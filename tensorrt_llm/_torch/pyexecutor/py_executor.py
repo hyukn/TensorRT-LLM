@@ -19,6 +19,7 @@ try:
 except ImportError:
     from cuda import cudart
 
+from tensorrt_llm._torch.pyexecutor.host_profiler import host_profiler_context
 from tensorrt_llm._torch.pyexecutor.resource_manager import (
     ResourceManagerType, request_context)
 from tensorrt_llm._utils import (customized_gc_thresholds, is_trace_enabled,
@@ -498,8 +499,9 @@ class PyExecutor:
 
     def _event_loop_wrapper(self):
         try:
-            with customized_gc_thresholds(
-                    self.garbage_collection_gen0_threshold):
+            # use environment variable TLLM_LINE_PROFILER_PATH to enable line profiler
+            with host_profiler_context(enable=bool(os.environ.get("TLLM_LINE_PROFILER_PATH"))), \
+                 customized_gc_thresholds(self.garbage_collection_gen0_threshold):
                 self.event_loop()
         except Exception as e:
             logger.error(f"Error in event loop: {e}")
@@ -724,7 +726,8 @@ class PyExecutor:
             ]
             torch_profiler = torch.profiler.profile(activities=activities,
                                                     record_shapes=True,
-                                                    with_modules=True)
+                                                    with_modules=True,
+                                                    with_stack=True)
 
         def profile_step():
             nonlocal it, enabled, start_time, start_event_1, end_event_1, start_event_2, end_event_2, prev_device_step_time
