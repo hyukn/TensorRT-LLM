@@ -375,6 +375,21 @@ if(CMAKE_SYSTEM_PROCESSOR STREQUAL x86_64)
   set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -Wl,--no-relax")
 endif()
 
+# ==== BOLT Optimization Flags ====
+# These flags enable BOLT binary optimization:
+# -fno-reorder-blocks-and-partition: Prevents compiler from splitting hot/cold
+# blocks -Wl,--emit-relocs (or -Wl,-q): Preserves relocation info for BOLT
+option(ENABLE_BOLT_OPTIMIZATION "Enable BOLT-compatible build flags" OFF)
+if(ENABLE_BOLT_OPTIMIZATION AND NOT WIN32)
+  message(STATUS "BOLT optimization flags enabled")
+  set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -fno-reorder-blocks-and-partition")
+  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fno-reorder-blocks-and-partition")
+  set(CMAKE_SHARED_LINKER_FLAGS
+      "${CMAKE_SHARED_LINKER_FLAGS} -Wl,--emit-relocs")
+  set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -Wl,--emit-relocs")
+endif()
+# ==== End BOLT Optimization Flags ====
+
 # Disable deprecated declarations warnings
 if(NOT WIN32)
   set(CMAKE_CXX_FLAGS "-Wno-deprecated-declarations ${CMAKE_CXX_FLAGS}")
