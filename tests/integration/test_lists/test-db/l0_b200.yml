@@ -133,6 +133,10 @@ l0_b200:
   - unittest/_torch/visual_gen/test_flux_attention.py
   - unittest/_torch/visual_gen/test_flux_pipeline.py
   # - examples/test_visual_gen.py
+  # ------------- Host perf regression tests ---------------
+  - perf/host_perf/test_module_scheduler.py
+  - perf/host_perf/test_module_sampler.py
+  - perf/host_perf/test_module_resource_manager.py
 - condition:
     ranges:
       system_gpu_count:
