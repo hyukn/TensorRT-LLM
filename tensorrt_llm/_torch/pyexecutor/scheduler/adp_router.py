@@ -434,10 +434,19 @@ class KVCacheAwareADPRouter(ADPRouter):
             # cache_salt_id scopes block reuse on both v1 and v2 backends;
             # passing None for non-salted requests is a no-op.
             cache_salt_id = getattr(req, "cache_salt_id", None)
+            # Pass the real request id so the digest chain computed by this
+            # probe is cached and the scheduler's create_kv_cache for this same
+            # first-chunk context request (same iteration) reuses it instead of
+            # re-hashing every token. Only for text-only requests: multimodal
+            # requests are augmented (gen_multi_modal_tokens) before the
+            # scheduler hashes them, so the router's raw-token chain would not
+            # match -- pass req_id=None so they fall back to a fresh walk.
+            is_text_only = getattr(req, "multimodal_hashes", None) is None
             match_len = self.kv_cache_manager.probe_prefix_match_length(
                 probe_tokens,
                 lora_task_id,
                 cache_salt_id=cache_salt_id,
+                req_id=(req_item.id if is_text_only else None),
             )
             local_matches.extend([req_item.id, match_len])
 

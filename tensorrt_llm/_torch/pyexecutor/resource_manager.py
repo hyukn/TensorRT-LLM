@@ -58,8 +58,8 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import \
     KVCacheManagerConfig as KVCacheManagerConfigPy
 from tensorrt_llm.runtime.kv_cache_manager_v2 import (LayerId, TokenIdExt,
                                                       _KVCache)
-from tensorrt_llm.runtime.kv_cache_manager_v2._block_radix_tree import \
-    gen_multi_modal_tokens
+from tensorrt_llm.runtime.kv_cache_manager_v2._block_radix_tree import (
+    MemoizedBlockChain, gen_multi_modal_tokens)
 from tensorrt_llm.runtime.kv_cache_manager_v2._common import (BAD_PAGE_INDEX,
                                                               GPU_LEVEL,
                                                               CacheLevel)
@@ -681,7 +681,8 @@ class KVCacheManager(BaseResourceManager):
     def probe_prefix_match_length(self,
                                   input_tokens,
                                   lora_task_id=None,
-                                  cache_salt_id=None):
+                                  cache_salt_id=None,
+                                  req_id=0):
         """Probe the KV cache radix tree for prefix match length.
 
         Returns the number of prefix tokens already cached on this rank.
@@ -691,6 +692,13 @@ class KVCacheManager(BaseResourceManager):
         namespace that ``_create_kv_cache`` uses; without it, salted
         requests would be probed against the salt=None namespace and the
         router would see the wrong match length.
+
+        ``req_id`` is the real request id. The underlying
+        ``analyze_prefix_reuse`` memoizes its result keyed by request id
+        (cleared every iteration), so the capacity scheduler's later walk for
+        the same first-chunk context request hits this cache instead of
+        re-walking the radix tree. Passing the real id (not a dummy 0) is what
+        lets the router's probe and the scheduler's analysis share one walk.
         """
         if not self.enable_block_reuse:
             return 0
@@ -710,7 +718,7 @@ class KVCacheManager(BaseResourceManager):
         # buildBlockKeys() on the C++ side pulls cache_salt_id off the
         # request, so dummy_req must carry it for the probe namespace to
         # match the real create_kv_cache path.
-        dummy_req = CppLlmRequest(request_id=0,
+        dummy_req = CppLlmRequest(request_id=req_id,
                                   max_new_tokens=0,
                                   input_tokens=input_tokens,
                                   sampling_config=SamplingConfig(),
@@ -1939,6 +1947,20 @@ class KVCacheManagerV2(BaseResourceManager):
         self.max_seq_len = max_seq_len
         self.max_batch_size = max_batch_size
         self.kv_factor = 1 if kv_cache_type == CacheTypeCpp.SELFKONLY else 2
+        # --- router<->scheduler prefix digest-chain dedup (V2) ---
+        # In one iteration the KV-aware router's probe_reuse and the capacity
+        # scheduler's create_kv_cache both hash the SAME (reuse_scope, tokens)
+        # for a first-chunk context request via sequence_to_blockchain_keys
+        # (incremental SHA-256 over every token -- the dominant host cost of
+        # both walks). The probe caches that digest chain keyed by request id;
+        # create_kv_cache reuses it, skipping the recompute. Only the immutable
+        # chain is cached -- the volatile live-tree descent still re-runs, so
+        # the match result is identical even if blocks are evicted in between.
+        self._prefix_chain_cache: dict[int, tuple] = {}
+        self._prefix_chain_hits = 0
+        self._prefix_chain_misses = 0
+        self._prefix_chain_cap = 4096
+        self._chain_log_ctr = 0
         from ..speculative import get_num_extra_kv_tokens
         self.num_extra_kv_tokens = get_num_extra_kv_tokens(spec_config)
         self.max_draft_len = spec_config.max_draft_len if spec_config is not None else 0
@@ -2611,7 +2633,8 @@ class KVCacheManagerV2(BaseResourceManager):
     def probe_prefix_match_length(self,
                                   input_tokens,
                                   lora_task_id=None,
-                                  cache_salt_id=None):
+                                  cache_salt_id=None,
+                                  req_id=None):
         """Probe the v2 KV cache radix tree for prefix match length.
 
         Returns the number of prefix tokens already cached on this rank,
@@ -2623,6 +2646,11 @@ class KVCacheManagerV2(BaseResourceManager):
         ``ReuseScope(lora_id=lora_task_id, salt=cache_salt_id)``).
         Otherwise the probe queries the wrong reuse namespace and the
         router sees an incorrect match length.
+
+        ``req_id``: when given (text-only requests only -- see the router),
+        the (reuse_scope, tokens) digest chain is computed once here and
+        cached so the scheduler's ``create_kv_cache`` for this same request
+        in the same iteration reuses it instead of re-hashing every token.
         """
         if not self.enable_block_reuse:
             return 0
@@ -2630,10 +2658,27 @@ class KVCacheManagerV2(BaseResourceManager):
             return 0
         from tensorrt_llm.runtime.kv_cache_manager_v2._block_radix_tree import \
             ReuseScope
-        return self.impl.probe_reuse(
-            ReuseScope(lora_id=lora_task_id, salt=cache_salt_id),
-            input_tokens,
-        )
+        scope = ReuseScope(lora_id=lora_task_id, salt=cache_salt_id)
+        precomputed_keys = None
+        if req_id is not None:
+            # Lazily-memoized chain: this probe only hashes as far as the radix
+            # descent inspects (it breaks at the first mismatch), and the
+            # scheduler's create_kv_cache for this request reuses that hashing.
+            # Keyed by py_request_id (== req_item.id); valid until create, which
+            # is often several iterations later (after the capacity backlog
+            # clears) -- so it is NOT cleared per iteration. An LRU cap bounds
+            # it: the router probes every new request on every rank, but each is
+            # created on only one rank, so the rest are evicted oldest-first.
+            precomputed_keys = MemoizedBlockChain(self.tokens_per_block, scope,
+                                                  input_tokens)
+            c = self._prefix_chain_cache
+            c.pop(req_id, None)
+            c[req_id] = (scope.to_bytes(), len(input_tokens), precomputed_keys)
+            while len(c) > self._prefix_chain_cap:
+                c.pop(next(iter(c)))
+        return self.impl.probe_reuse(scope,
+                                     input_tokens,
+                                     precomputed_keys=precomputed_keys)
 
     def _effective_draft_len(self, req: LlmRequest) -> int:
         """Draft token length to use for next-step KV capacity calculation.
@@ -3927,11 +3972,31 @@ class KVCacheManagerV2(BaseResourceManager):
                 "Skipping KV cache creation; request will retry next iteration.",
                 request_id, self.index_mapper.size(), self.index_mapper.size())
             return None
+        scope = ReuseScope(lora_id=lora_task_id, salt=cache_salt_id)
+        # Reuse the router's already-computed digest chain for this request if
+        # it is still valid (same reuse namespace + token count). The chain is
+        # popped: it is consumed exactly once per request lifetime.
+        precomputed_keys = None
+        entry = self._prefix_chain_cache.pop(request_id, None)
+        if input_tokens is not None:
+            if (entry is not None and entry[0] == scope.to_bytes()
+                    and entry[1] == len(input_tokens)):
+                precomputed_keys = entry[2]
+                self._prefix_chain_hits += 1
+            else:
+                self._prefix_chain_misses += 1
+            self._chain_log_ctr += 1
+            if self._chain_log_ctr % 200 == 0:
+                logger.info(f"[chain-dedup] creates={self._chain_log_ctr} "
+                            f"hits={self._prefix_chain_hits} "
+                            f"misses={self._prefix_chain_misses} "
+                            f"cache_sz={len(self._prefix_chain_cache)}")
         kv_cache = self.impl.create_kv_cache(
-            ReuseScope(lora_id=lora_task_id, salt=cache_salt_id),
+            scope,
             input_tokens,
             id=request_id,
             expected_prompt_length=expected_prompt_length,
+            precomputed_keys=precomputed_keys,
         )
         self.kv_cache_map[request_id] = kv_cache
         if is_dummy:
@@ -3948,6 +4013,16 @@ class KVCacheManagerV2(BaseResourceManager):
 
     def reset_reuse_state(self):
         self.impl.clear_reusable_blocks()
+
+    def clear_prefix_chain_cache(self):
+        """Drop the per-iteration router->scheduler digest-chain cache.
+
+        Called by the KV-aware router at the start of each iteration's probe
+        pass so chains from requests that were probed but never scheduled do
+        not accumulate. Entries that are consumed by create_kv_cache are
+        already popped there; this bounds the rest.
+        """
+        self._prefix_chain_cache.clear()
 
 
 class SlotManager:

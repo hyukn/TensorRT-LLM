@@ -115,6 +115,53 @@ def sequence_to_blockchain_keys(
         yield token_block, digest
 
 
+class MemoizedBlockChain:
+    """Lazily computes and memoizes the ``sequence_to_blockchain_keys`` chain.
+
+    Iterating yields already-computed (token_block, key) entries first, then
+    extends the underlying generator one block at a time. Two properties make
+    this the right shape for the router<->scheduler prefix dedup:
+
+    * **Lazy** -- the radix descent breaks at the first mismatching block, so a
+      consumer only pays the SHA-256 cost for the prefix it actually inspects
+      (NOT the whole prompt). This preserves the early-out that a plain
+      ``list(sequence_to_blockchain_keys(...))`` would destroy.
+    * **Memoized** -- a second consumer (the scheduler's ``create_kv_cache``
+      after the router's ``probe_reuse``) reuses the blocks the first consumer
+      already hashed, and only extends the chain if it descends deeper (e.g.
+      the tree grew between probe and create). The digest of block i depends
+      only on tokens[: i * tokens_per_block], so the memoized prefix is always
+      valid regardless of tree state.
+    """
+
+    __slots__ = ("_gen", "_computed")
+
+    def __init__(
+        self, tokens_per_block: int, reuse_scope: "ReuseScope", tokens: "Sequence[TokenIdExt]"
+    ) -> None:
+        self._gen = sequence_to_blockchain_keys(tokens_per_block, reuse_scope, tokens)
+        self._computed: "list[tuple[TokenBlock, BlockKey]]" = []
+
+    def __iter__(self) -> "Iterator[tuple[TokenBlock, BlockKey]]":
+        computed = self._computed
+        i = 0
+        while True:
+            if i < len(computed):
+                yield computed[i]
+                i += 1
+                continue
+            if self._gen is None:
+                return
+            try:
+                item = next(self._gen)
+            except StopIteration:
+                self._gen = None
+                return
+            computed.append(item)
+            yield item
+            i += 1
+
+
 Child = TypeVar("Child", bound="Block | RootBlock")
 Children = dict[BlockKey, Child]
 
@@ -493,12 +540,16 @@ class BlockRadixTree:
         reuse_scope: ReuseScope,
         tokens: Sequence[TokenIdExt],
         enable_partial_match: bool = False,
+        precomputed_keys: "list[tuple[TokenBlock, BlockKey]] | None" = None,
     ) -> Iterator[tuple[Block, int]]:
         block: Block | RootBlock | BlockRadixTree = self
         mismatched_token_block: TokenBlock = []
-        for token_block, key in sequence_to_blockchain_keys(
-            self._tokens_per_block, reuse_scope, tokens
-        ):
+        key_chain = (
+            precomputed_keys
+            if precomputed_keys is not None
+            else sequence_to_blockchain_keys(self._tokens_per_block, reuse_scope, tokens)
+        )
+        for token_block, key in key_chain:
             if key in block.next:
                 block = block.next[key]
                 if token_block:
@@ -593,15 +644,23 @@ class BlockRadixTree:
         reuse_scope: ReuseScope,
         tokens: Sequence[TokenIdExt],
         enable_partial_match: bool = False,
+        precomputed_keys: "list[tuple[TokenBlock, BlockKey]] | None" = None,
     ) -> ReuseMatch:
         """
         Return the currently reusable prefix match without holding pages.
 
         The result is volatile: callers that need to reuse the returned blocks must
         acquire ownership of the pages before depending on them.
+
+        ``precomputed_keys``: optional pre-built (token_block, key) chain from
+        ``sequence_to_blockchain_keys`` for these exact (reuse_scope, tokens).
+        When supplied, the per-token SHA-256 hashing is skipped; only the live
+        tree descent runs, so the result is identical to recomputing the chain.
         """
         matched = self._prune_match(
-            list(self._match_token_path(reuse_scope, tokens, enable_partial_match))
+            list(
+                self._match_token_path(reuse_scope, tokens, enable_partial_match, precomputed_keys)
+            )
         )
         return ReuseMatch([block for block, _ in matched], self._num_matched_tokens(matched))
 

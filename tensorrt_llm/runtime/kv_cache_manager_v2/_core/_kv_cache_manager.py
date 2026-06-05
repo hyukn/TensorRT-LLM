@@ -384,6 +384,7 @@ class KVCacheManager:
         custom_priority_callback: Callable[[BlockOrdinal, LifeCycle], Priority] = lambda _,
         __: PRIORITY_DEFAULT,
         expected_prompt_length: int | None = None,
+        precomputed_keys=None,
     ) -> _KVCache:
         """
         reuse_scope: namespace to match before matching any tokens.
@@ -403,7 +404,9 @@ class KVCacheManager:
         if expected_prompt_length is None and input_tokens is not None:
             expected_prompt_length = len(input_tokens)
         reuse_match = (
-            self._match_reuse(reuse_scope, input_tokens) if input_tokens is not None else None
+            self._match_reuse(reuse_scope, input_tokens, precomputed_keys)
+            if input_tokens is not None
+            else None
         )
         return _KVCache(
             self,
@@ -415,14 +418,20 @@ class KVCacheManager:
         )
 
     def _match_reuse(
-        self, reuse_scope: ReuseScope, input_tokens: Sequence[TokenIdExt]
+        self,
+        reuse_scope: ReuseScope,
+        input_tokens: Sequence[TokenIdExt],
+        precomputed_keys=None,
     ) -> ReuseMatch:
-        return self._radix_tree.match(reuse_scope, input_tokens, self.enable_partial_match)
+        return self._radix_tree.match(
+            reuse_scope, input_tokens, self.enable_partial_match, precomputed_keys
+        )
 
     def probe_reuse(
         self,
         reuse_scope: ReuseScope | None = None,
         input_tokens: Sequence[TokenIdExt] | None = None,
+        precomputed_keys=None,
     ) -> int:
         """
         Return the currently reusable prefix length without holding pages.
@@ -434,7 +443,7 @@ class KVCacheManager:
         assert type(reuse_scope) is ReuseScope
         if input_tokens is None:
             input_tokens = ()
-        return self._match_reuse(reuse_scope, input_tokens).num_tokens
+        return self._match_reuse(reuse_scope, input_tokens, precomputed_keys).num_tokens
 
     def resize(self, cache_level: CacheLevel, quota: int, best_efforts: bool = False) -> bool:
         """
