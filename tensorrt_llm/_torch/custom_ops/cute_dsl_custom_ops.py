@@ -390,6 +390,23 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 self.use_tvm_ffi,
             )
 
+        def should_profile_tactic_in_subprocess(
+            self,
+            custom_op: str,
+            inputs: List[torch.Tensor],
+            tactic,
+            tuning_config: TuningConfig,
+            **kwargs,
+        ) -> bool:
+            # Each tactic triggers a separate cute.compile() JIT, which dominates
+            # autotune wall time, so profile them concurrently in subprocesses.
+            # The base tactic is a 4-tuple (mma_tiler_mn, cluster_shape_mn,
+            # swap_ab, use_prefetch); the nvMatmulHeuristics path appends two
+            # tile-scheduler knobs (swizzle_size, raster_along_m) -> 6-tuple.
+            # Accept both, so heuristic-pruned tactics are not silently excluded
+            # from multiprocess profiling.
+            return isinstance(tactic, tuple) and len(tactic) in (4, 6)
+
         def get_valid_tactics(
             self,
             inputs: List[torch.Tensor],
