@@ -3,6 +3,7 @@ import gc
 import importlib
 import inspect
 import json
+import multiprocessing
 import os
 import secrets
 import signal
@@ -1168,6 +1169,45 @@ def serve_encoder(model: str, host: str, port: int, log_level: str,
     launch_mm_encoder_server(host, port, encoder_args, metadata_server_cfg)
 
 
+def _disagg_orchestrator_worker(config_file, metadata_server_config_file,
+                                server_start_timeout, request_timeout,
+                                log_level, schedule_style, metrics_log_interval,
+                                port_offset):
+    """One INDEPENDENT disagg orchestrator process (A1 multi-orchestrator).
+
+    Spawned as a fresh interpreter; serves on ``disagg_cfg.port + port_offset``
+    so each orchestrator owns a distinct client-facing port and its own asyncio
+    loop / core. Distinct ports keep each orchestrator's ctx/gen relay state
+    isolated (the proven multi-orchestrator model); sharing one port across
+    workers corrupts the relay. Config is re-parsed here (all args are picklable)
+    so this can be a module-level target for the spawn start method. The
+    TLLM_DISAGG_DEPLOYMENT_ID env is inherited from the launcher.
+    """
+    logger.set_level(log_level)
+    disagg_cfg = parse_disagg_config_file(config_file)
+    if schedule_style:
+        disagg_cfg.schedule_style = schedule_style
+    disagg_cfg.port = disagg_cfg.port + port_offset
+    metadata_server_cfg = parse_metadata_server_config_file(
+        metadata_server_config_file)
+    server = OpenAIDisaggServer(config=disagg_cfg,
+                                req_timeout_secs=request_timeout,
+                                server_start_timeout_secs=server_start_timeout,
+                                metadata_server_cfg=metadata_server_cfg,
+                                metrics_interval_secs=metrics_log_interval)
+    if os.getenv("TRTLLM_DISAGG_SERVER_DISABLE_GC", "1") == "1":
+        gc.disable()
+    ws = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    ws.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    try:
+        ws.bind((disagg_cfg.hostname, disagg_cfg.port))
+    except OSError as e:
+        raise RuntimeError(
+            f"Orchestrator failed to bind {disagg_cfg.hostname}:{disagg_cfg.port}: {e}"
+        )
+    asyncio.run(server(disagg_cfg.hostname, disagg_cfg.port, sockets=[ws]))
+
+
 @click.command("disaggregated")
 @click.option("-c",
               "--config",
@@ -1238,38 +1278,74 @@ def disaggregated(
     # Inherited by child processes via env var; used for deduplication at query time.
     os.environ[DisaggLauncherEnvs.TLLM_DISAGG_DEPLOYMENT_ID] = uuid.uuid4().hex
 
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        try:
-            s.bind((disagg_cfg.hostname, disagg_cfg.port))
-        except OSError as e:
-            raise RuntimeError(
-                f"Failed to bind socket to {disagg_cfg.hostname}:{disagg_cfg.port}: {e}"
-            )
+    # A1 -- multi-process orchestrator. The disagg orchestrator front end is a
+    # single asyncio event loop (GIL, one core): it serializes every request's
+    # intake + ctx/gen relay AND drives all concurrent SSE output streams, so at
+    # high concurrency it is the host-side bottleneck (measured event-loop lag
+    # ~0.5 s at c3120). TLLM_DISAGG_NUM_ORCHESTRATORS=N runs N INDEPENDENT
+    # orchestrator processes, each on its OWN port (disagg_cfg.port + i) and its
+    # own asyncio loop / core, parallelizing the front end ~N x.
+    #
+    # Each orchestrator is a full standalone instance with a DISTINCT port. This
+    # matters: sharing a single port across N workers (e.g. SO_REUSEPORT) makes
+    # the ctx/gen backends see N indistinguishable orchestrators and corrupts the
+    # per-request relay / KV-transfer handshake (requests return no output). N
+    # distinct ports keep each orchestrator's relay state isolated -- the model
+    # validated end to end at ~99.9% success.
+    #
+    # A front load balancer (or the benchmark client) must spread requests across
+    # ports [port, port+N); pinning a conversation to one port preserves that
+    # orchestrator's KV-cache routing affinity. Default 1 = unchanged single port.
+    num_orch = max(1, int(os.getenv("TLLM_DISAGG_NUM_ORCHESTRATORS", "1")))
 
+    if num_orch <= 1:
         metadata_server_cfg = parse_metadata_server_config_file(
             metadata_server_config_file)
-
         server = OpenAIDisaggServer(
             config=disagg_cfg,
             req_timeout_secs=request_timeout,
             server_start_timeout_secs=server_start_timeout,
             metadata_server_cfg=metadata_server_cfg,
             metrics_interval_secs=metrics_log_interval)
-
-        # Disable GC by default
-        #   When concurrency is high, the number of Python objects increases, so
-        #   GC runs frequently and takes a long time to process. In this case,
-        #   requests are not immediately forwarded to CTX workers and GEN workers,
-        #   causing them to run with small batch sizes. Disabling GC can mitigate
-        #   this problem.
-        #   By testing this feature, we didn't observe significant RSS or VMS
-        #   increment, and observed that `count0` (obtained by `gc.get_count()`)
-        #   increases by fewer than 1,000 after every 200,000 requests, while the
-        #   maximum value of `count0` exceeded 3,000,000 during the test.
+        # Disable GC by default (high concurrency -> frequent long GC pauses that
+        # delay forwarding to ctx/gen workers).
         if os.getenv("TRTLLM_DISAGG_SERVER_DISABLE_GC", "1") == "1":
             gc.disable()
-
-        asyncio.run(server(disagg_cfg.hostname, disagg_cfg.port, sockets=[s]))
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            try:
+                s.bind((disagg_cfg.hostname, disagg_cfg.port))
+            except OSError as e:
+                raise RuntimeError(
+                    f"Failed to bind socket to {disagg_cfg.hostname}:{disagg_cfg.port}: {e}"
+                )
+            asyncio.run(
+                server(disagg_cfg.hostname, disagg_cfg.port, sockets=[s]))
+    else:
+        logger.info(
+            f"Disaggregated: launching {num_orch} independent orchestrator "
+            f"processes on {disagg_cfg.hostname}:{disagg_cfg.port}.."
+            f"{disagg_cfg.port + num_orch - 1} "
+            f"(TLLM_DISAGG_NUM_ORCHESTRATORS={num_orch})")
+        # Spawn (not fork): each orchestrator is a fresh interpreter, equivalent
+        # to launching N standalone `trtllm-serve disaggregated` processes.
+        mp_ctx = multiprocessing.get_context("spawn")
+        procs: list[multiprocessing.Process] = []
+        for i in range(num_orch):
+            p = mp_ctx.Process(target=_disagg_orchestrator_worker,
+                               args=(config_file, metadata_server_config_file,
+                                     server_start_timeout, request_timeout,
+                                     log_level, schedule_style,
+                                     metrics_log_interval, i))
+            p.start()
+            procs.append(p)
+        try:
+            for p in procs:
+                p.join()
+        finally:
+            for p in procs:
+                if p.is_alive():
+                    p.terminate()
 
 
 def set_cuda_device():
