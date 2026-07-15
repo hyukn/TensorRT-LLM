@@ -568,11 +568,14 @@ class BaseLLM:
         # - multimodal data is present (whether through embeddings or as preprocessed data), AND
         # - token IDs are present, AND
         # - two methods defining the placeholder token IDs expansion logic are not available.
-        if not inputs.get("prompt") and inputs.get("prompt_token_ids") and (
-                inputs.get("multi_modal_data")
-                or inputs.get("multi_modal_embeddings")) and not isinstance(
-                    self.input_processor, DefaultInputProcessor
-                ) and not use_token_ids_for_mm_placeholders:
+        # Use `is not None` (not truthiness): prompt_token_ids may be a numpy
+        # int32 ndarray (lazy disagg-gen buffer), whose truth value is ambiguous.
+        if not inputs.get("prompt") and inputs.get(
+                "prompt_token_ids") is not None and (
+                    inputs.get("multi_modal_data")
+                    or inputs.get("multi_modal_embeddings")) and not isinstance(
+                        self.input_processor, DefaultInputProcessor
+                    ) and not use_token_ids_for_mm_placeholders:
             # VLMs need to process/tokenize the prompt in their own way,
             # if they don't have the fast path for token IDs & MM data implemented yet.
             # TODO: Once all the VLMs support the fast path, we can remove this detokenization step entirely.
