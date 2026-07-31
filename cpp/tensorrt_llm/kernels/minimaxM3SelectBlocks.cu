@@ -97,7 +97,12 @@ __forceinline__ __device__ void warpBitonicSortDesc64(
     }
 }
 
-__forceinline__ __device__ void warpBitonicSortDesc128(uint32_t (&scoreKeys)[4], int32_t (&blockIds)[4], int32_t lane)
+// Sorts 128 packed TopKRedType<float> comparison values descending. A plain
+// unsigned compare on the packed value is exactly candidateGreater: the twiddled
+// score sits in bits 32..63, bits 16..31 are always zero and bits 0..15 hold
+// 65535 - blockId, so the larger packed value has the larger score or, on a score
+// tie, the smaller block ID.
+__forceinline__ __device__ void warpBitonicSortDesc128(uint64_t (&candidates)[4], int32_t lane)
 {
     // Virtual item slot * 32 + lane stays in registers. Short strides exchange
     // lanes with shuffles; strides 32 and 64 exchange slots within each lane.
@@ -107,42 +112,44 @@ __forceinline__ __device__ void warpBitonicSortDesc128(uint32_t (&scoreKeys)[4],
 #pragma unroll
         for (int32_t stride = size / 2; stride > 0; stride /= 2)
         {
-            uint32_t previousScoreKeys[4];
-            int32_t previousBlockIds[4];
-#pragma unroll
-            for (int32_t slot = 0; slot < 4; ++slot)
+            if (stride < kWarpSize)
             {
-                previousScoreKeys[slot] = scoreKeys[slot];
-                previousBlockIds[slot] = blockIds[slot];
+                // Every slot only ever meets itself across lanes, so the exchange
+                // is safe in place: the shuffle for a slot runs before that slot
+                // is written in any lane.
+#pragma unroll
+                for (int32_t slot = 0; slot < 4; ++slot)
+                {
+                    uint64_t const partner = __shfl_xor_sync(kFullWarpMask, candidates[slot], stride);
+                    int32_t const item = lane + slot * kWarpSize;
+                    bool const takeGreater = ((item & size) == 0) == ((item & stride) == 0);
+                    if ((partner > candidates[slot]) == takeGreater)
+                    {
+                        candidates[slot] = partner;
+                    }
+                }
             }
-
-#pragma unroll
-            for (int32_t slot = 0; slot < 4; ++slot)
+            else
             {
-                uint32_t partnerScoreKey;
-                int32_t partnerBlockId;
-                if (stride < kWarpSize)
+                // Partners live in another slot of the same lane. The two halves
+                // of a pair always move together, so a single predicate drives
+                // the swap and no shadow copy of the slots is needed.
+                int32_t const slotStride = stride / kWarpSize;
+#pragma unroll
+                for (int32_t slot = 0; slot < 4; ++slot)
                 {
-                    partnerScoreKey = __shfl_xor_sync(kFullWarpMask, previousScoreKeys[slot], stride);
-                    partnerBlockId = __shfl_xor_sync(kFullWarpMask, previousBlockIds[slot], stride);
-                }
-                else
-                {
-                    int32_t const partnerSlot = slot ^ (stride / kWarpSize);
-                    partnerScoreKey = previousScoreKeys[partnerSlot];
-                    partnerBlockId = previousBlockIds[partnerSlot];
-                }
-
-                int32_t const item = lane + slot * kWarpSize;
-                bool const takeGreater = ((item & size) == 0) == ((item & stride) == 0);
-                bool const partnerGreater = candidateGreater(
-                    partnerScoreKey, partnerBlockId, previousScoreKeys[slot], previousBlockIds[slot]);
-                bool const currentGreater = candidateGreater(
-                    previousScoreKeys[slot], previousBlockIds[slot], partnerScoreKey, partnerBlockId);
-                if ((takeGreater && partnerGreater) || (!takeGreater && currentGreater))
-                {
-                    scoreKeys[slot] = partnerScoreKey;
-                    blockIds[slot] = partnerBlockId;
+                    int32_t const partnerSlot = slot ^ slotStride;
+                    if (partnerSlot > slot)
+                    {
+                        int32_t const item = lane + slot * kWarpSize;
+                        bool const takeGreater = ((item & size) == 0);
+                        if ((candidates[partnerSlot] > candidates[slot]) == takeGreater)
+                        {
+                            uint64_t const previous = candidates[slot];
+                            candidates[slot] = candidates[partnerSlot];
+                            candidates[partnerSlot] = previous;
+                        }
+                    }
                 }
             }
         }
@@ -368,11 +375,11 @@ __global__ void minimaxM3SelectBlocks128Kernel(float const* __restrict__ scores,
         = max(static_cast<int64_t>(rawValidBlocks) - static_cast<int64_t>(localBlocks), static_cast<int64_t>(0));
 
     using RedType = reduce_topk::TopKRedType<float>;
-    RedType candidates[4];
+    uint64_t candidates[4];
 #pragma unroll
     for (int32_t slot = 0; slot < 4; ++slot)
     {
-        candidates[slot] = RedType{-INFINITY, RedType::kMaxIdx};
+        candidates[slot] = RedType{-INFINITY, RedType::kMaxIdx}.compValIdx;
         int32_t const block = lane + slot * kWarpSize;
         if (block < validBlocks)
         {
@@ -389,29 +396,21 @@ __global__ void minimaxM3SelectBlocks128Kernel(float const* __restrict__ scores,
             {
                 score = kLocalScore;
             }
-            candidates[slot] = RedType{score, block};
+            candidates[slot] = RedType{score, block}.compValIdx;
         }
     }
 
-    uint32_t scoreKeys[4];
-    int32_t blockIds[4];
-#pragma unroll
-    for (int32_t slot = 0; slot < 4; ++slot)
-    {
-        scoreKeys[slot] = static_cast<uint32_t>(candidates[slot].compValIdx >> RedType::kMoveBits);
-        blockIds[slot]
-            = RedType::kMaxIdx - static_cast<int32_t>(static_cast<uint32_t>(candidates[slot].compValIdx) & 0xFFFFU);
-    }
-    warpBitonicSortDesc128(scoreKeys, blockIds, lane);
+    warpBitonicSortDesc128(candidates, lane);
 
     if (lane < kTopK)
     {
+        int32_t blockId = RedType::kMaxIdx - static_cast<int32_t>(static_cast<uint32_t>(candidates[0]) & 0xFFFFU);
         RedType const negativeInfinity{-INFINITY, 0};
         uint32_t const negativeInfinityScoreKey
             = static_cast<uint32_t>(negativeInfinity.compValIdx >> RedType::kMoveBits);
-        if (scoreKeys[0] == negativeInfinityScoreKey)
+        if (static_cast<uint32_t>(candidates[0] >> RedType::kMoveBits) == negativeInfinityScoreKey)
         {
-            blockIds[0] = numBlocks;
+            blockId = numBlocks;
         }
 
         // MSA consumes block IDs in ascending order. numBlocks is the sentinel
@@ -422,14 +421,14 @@ __global__ void minimaxM3SelectBlocks128Kernel(float const* __restrict__ scores,
 #pragma unroll
             for (int32_t stride = size / 2; stride > 0; stride /= 2)
             {
-                int32_t const partnerBlockId = __shfl_xor_sync(0xFFFFU, blockIds[0], stride);
+                int32_t const partnerBlockId = __shfl_xor_sync(0xFFFFU, blockId, stride);
                 bool const takeMin = ((lane & size) == 0) == ((lane & stride) == 0);
-                blockIds[0] = takeMin ? min(blockIds[0], partnerBlockId) : max(blockIds[0], partnerBlockId);
+                blockId = takeMin ? min(blockId, partnerBlockId) : max(blockId, partnerBlockId);
             }
         }
 
         output[outputOffset<HeadMajorOutput>(query, kvHead, totalQueries, numKvHeads, lane)]
-            = blockIds[0] == numBlocks ? -1 : blockIds[0];
+            = blockId == numBlocks ? -1 : blockId;
     }
 }
 
