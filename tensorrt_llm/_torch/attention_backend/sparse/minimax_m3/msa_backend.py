@@ -176,10 +176,19 @@ _MSA_SPLIT_KV_INDEX_KEYS = (
 # _alloc_workspace_buf, which reallocates whenever the requested size grows, and
 # workspace_lse through _alloc_perplan_buf, which reallocates on every call
 # (api.py:78-101) -- so neither address can be pinned and both are mirrored.
-# They are pure kernel scratch: the kernel writes them and nothing reads them
-# across steps, so only the address must be stable, never the contents.
+# Because the mirror substitutes them by address instead of copying, the plan
+# kernel's writes into the plan's own buffer never reach the mirror: only a
+# buffer the consumer overwrites before reading may be handled this way.
 _MSA_SPLIT_KV_SCRATCH_KEYS = ()
 _MSA_SPLIT_KV_MIRROR_SCRATCH_KEYS = ("workspace_o", "workspace_lse")
+# workspace_lse is the exception. The plan kernel initialises all of it to
+# -INFINITY (plan.cuh:920-922) and the split-KV reduction reads that value as
+# "this split is empty" and skips it (sm100_fmha_reduction.hpp:102, with the
+# running-max updates at :125 and :136). The seed is the only signal that
+# distinguishes an unwritten split from a real one, so the mirror has to
+# reproduce it. workspace_o carries no such seed -- the reduction reads it only
+# for splits whose LSE says they were written -- so it stays address-only.
+_MSA_SPLIT_KV_SEEDED_SCRATCH_KEYS = ("workspace_lse", )
 
 # The planner row-expands the proxy's per-row worklists over query tokens times
 # pack_factor, which is num_index_heads at decode (all index heads fold into one
@@ -366,8 +375,10 @@ class _MsaGraphSafePlan:
                 )
         rebuilt = dict(decode)
         if self._num_kv_splits > 1:
-            # Pure kernel scratch: only the address must be stable across
-            # replays, so substitute the fixed buffer instead of copying into it.
+            # The mirror substitutes these by address rather than copying, so
+            # whatever the plan kernel wrote into the plan's own buffer does not
+            # reach the mirror. That is only sound for a buffer the consumer
+            # fully overwrites before reading.
             for key in _MSA_SPLIT_KV_MIRROR_SCRATCH_KEYS:
                 src = decode.get(key)
                 if src is None:
@@ -379,6 +390,16 @@ class _MsaGraphSafePlan:
                         f"MSA plan buffer {key} ({dst.numel()}) is smaller than the "
                         f"plan tensor ({n})."
                     )
+                if key in _MSA_SPLIT_KV_SEEDED_SCRATCH_KEYS:
+                    # workspace_lse is NOT write-before-read scratch: the plan
+                    # kernel seeds every element to -INFINITY (plan.cuh:920-922)
+                    # and the split-KV reduction treats that value as "this split
+                    # produced nothing", skipping it
+                    # (sm100_fmha_reduction.hpp:102). A split the planner left
+                    # empty is therefore identified by the seed alone. Handing the
+                    # kernel an unseeded mirror would let a stale finite LSE from
+                    # an earlier step be folded in as if it were real output.
+                    dst[:n].fill_(float("-inf"))
                 rebuilt[key] = dst[:n]
         for key in (
             *_MSA_PLAN_STABLE_KEYS,

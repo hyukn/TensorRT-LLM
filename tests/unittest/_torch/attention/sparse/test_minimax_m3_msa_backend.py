@@ -656,3 +656,99 @@ def test_fused_scatter_matches_reference(cache_dtype, num_kv_heads, with_idx):
 
     torch.testing.assert_close(pool.to(torch.float32), ref_pool.to(torch.float32))
     torch.testing.assert_close(idx_pool, ref_idx_pool)
+
+
+def _lse_mirror_plan(num_kv_splits: int, width: int):
+    """A `_MsaGraphSafePlan` over CPU buffers, with no CUDA and no metadata.
+
+    `get_empty` is the only thing the constructor needs from the metadata, and
+    the split-KV mirrors are the only buffers this test looks at.
+    """
+    from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.msa_backend import (
+        _MsaGraphSafePlan, )
+
+    stub = SimpleNamespace(
+        cuda_graph_buffers=None,
+        get_empty=lambda _buffers, shape, cache_name, dtype, capture_graph:
+        torch.zeros(shape, dtype=dtype),
+    )
+    plan = _MsaGraphSafePlan.__new__(_MsaGraphSafePlan)
+    _MsaGraphSafePlan.__init__(plan,
+                              stub,
+                              "test",
+                              max_batch=width,
+                              num_ctas=8,
+                              capture_graph=False,
+                              num_kv_splits=num_kv_splits)
+    return plan
+
+
+def _decode_plan_dict(width: int):
+    """The subset of a plan dict `refresh()` touches, all of it CPU."""
+    d = {
+        key: torch.zeros(width, dtype=torch.int32)
+        for key in (
+            "qo_segment_offsets",
+            "kv_segment_offsets",
+            "kv_page_indptr",
+            "qo_segment_lens",
+            "kv_segment_lens",
+            "qo_offset",
+            "seqused_k",
+        )
+    }
+    d["packed_work_range"] = torch.zeros(width, dtype=torch.int64)
+    d["packed_work_info"] = torch.zeros(width, dtype=torch.int64)
+    for key in ("kv_tile_begin_indices", "kv_tile_end_indices",
+                "kv_split_indices", "num_kv_splits_per_row"):
+        d[key] = torch.zeros(width, dtype=torch.int32)
+    # The planner seeds workspace_lse to -inf; workspace_o it leaves alone.
+    d["workspace_lse"] = torch.full((width, ), float("-inf"),
+                                    dtype=torch.float32)
+    d["workspace_o"] = torch.zeros(width, dtype=torch.float32)
+    return d
+
+
+def test_split_kv_lse_mirror_is_seeded_to_negative_infinity():
+    """The split-KV reduction identifies an empty split by its LSE still holding
+    the planner's -inf seed (`plan.cuh:920-922` writes it,
+    `sm100_fmha_reduction.hpp:102` reads it). The graph-safe mirror substitutes
+    `workspace_lse` by address instead of copying, so the planner's seed never
+    reaches the buffer the kernel is actually handed — the mirror has to
+    reproduce it. Without that, a stale finite LSE left by an earlier step reads
+    as a real split and is folded into the output.
+
+    `workspace_o` carries no seed (the reduction reads it only for splits whose
+    LSE says they were written), so it is deliberately NOT checked here.
+    """
+    width = 16
+    plan = _lse_mirror_plan(num_kv_splits=4, width=width)
+
+    # Dirty the mirror the way a previous step's kernel would have.
+    plan._buf["workspace_lse"].fill_(1.25)
+
+    _, _, _, rebuilt, _ = plan.refresh(
+        (False, True, 1, _decode_plan_dict(width), None))
+
+    lse = rebuilt["workspace_lse"]
+    assert lse.data_ptr() == plan._buf["workspace_lse"].data_ptr(), \
+        "the mirror must still be substituted by address, not copied wholesale"
+    assert torch.isneginf(lse).all(), (
+        "workspace_lse mirror kept a stale finite value; the reduction would "
+        "treat that split as real output")
+
+
+def test_split_kv_workspace_o_mirror_stays_address_only():
+    """The counterpart to the LSE seed: `workspace_o` is genuine
+    write-before-read scratch, so the mirror must not spend a fill on it."""
+    width = 16
+    plan = _lse_mirror_plan(num_kv_splits=4, width=width)
+    plan._buf["workspace_o"].fill_(7.5)
+
+    _, _, _, rebuilt, _ = plan.refresh(
+        (False, True, 1, _decode_plan_dict(width), None))
+
+    o = rebuilt["workspace_o"]
+    assert o.data_ptr() == plan._buf["workspace_o"].data_ptr()
+    assert torch.all(o == 7.5), \
+        "workspace_o was needlessly rewritten; it is write-before-read scratch"
