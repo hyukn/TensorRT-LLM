@@ -1798,8 +1798,6 @@ class DeepseekV4DecoderLayer(DecoderLayer):
         )
 
         self.fusion_config = EagerFusionConfig()
-        self.enable_fusion = os.environ.get("TRTLLM_DEEPSEEK_EAGER_FUSION_DISABLED", "0") == "0"
-        self.enable_fusion &= not self.enable_attention_dp
 
         self.hc_ffn = mHC(
             config.hc_mult,
@@ -1826,8 +1824,15 @@ class DeepseekV4DecoderLayer(DecoderLayer):
             )
             self.moe_allreduce = MoEAllReduce(self.mapping)
 
-        has_tp = mapping.has_tp()
-        self.fusion_config.PRE_MOE_FUSION = self.enable_fusion and has_tp
+        # DeepSeek-V4's attention output projection reduces across TP itself
+        # (self_attn is built with reduce_output whenever TP is on without
+        # attention DP), so the activation entering the MoE block is already
+        # rank-replicated. An all-reduce fused into the pre-MoE RMSNorm would
+        # only scale it by tp_size, which that same norm divides straight back
+        # out: the collective changes nothing and costs a TP synchronization
+        # point per layer. post_attention_layernorm is folded into the mHC
+        # boundary that precedes it instead (see forward).
+        self.fusion_config.PRE_MOE_FUSION = False
         # DeepSeek-V4 applies the next RMSNorm after mHC post_mapping and the
         # next layer's mHC pre_mapping. Fusing the post-MoE all-reduce with the
         # next RMSNorm would normalize the raw MoE output before mHC post_mapping,
@@ -2009,7 +2014,10 @@ class DeepseekV4DecoderLayer(DecoderLayer):
         )
 
         # -------------------------------------------------------------------
-        # Mid-layer boundary: fuse hc_attn.post_mapping + hc_ffn.pre_mapping.
+        # Mid-layer boundary: fuse hc_attn.post_mapping + hc_ffn.pre_mapping,
+        # with post_attention_layernorm folded into the layer_input epilogue —
+        # the same fold the entry boundary applies to input_layernorm, so the
+        # MoE block receives an already-normalized layer_input.
         # No engram concern here because engram only fires at layer entry.
         # When enable_fused_hc=False, fall back to the unfused chain.
         # -------------------------------------------------------------------
@@ -2031,6 +2039,8 @@ class DeepseekV4DecoderLayer(DecoderLayer):
                 residual_prev=residual,
                 post_mix_prev=post_mix,
                 comb_mix_prev=comb_mix,
+                norm_weight=self.post_attention_layernorm.weight,
+                norm_eps=self.post_attention_layernorm.variance_epsilon,
             )
         else:
             # Break fused_hc into post_mapping and pre_mapping as separate ops.
@@ -2041,6 +2051,7 @@ class DeepseekV4DecoderLayer(DecoderLayer):
                 comb_res_mix=comb_mix,
             )
             post_mix, comb_mix, layer_input = self.hc_ffn.pre_mapping(residual)
+            layer_input = self.post_attention_layernorm(layer_input)
 
         # -------------------------------------------------------------------
         # MoE block — returns x_ffn (post-MoE, already normed by
@@ -2126,6 +2137,13 @@ class DeepseekV4DecoderLayer(DecoderLayer):
         spec_metadata: Optional[SpecMetadata] = None,
         input_ids: Optional[torch.IntTensor] = None,
     ) -> torch.Tensor:
+        """Run the MoE block.
+
+        ``hidden_states`` is the mHC boundary's ``layer_input``, already
+        normalized by ``post_attention_layernorm`` in that boundary's epilogue,
+        and already reduced across TP by the attention output projection.
+        """
+
         def _run_MoE(hidden_states, hidden_states_fp4, do_finalize, input_ids):
             return self.mlp(
                 hidden_states,
@@ -2139,23 +2157,6 @@ class DeepseekV4DecoderLayer(DecoderLayer):
                 do_finalize=do_finalize,
                 input_ids=input_ids,
             )
-
-        if self.fusion_config.PRE_MOE_FUSION:
-            # In DeepSeek-V4 the external residual connection is handled by mHC
-            # (hc_ffn.post_mapping), so there is no residual to add here.
-            # Use fused allreduce + RMSNorm (no residual addition).
-            hidden_states = self.allreduce(
-                hidden_states,
-                all_reduce_params=AllReduceParams(
-                    fusion_op=AllReduceFusionOp.RMS_NORM,
-                    norm_weight=self.post_attention_layernorm.weight,
-                    eps=self.post_attention_layernorm.variance_epsilon,
-                    trigger_completion_at_end=False,
-                ),
-            )
-        else:
-            # No fusion: just normalize.
-            hidden_states = self.post_attention_layernorm(hidden_states)
 
         # Note: this fusion pattern is only supported for single-node TRTLLM-nvfp4 backend now
         do_finalize = self.mapping.is_multi_node() or (
