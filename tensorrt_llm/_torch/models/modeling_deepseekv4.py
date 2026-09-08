@@ -1542,7 +1542,9 @@ class DeepseekV4MoE(nn.Module):
         self.allreduce = None
         if not self.use_dp and self.mapping.tp_size > 1:
             self.allreduce = AllReduce(
-                mapping=model_config.mapping, strategy=model_config.allreduce_strategy
+                mapping=model_config.mapping,
+                strategy=model_config.allreduce_strategy,
+                dtype=dtype,
             )
         self.aux_stream = aux_stream_dict[AuxStreamType.MoeShared]
         self.event_dict = {key: torch.cuda.Event() for key in [EventType.Main, EventType.MoeShared]}

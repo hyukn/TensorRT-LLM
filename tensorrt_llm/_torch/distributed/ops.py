@@ -12,6 +12,7 @@ from tensorrt_llm._torch.distributed.allreduce_helper import \
     CustomAllReduceHelper
 from tensorrt_llm._torch.distributed.symm_mem_allreduce import \
     SymmetricMemoryAllReduce
+from tensorrt_llm._torch.flashinfer_utils import IS_FLASHINFER_AVAILABLE
 from tensorrt_llm._torch.utils import get_model_extra_attrs
 from tensorrt_llm._utils import mpi_comm, mpi_disabled
 from tensorrt_llm.bindings import internal as _tllm_internal
@@ -590,6 +591,18 @@ class MNNVLAllReduce(nn.Module):
                 num_tokens / group_size) * group_size * hidden_dim * elem_size
         return workspace_size
 
+    @staticmethod
+    def can_split_rms_norm(input: torch.Tensor,
+                           all_reduce_params: AllReduceParams) -> bool:
+        """Whether an RMS_NORM request may run as MNNVL all-reduce + RMSNorm.
+
+        Bounded by what flashinfer's rmsnorm accepts: a 2-D half-precision
+        tensor with an affine weight.
+        """
+        return (IS_FLASHINFER_AVAILABLE and input.dim() == 2
+                and input.dtype in (torch.float16, torch.bfloat16)
+                and all_reduce_params.norm_weight is not None)
+
     def forward(
         self,
         input: torch.Tensor,
@@ -633,6 +646,17 @@ class MNNVLAllReduce(nn.Module):
         # The buffer flags is tied to the buffer and used to save the state of the buffer
         buffer_flags = workspace["buffer_flags"]
 
+        # RMS_NORM has no MNNVL fusion pattern of its own, but it is exactly a
+        # plain all-reduce followed by a standalone RMSNorm, and that is already
+        # how the NCCL strategies execute it (allreduceOp.cpp's
+        # fallbackRunSubsequentOps runs the norm as a second kernel). Splitting
+        # it the same way keeps the reduction itself on MNNVL instead of handing
+        # the whole op back to NCCL.
+        split_rms_norm = (fusion_op == AllReduceFusionOp.RMS_NORM
+                          and self.can_split_rms_norm(input, all_reduce_params))
+        if split_rms_norm:
+            fusion_op = AllReduceFusionOp.NONE
+
         is_fusion = fusion_op != AllReduceFusionOp.NONE
         if is_fusion and fusion_op not in MNNVLAllReduce.SUPPORTED_FUSION_OPS:
             return None
@@ -648,6 +672,11 @@ class MNNVLAllReduce(nn.Module):
             all_reduce_params.scale,  # scale
             int(fusion_op),
         )
+        if split_rms_norm:
+            from tensorrt_llm._torch.custom_ops import flashinfer_rmsnorm
+            return flashinfer_rmsnorm(outputs[0],
+                                      all_reduce_params.norm_weight,
+                                      all_reduce_params.eps)
         return tuple(outputs) if is_fusion else outputs[0]
 
 
