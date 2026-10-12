@@ -63,7 +63,13 @@ from .kernels.trtllm_gen_dense_decode import (
     uniform_subpages_per_slot,
     write_subpage_block_table,
 )
-from .msa_indexer import MsaIndexer, cutedsl_score_runner, cutedsl_split_score_runner
+from .msa_indexer import (
+    CtxScoreArgs,
+    MsaIndexer,
+    ctx_scorer_module,
+    cutedsl_score_runner,
+    cutedsl_split_score_runner,
+)
 
 
 def _cache_device(meta) -> torch.device:
@@ -195,6 +201,8 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
     # never captured. Built once per step in prepare() and reused by every
     # layer.
     _msa_prefill_proxy_plan: Optional[tuple] = None
+    # ((first, last) rows, tcgen05 ctx-scorer launch plan, max k tiles); see msa_indexer.CtxScoreArgs.
+    _msa_ctx_score_plan: Optional[tuple] = None
     _msa_prefill_gqa_plan: Optional[tuple] = None
     _msa_prefill_dense_plan: Optional[tuple] = None
     # Per-token valid-block count for the prefill-side indexer proxy. It is
@@ -900,6 +908,7 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
         per-step tensors.
         """
         self._msa_prefill_proxy_plan = None
+        self._msa_ctx_score_plan = None
         self._msa_prefill_gqa_plan = None
         self._msa_prefill_dense_plan = None
         self._msa_prefill_n_valid_blocks = None
@@ -972,6 +981,20 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
             num_kv_heads=1,
             output_maxscore=True,
         )
+        proxy_rows = self._msa_proxy_plan_rows()
+        ctx_mod = ctx_scorer_module()
+        if ctx_mod is not None and proxy_rows is not None and proxy_rows[0] == 0:
+            first, last = proxy_rows
+            kv_rows = kv_lens_cpu[first:last]
+            max_k_tiles = (
+                int((int(kv_rows.max()) + page_size - 1) // page_size) if last > first else 0
+            )
+            if max_k_tiles > 0:
+                self._msa_ctx_score_plan = (
+                    proxy_rows,
+                    ctx_mod.ctx_plan_tc(qo_lens_cpu[first:last], kv_rows, num_index_heads),
+                    max_k_tiles,
+                )
         attn_rows = self._msa_attn_plan_rows()
         # Sparse layers: kv_block_num=topk limits attention to top-k blocks.
         self._msa_prefill_gqa_plan = plan_for(
@@ -1523,7 +1546,7 @@ class MiniMaxM3MsaSparseAttention(TrtllmAttention):
         # The generation span can be scored split across the TP group instead (pure-decode and
         # mixed steps alike); the result is bitwise what the CuTe DSL scorer would write.
         split_scores = None
-        if span is not None:
+        if span is not None and tp_split_min_batch() is not None:
             split_scores = self._maybe_tp_split_scores(
                 metadata,
                 idx_q_view[gen_first:],
@@ -1560,6 +1583,17 @@ class MiniMaxM3MsaSparseAttention(TrtllmAttention):
                 if span is not None
                 else None
             )
+        ctx_score_args = None
+        ctx_plan = getattr(metadata, "_msa_ctx_score_plan", None)
+        if ctx_plan is not None:
+            (first, last), plan, max_k_tiles = ctx_plan
+            ctx_score_args = CtxScoreArgs(
+                cu_seqlens_q=metadata.msa_cu_q_lens[first : last + 1],
+                seq_lens=metadata.msa_seq_lens_cuda[first:last],
+                block_table=metadata.msa_block_table[first:last],
+                plan=plan,
+                max_k_tiles=max_k_tiles,
+            )
         return self.indexer.select_blocks(
             idx_q_view,
             idx_k_cache,
@@ -1578,6 +1612,7 @@ class MiniMaxM3MsaSparseAttention(TrtllmAttention):
             gen_token_first=gen_first,
             ctx_rows=ctx_rows,
             precomputed_gen_scores=split_scores,
+            ctx_score_args=ctx_score_args,
         )
 
     def _maybe_tp_split_scores(
