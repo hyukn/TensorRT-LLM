@@ -1726,6 +1726,9 @@ class KVCacheManagerV2(BaseResourceManager):
 
         self.kv_cache_map: dict[int, _KVCache] = {}
         self._disagg_receive_ready: dict[int, torch.cuda.Event] = {}
+        # Set by the disagg coordinator when it publishes gen-init receives after the forward
+        # (wait_disagg_receive_ready) instead of right after prepare_resources.
+        self.defer_disagg_receive_ready = False
         self._request_stats_enabled_ids: set[int] = set()
 
         # Lazily built map of layer-group id -> sliding window size, restricted
@@ -4005,11 +4008,23 @@ class KVCacheManagerV2(BaseResourceManager):
             by_group.append(indices)
         return by_group
 
+    def wait_disagg_receive_ready(self, request_id: int) -> None:
+        """Host-wait for a gen-init request's admission event (deferred publication path)."""
+        ready = self._disagg_receive_ready.pop(request_id, None)
+        if ready is not None:
+            ready.synchronize()
+
     @nvtx_range("prepare_resources_kv_cache_manager_v2")
     def prepare_resources(self, scheduled_batch: ScheduledRequests):
         for request in scheduled_batch.context_requests:
             ready = self._disagg_receive_ready.get(request.py_request_id)
             if ready is not None:
+                if self.defer_disagg_receive_ready:
+                    # The host wait moves to wait_disagg_receive_ready, right before the receive
+                    # is published; order this stream's later work after admission without
+                    # blocking the host.
+                    torch.cuda.current_stream().wait_event(ready)
+                    continue
                 ready.synchronize()
                 del self._disagg_receive_ready[request.py_request_id]
 

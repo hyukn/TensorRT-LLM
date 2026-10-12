@@ -219,6 +219,22 @@ _SCHEDULE_HEAD = [
 _SHUTDOWN_PASS = [("handle_errors_synced",), ("flush_pending_transfer_responses",)]
 _PP_SHUTDOWN_PASS = [("handle_errors_synced",)]
 
+# The overlap loop also publishes deferred gen-init receives (rank-local, no collective): it sets
+# the mode once before the first iteration, publishes leftovers right after the error pass, and
+# publishes the iteration's receives after the forward/update section.
+_DEFER_MODE_SET = [("enable_deferred_gen_receive_publish", False)]
+_PUBLISH = ("publish_deferred_gen_receives",)
+
+
+def _with_head_publish(transcript: list) -> list:
+    """Insert the loop-head publish after every error pass."""
+    out = []
+    for call in transcript:
+        out.append(call)
+        if call == ("handle_errors_synced",):
+            out.append(_PUBLISH)
+    return out
+
 
 def test_executor_loop_transcript(monkeypatch) -> None:
     """The timeout-consensus drain precedes the response flush in this loop."""
@@ -248,12 +264,13 @@ def test_executor_loop_overlap_transcript(monkeypatch) -> None:
     PyExecutor._executor_loop_overlap(executor)
 
     idle_pass = _SCHEDULE_HEAD + [
+        _PUBLISH,
         ("flush_pending_transfer_responses",),
         ("handle_timeouts_synced",),
         ("check_transfer_timeouts", "only_with_context_sends=True"),
         ("pace_idle",),
     ]
-    assert calls == idle_pass + _SHUTDOWN_PASS
+    assert calls == _DEFER_MODE_SET + _with_head_publish(idle_pass + _SHUTDOWN_PASS)
 
 
 @pytest.mark.parametrize(
@@ -280,7 +297,10 @@ def test_insufficient_kv_fail_fast_ends_the_loop_before_the_benchmark_gate(
 
     loop(executor)
 
-    assert calls == _SCHEDULE_HEAD + [("fail_requests", 2), ("flush_pending_transfer_responses",)]
+    expected = _SCHEDULE_HEAD + [("fail_requests", 2), ("flush_pending_transfer_responses",)]
+    if loop is PyExecutor._executor_loop_overlap:
+        expected = _DEFER_MODE_SET + _with_head_publish(expected)
+    assert calls == expected
     executor._check_benchmark_disagg_gate.assert_not_called()
     assert executor._event_loop_completed
 

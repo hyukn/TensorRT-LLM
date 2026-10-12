@@ -114,6 +114,51 @@ class DisaggTransferCoordinator:
         self._timed_out_ctx_cancelled_ids: Set[int] = set()
         self._timed_out_gen_cancelled_ids: Set[int] = set()
         self._inflight_cancel_unsupported_logged = False
+        # Deferred receive publication (TRTLLM_DISAGG_DEFER_GEN_RECEIVE): gen-init requests whose
+        # resources are prepared but whose receive is published after the iteration's forward.
+        self._defer_gen_receive_publish = False
+        self._deferred_gen_receives: List[LlmRequest] = []
+
+    def enable_deferred_gen_receive_publish(self, enabled: bool) -> None:
+        """Publish gen-init KV receives after the iteration's forward instead of while scheduling.
+
+        Admission records a cache-stream event that the receive must not be published before
+        (RDMA cannot observe stream order); it can depend on pages the in-flight forward still
+        reads, so waiting for it while scheduling stalls the host for most of a step -- and under
+        attention DP every rank waits for that one at the next rank collective, leaving all GPUs
+        idle while the hosts then prepare the next step. Deferred, the wait happens after the
+        next forward is already queued (``publish_deferred_gen_receives``), when the event has
+        normally completed. Only used by loops that call ``publish_deferred_gen_receives`` every
+        iteration, and only with asynchronous receives (or the gen-only benchmark, which has no
+        receive at all).
+        """
+        enabled = bool(enabled) and (
+            uses_async_gen_transfer() or is_gen_only_no_context_benchmark()
+        )
+        self._defer_gen_receive_publish = enabled
+        for mgr in (self._kv_cache_manager, self._draft_kv_cache_manager):
+            if mgr is not None and hasattr(mgr, "defer_disagg_receive_ready"):
+                mgr.defer_disagg_receive_ready = enabled
+
+    @nvtx_range("publish_deferred_gen_receives")
+    def publish_deferred_gen_receives(self) -> None:
+        """Wait for each deferred request's admission event, then publish its receive.
+
+        Rank-local (like the immediate path, which only runs on ranks that admitted requests).
+        Requests that left DISAGG_GENERATION_INIT meanwhile (terminated) are skipped.
+        """
+        if not self._deferred_gen_receives:
+            return
+        pending, self._deferred_gen_receives = self._deferred_gen_receives, []
+        live = [req for req in pending if req.state == LlmRequestState.DISAGG_GENERATION_INIT]
+        for mgr in (self._kv_cache_manager, self._draft_kv_cache_manager):
+            wait = getattr(mgr, "wait_disagg_receive_ready", None) if mgr is not None else None
+            if wait is not None:
+                for req in live:
+                    wait(req.py_request_id)
+        if not live:
+            return
+        self._publish_gen_receives(live)
 
     # -- loop head -----------------------------------------------------------
 
@@ -344,6 +389,12 @@ class DisaggTransferCoordinator:
             self._check_transfer_errors("generation requests")
             return
 
+        if self._defer_gen_receive_publish:
+            self._deferred_gen_receives.extend(admitted)
+            return
+        self._publish_gen_receives(admitted)
+
+    def _publish_gen_receives(self, admitted: List[LlmRequest]) -> None:
         for req in admitted:
             self._transceiver.request_and_receive_async(req)
 
@@ -796,6 +847,12 @@ class NoopDisaggCoordinator(DisaggTransferCoordinator):
             enable_attention_dp=False,
             force_terminate_ctx_for_partial_reuse=False,
         )
+
+    def enable_deferred_gen_receive_publish(self, enabled: bool) -> None:
+        pass
+
+    def publish_deferred_gen_receives(self) -> None:
+        pass
 
     def handle_errors_synced(self) -> None:
         return None

@@ -5341,6 +5341,11 @@ class PyExecutor:
             target_inputs = None
             previous_tensors_device = None
             can_forward = not self.is_benchmark_disagg
+            # Publish gen-init KV receives after the forward instead of host-waiting for each
+            # admission while scheduling (see DisaggTransferCoordinator.
+            # enable_deferred_gen_receive_publish). This loop publishes every iteration.
+            self.disagg.enable_deferred_gen_receive_publish(
+                os.environ.get("TRTLLM_DISAGG_DEFER_GEN_RECEIVE", "0") == "1")
             while True:
                 self.hang_detector.checkpoint()
                 profile_step()
@@ -5354,6 +5359,9 @@ class PyExecutor:
                     self._maybe_rebalance_kv_pools()
 
                 self.disagg.handle_errors_synced()
+                # Receives an iteration deferred but did not publish (it left early) go out
+                # before the next schedule sees their requests.
+                self.disagg.publish_deferred_gen_receives()
 
                 # Need to wait for the copy of previous iteration before
                 # modifying any host memory copied to GPU. Scheduler V2
@@ -5538,6 +5546,10 @@ class PyExecutor:
 
                     self._send_kv_async(
                         self.previous_batch.scheduled_requests.all_requests())
+
+                # This iteration's forward is queued and the previous one has completed (its
+                # sample was awaited above), which normally completes the admission events too.
+                self.disagg.publish_deferred_gen_receives()
 
                 if self.enable_early_first_token_response:
                     if self.previous_batch is not None and should_process_previous_batch:
