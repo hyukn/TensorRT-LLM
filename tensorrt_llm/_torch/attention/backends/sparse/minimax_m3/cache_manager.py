@@ -769,12 +769,7 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
         preserves the dim-0 stride (``scale * page_stride``), so
         ``view[s, 0/1, ...]`` lands on this layer's K/V at slot ``s``.
         """
-        addr_key, torch_dtype, num_slots, scale, page_shape = self._kv_slot_geometry(
-            layer_idx, kv_layout
-        )
-        full_slot_shape = [num_slots, scale, *page_shape]
-        full_view = convert_to_torch_tensor(TensorWrapper(addr_key, torch_dtype, full_slot_shape))
-        return full_view[:, :2]
+        return self._cached_pool_view("kv", layer_idx, kv_layout, Role.KEY, self._kv_slot_geometry)
 
     def _kv_scale_slot_geometry(
         self, layer_idx: int, kv_layout: Optional[str]
@@ -839,12 +834,35 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
         self, layer_idx: int, kv_layout: Optional[str] = None
     ) -> torch.Tensor:
         """Return paged NVFP4 K+V E4M3 scale-byte views for ``layer_idx``."""
-        addr_key, torch_dtype, num_slots, scale, page_shape = self._kv_scale_slot_geometry(
-            layer_idx, kv_layout
+        return self._cached_pool_view(
+            "kv_scale", layer_idx, kv_layout, Role.KEY_BLOCK_SCALE, self._kv_scale_slot_geometry
         )
+
+    def _cached_pool_view(self, kind, layer_idx, kv_layout, role, geometry_fn) -> torch.Tensor:
+        """The [num_slots, 2, ...] K+V view of one layer's pool, rebuilt only when the pool moved.
+
+        Building the view walks six pool accessors and wraps the address through
+        __cuda_array_interface__, which costs tens of microseconds; the attention path asks for
+        it several times per layer per step. The view only changes when the pool is re-laid out
+        (KV pool rebalancing changes the base address and the page count), so the cached view is
+        keyed on those two accessor values and rebuilt whenever either differs.
+        """
+        cache = self.__dict__.setdefault("_pool_view_cache", {})
+        key = (kind, layer_idx, kv_layout)
+        layer_offset = self.layer_offsets[layer_idx]
+        stamp = (
+            self.impl.get_mem_pool_base_address(layer_offset, role),
+            self.impl.get_page_index_upper_bound(layer_offset, role),
+        )
+        hit = cache.get(key)
+        if hit is not None and hit[0] == stamp:
+            return hit[1]
+        addr_key, torch_dtype, num_slots, scale, page_shape = geometry_fn(layer_idx, kv_layout)
         full_slot_shape = [num_slots, scale, *page_shape]
         full_view = convert_to_torch_tensor(TensorWrapper(addr_key, torch_dtype, full_slot_shape))
-        return full_view[:, :2]
+        view = full_view[:, :2]
+        cache[key] = (stamp, view)
+        return view
 
     def get_kv_subpage_pool(
         self, layer_idx: int, kv_layout: str = "HND"
