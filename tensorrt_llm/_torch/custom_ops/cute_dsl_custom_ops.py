@@ -9386,6 +9386,168 @@ if IS_CUTLASS_DSL_AVAILABLE:
     ) -> None:
         return None
 
+    # ------------------------------------------------------------------ #
+    #  CuTe DSL MiniMax-M3 index decode scoring split across TP ranks    #
+    # ------------------------------------------------------------------ #
+    from ..cute_dsl_kernels.blackwell.minimax_m3_index_decode_score_split import \
+        IndexDecodeScoreSplitKernel
+
+    class CuteDSLMiniMaxM3IndexDecodeScoreSplitRunner:
+        """Runner for the rank-split MiniMax-M3 indexer decode scorer.
+
+        Rank r of W scores every index head on blocks r::W and writes head h
+        into its own output tensor (the owning rank's buffer, usually peer
+        memory). Compiled per (dtype, num_heads, max_decode_query_len,
+        head_dim, split_k, rank, world); batch, token count, page count and
+        all output strides stay symbolic.
+        """
+
+        kernel_cache = dict()
+        MAX_HEADS = 4
+
+        @classmethod
+        def is_supported(cls, *, q_dtype: torch.dtype, num_heads: int,
+                         head_dim: int, page_size: int,
+                         max_decode_query_len: int) -> bool:
+            return (num_heads <= cls.MAX_HEADS
+                    and CuteDSLMiniMaxM3IndexDecodeScoreRunner.is_supported(
+                        q_dtype=q_dtype,
+                        num_heads=num_heads,
+                        head_dim=head_dim,
+                        page_size=page_size,
+                        max_decode_query_len=max_decode_query_len))
+
+        @classmethod
+        def _compile(cls, key):
+            (q_dtype, num_heads, max_decode_query_len, head_dim, split_k, rank,
+             world) = key
+            cute_dtype = _M3_TORCH_TO_CUTE_DTYPE[q_dtype]
+            page_size = IndexDecodeScoreSplitKernel.BLOCK_K
+            sym_total_tokens = cute.sym_int()
+            sym_batch = cute.sym_int()
+            sym_pages = cute.sym_int()
+
+            def _sym_stride():
+                return cute.sym_int64(divisibility=16)
+
+            q_fake = cute.runtime.make_fake_tensor(
+                cute_dtype, (sym_total_tokens, num_heads, head_dim),
+                stride=(_sym_stride(), _sym_stride(), 1))
+            k_fake = cute.runtime.make_fake_tensor(
+                cute_dtype, (cute.sym_int(), page_size, head_dim),
+                stride=(_sym_stride(), _sym_stride(), 1))
+            bt_fake = cute.runtime.make_fake_compact_tensor(
+                cutlass.Int32, (sym_batch, cute.sym_int()), stride_order=(1, 0))
+            score_fakes = [
+                cute.runtime.make_fake_tensor(cutlass.Float32,
+                                              (sym_total_tokens, sym_pages),
+                                              stride=(cute.sym_int64(),
+                                                      cute.sym_int64()))
+                for _ in range(cls.MAX_HEADS)
+            ]
+            sl_fake = cute.runtime.make_fake_compact_tensor(cutlass.Int32,
+                                                            (sym_batch, ),
+                                                            stride_order=(0, ))
+            fake_stream = cute.runtime.make_fake_stream(
+                use_tvm_ffi_env_stream=True)
+            kernel = IndexDecodeScoreSplitKernel(cute_dtype,
+                                                 num_heads,
+                                                 max_decode_query_len,
+                                                 split_k,
+                                                 head_dim,
+                                                 rank=rank,
+                                                 world=world)
+            cls.kernel_cache[key] = cute.compile(kernel,
+                                                 q_fake,
+                                                 k_fake,
+                                                 bt_fake,
+                                                 *score_fakes,
+                                                 sl_fake,
+                                                 fake_stream,
+                                                 options="--enable-tvm-ffi")
+            logger.debug(
+                f"[compile cute_dsl minimax_m3_index_decode_score_split] {key}")
+
+        @classmethod
+        def forward(cls, idx_q: torch.Tensor, index_k_cache: torch.Tensor,
+                    block_table: torch.Tensor, seq_lens: torch.Tensor,
+                    scores: List[torch.Tensor], max_decode_query_len: int,
+                    rank: int, world: int, split_k: int) -> None:
+            """Compiles on first use; that allocates, so the first call for a
+            key must not be inside a CUDA graph capture (the eager warmup
+            forwards that precede capture cover it)."""
+            _, num_heads, head_dim = idx_q.shape
+            if len(scores) != num_heads:
+                raise ValueError(
+                    f"need one score tensor per index head ({num_heads}), "
+                    f"got {len(scores)}")
+            key = (idx_q.dtype, num_heads, max_decode_query_len, head_dim,
+                   split_k, rank, world)
+            if key not in cls.kernel_cache:
+                cls._compile(key)
+            padded = list(scores) + [scores[0]] * (cls.MAX_HEADS - num_heads)
+            cls.kernel_cache[key](idx_q, index_k_cache, block_table, *padded,
+                                  seq_lens)
+
+    @torch.library.custom_op(
+        "trtllm::cute_dsl_minimax_m3_index_decode_score_split",
+        mutates_args=("score0", "score1", "score2", "score3"),
+        device_types="cuda")
+    def cute_dsl_minimax_m3_index_decode_score_split(
+        idx_q: torch.Tensor,
+        index_k_cache: torch.Tensor,
+        block_table: torch.Tensor,
+        seq_lens: torch.Tensor,
+        score0: torch.Tensor,
+        score1: torch.Tensor,
+        score2: torch.Tensor,
+        score3: torch.Tensor,
+        num_heads: int,
+        max_decode_query_len: int,
+        rank: int,
+        world: int,
+        split_k: int,
+    ) -> None:
+        """Rank-split index decode scoring (see IndexDecodeScoreSplitKernel).
+
+        Args:
+            idx_q: [total_q, num_heads, head_dim] index Q of every index head,
+                BF16 or FP8 E4M3; any 16-element-aligned strides.
+            index_k_cache: [num_pages, page_size, head_dim] MQA index-K pool.
+            block_table / seq_lens: as for cute_dsl_minimax_m3_index_decode_score.
+            score0..score3: [total_q, max_blocks] float32 per index head (any
+                strides); only the first num_heads are used. Head h receives
+                blocks rank::world below ceil(seq_len / page_size).
+        """
+        if not is_sm_100f():
+            raise ValueError(
+                f"CuteDSL: SM version {get_sm_version()} is not supported. "
+                f"The rank-split MiniMax-M3 index decode scorer only supports "
+                f"the SM 100 family.")
+        CuteDSLMiniMaxM3IndexDecodeScoreSplitRunner.forward(
+            idx_q, index_k_cache, block_table, seq_lens,
+            [score0, score1, score2,
+             score3][:num_heads], max_decode_query_len, rank, world, split_k)
+
+    @torch.library.register_fake(
+        "trtllm::cute_dsl_minimax_m3_index_decode_score_split")
+    def _(
+        idx_q: torch.Tensor,
+        index_k_cache: torch.Tensor,
+        block_table: torch.Tensor,
+        seq_lens: torch.Tensor,
+        score0: torch.Tensor,
+        score1: torch.Tensor,
+        score2: torch.Tensor,
+        score3: torch.Tensor,
+        num_heads: int,
+        max_decode_query_len: int,
+        rank: int,
+        world: int,
+        split_k: int,
+    ) -> None:
+        return None
+
     # ======================================================================
     # BF16 Dense Persistent BMM (CuTe DSL) for Blackwell
     # ======================================================================

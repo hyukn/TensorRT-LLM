@@ -48,6 +48,7 @@ from .common import (
     build_paged_kv_slot_mapping,
     write_kv_slots,
 )
+from .index_tp_split import IndexTpSplitWorkspace, tp_split_min_batch, tp_split_score
 from .kernels.msa_utils import (
     MSA_REQUIRED_HEAD_DIM,
     MSA_REQUIRED_TOPK,
@@ -60,7 +61,7 @@ from .kernels.trtllm_gen_dense_decode import (
     uniform_subpages_per_slot,
     write_subpage_block_table,
 )
-from .msa_indexer import MsaIndexer, cutedsl_score_runner
+from .msa_indexer import MsaIndexer, cutedsl_score_runner, cutedsl_split_score_runner
 
 
 def _cache_device(meta) -> torch.device:
@@ -1489,7 +1490,21 @@ class MiniMaxM3MsaSparseAttention(TrtllmAttention):
         # present (a standalone test that skips prepare) select_blocks plans
         # inline and computes the valid-block count itself.
         proxy_plan = metadata.msa_prefill_proxy_plan
+        # The generation span can be scored split across the TP group instead (pure-decode and
+        # mixed steps alike); the result is bitwise what the CuTe DSL scorer would write.
+        split_scores = None
+        if span is not None:
+            split_scores = self._maybe_tp_split_scores(
+                metadata,
+                idx_q_view[gen_first:],
+                idx_k_cache,
+                block_table=block_table,
+                seq_lens_cuda=seq_lens_cuda,
+                decode_query_len=decode_query_len,
+            )
         if proxy_plan is None and span is not None and span.row_first == 0:
+            if split_scores is not None:
+                return self.indexer._select(split_scores, metadata.msa_n_valid_blocks[:num_tokens])
             # No proxy plan to read max_k_tiles from for the contiguous score
             # view, so it is shaped to the worst case, which the scorer
             # accepts: it takes every score stride at runtime.
@@ -1532,6 +1547,68 @@ class MiniMaxM3MsaSparseAttention(TrtllmAttention):
             decode_query_len=decode_query_len,
             gen_token_first=gen_first,
             ctx_rows=ctx_rows,
+            precomputed_gen_scores=split_scores,
+        )
+
+    def _maybe_tp_split_scores(
+        self,
+        metadata,
+        idx_q_view: torch.Tensor,
+        idx_k_cache: torch.Tensor,
+        *,
+        block_table: torch.Tensor,
+        seq_lens_cuda: torch.Tensor,
+        decode_query_len: int,
+    ) -> Optional[torch.Tensor]:
+        """Score a step's generation span split across the TP group (see index_tp_split).
+
+        `idx_q_view`, `block_table` and `seq_lens_cuda` cover the span's rows only. Returns this
+        rank's [local_heads, worst_k_tiles, span tokens] max-score buffer, bitwise what the
+        unsplit scorer writes, or None when the split does not apply. Every input to the decision
+        is identical on all TP ranks, so they all take the same path and issue the same barriers.
+        """
+        min_batch = tp_split_min_batch()
+        if min_batch is None:
+            return None
+        mapping = metadata.mapping
+        if mapping is None or mapping.tp_size <= 1 or mapping.enable_attention_dp:
+            return None
+        if int(seq_lens_cuda.shape[0]) < min_batch:
+            return None
+        config = self.m3_config
+        local_heads = int(config.num_index_heads)
+        total_heads = local_heads * int(mapping.tp_size)
+        if total_heads != int(self.sparse_params.num_index_heads):
+            # TP wider than the index heads replicates them; nothing to split.
+            return None
+        page_size = int(idx_k_cache.shape[2])
+        runner = cutedsl_split_score_runner()
+        if runner is None or not runner.is_supported(
+            q_dtype=idx_q_view.dtype,
+            num_heads=total_heads,
+            head_dim=int(idx_q_view.shape[2]),
+            page_size=page_size,
+            max_decode_query_len=int(decode_query_len),
+        ):
+            return None
+        k_tiles = int(metadata.msa_worst_case_max_k_tiles)
+        max_tokens = int(metadata._msa_max_decode_tokens())
+        ws = IndexTpSplitWorkspace.get(
+            mapping,
+            local_heads=local_heads,
+            k_tiles=k_tiles,
+            q_row_bytes=local_heads * int(idx_q_view.shape[2]) * idx_q_view.element_size(),
+            max_tokens=max_tokens,
+        )
+        return tp_split_score(
+            ws,
+            idx_q_view,
+            idx_k_cache,
+            block_table=block_table,
+            seq_lens_cuda=seq_lens_cuda,
+            decode_query_len=int(decode_query_len),
+            local_heads=local_heads,
+            k_tiles=k_tiles,
         )
 
     def sparse_attn_predict(
