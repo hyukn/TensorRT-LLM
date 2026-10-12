@@ -21,6 +21,7 @@ from ..pyexecutor.kv_cache.mamba_cache_manager import MambaHybridCacheManager
 from ..pyexecutor.llm_request import LlmRequest
 from ..pyexecutor.resource_manager import BaseResourceManager, SlotManager
 from ..pyexecutor.scheduler import ScheduledRequests
+from . import eagle3_lm_head_tp
 from .interface import (INVALID_PROMPT_LOOKAHEAD_TOKEN, SpecMetadata,
                         SpecWorkerBase)
 from .mtp import _select_mtp_position_ids
@@ -930,9 +931,24 @@ class Eagle3OneModelWorker(SpecWorkerBase):
                             request_hidden_states, draft_model.lm_head,
                             attn_metadata, True)
                 else:
-                    logits = draft_model.logits_processor(
-                        hidden_states[gather_ids], draft_model.lm_head,
-                        attn_metadata, True)
+                    # Eagle3 under ADP: optionally vocab-shard the replicated
+                    # draft head across an LM-head-TP group (greedy drafts
+                    # only; see eagle3_lm_head_tp).
+                    eagle3_tp = None
+                    if (not advanced_draft_sampling
+                            and self.guided_decoder is None
+                            and eagle3_lm_head_tp.enabled(self.mapping)):
+                        eagle3_tp = eagle3_lm_head_tp.sharded_draft_logits(
+                            hidden_states[gather_ids],
+                            draft_model.lm_head.weight, self.mapping,
+                            spec_metadata.max_num_requests)
+                    if eagle3_tp is not None:
+                        logits, eagle3_lm_head_mapping = eagle3_tp
+                        use_lm_head_tp_in_adp = True
+                    else:
+                        logits = draft_model.logits_processor(
+                            hidden_states[gather_ids], draft_model.lm_head,
+                            attn_metadata, True)
 
                 if self.guided_decoder is not None:
                     if self.is_mtp_eagle:
@@ -953,7 +969,11 @@ class Eagle3OneModelWorker(SpecWorkerBase):
                 # shards and slice this rank's own row segment; only then trim
                 # the max_num_requests padding down to token_count.
                 mapping_lm_head_tp = None
-                if use_lm_head_tp_in_adp:
+                if use_lm_head_tp_in_adp and not self.is_mtp_eagle:
+                    # Eagle3 sharded head: one row per request.
+                    mapping_lm_head_tp = eagle3_lm_head_mapping
+                    token_count = batch_size
+                elif use_lm_head_tp_in_adp:
                     # The MTP head built this per-forward mapping when producing
                     # the vocab-sharded logits; the sampler needs it to gather.
                     mapping_lm_head_tp = getattr(
