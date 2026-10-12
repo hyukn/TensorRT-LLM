@@ -46,6 +46,16 @@ def cutedsl_score_runner():
     return getattr(cute_dsl_custom_ops, "CuteDSLMiniMaxM3IndexDecodeScoreRunner", None)
 
 
+@functools.lru_cache(maxsize=1)
+def cutedsl_split_score_runner():
+    """Return the rank-split CuTe DSL scoring runner, or None if unavailable."""
+    try:
+        from tensorrt_llm._torch.custom_ops import cute_dsl_custom_ops
+    except ImportError:
+        return None
+    return getattr(cute_dsl_custom_ops, "CuteDSLMiniMaxM3IndexDecodeScoreSplitRunner", None)
+
+
 def _cutedsl_score(
     idx_q: torch.Tensor,
     idx_k_paged: torch.Tensor,
@@ -235,6 +245,7 @@ class MsaIndexer:
         require_cutedsl: bool = False,
         gen_token_first: int = 0,
         ctx_rows: int = 0,
+        precomputed_gen_scores: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Return [total_q, num_kv_heads, topk] selected block indices.
 
@@ -255,12 +266,19 @@ class MsaIndexer:
         are 0 on a pure-decode step. The halves score into separate buffers,
         since fmha_sm100 writes a contiguous [heads, k_tiles, tokens] block and
         cannot fill a slice of the scorer's, then their tables are joined.
+
+        `precomputed_gen_scores` is the generation span's max-score buffer already
+        filled by another scorer (the TP-split one, see index_tp_split); the CuTe DSL
+        scorer is then skipped.
         """
         page_size = int(idx_k_paged.shape[2])
         gen_first = int(gen_token_first)
 
         scored = False
-        if (
+        if precomputed_gen_scores is not None:
+            max_score = precomputed_gen_scores
+            scored = True
+        elif (
             max_score is not None
             and block_table is not None
             and seq_lens_cuda is not None
@@ -398,4 +416,4 @@ class MsaIndexer:
         )
 
 
-__all__ = ["MsaIndexer", "cutedsl_score_runner"]
+__all__ = ["MsaIndexer", "cutedsl_score_runner", "cutedsl_split_score_runner"]
