@@ -48,7 +48,12 @@ from .common import (
     build_paged_kv_slot_mapping,
     write_kv_slots,
 )
-from .index_tp_split import IndexTpSplitWorkspace, tp_split_min_batch, tp_split_score
+from .index_tp_split import (
+    IndexTpSplitWorkspace,
+    tp_split_min_batch,
+    tp_split_peer_access,
+    tp_split_score,
+)
 from .kernels.msa_utils import (
     MSA_REQUIRED_HEAD_DIM,
     MSA_REQUIRED_TOPK,
@@ -1639,6 +1644,8 @@ class MiniMaxM3MsaSparseAttention(TrtllmAttention):
         if mapping is None or mapping.tp_size <= 1 or mapping.enable_attention_dp:
             return None
         if int(seq_lens_cuda.shape[0]) < min_batch:
+            return None
+        if not tp_split_peer_access(mapping):
             return None
         config = self.m3_config
         local_heads = int(config.num_index_heads)
