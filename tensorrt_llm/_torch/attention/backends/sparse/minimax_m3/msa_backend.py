@@ -1612,10 +1612,16 @@ class MiniMaxM3MsaSparseAttention(TrtllmAttention):
             return None
         config = self.m3_config
         local_heads = int(config.num_index_heads)
-        total_heads = local_heads * int(mapping.tp_size)
-        if total_heads != int(self.sparse_params.num_index_heads):
-            # TP wider than the index heads replicates them; nothing to split.
+        total_heads = int(self.sparse_params.num_index_heads)
+        tp_size = int(mapping.tp_size)
+        if local_heads <= 0 or total_heads % local_heads != 0:
             return None
+        groups = total_heads // local_heads
+        if tp_size % groups != 0:
+            return None
+        # TP wider than the index heads replicates whole head groups over consecutive ranks
+        # (index_head_range); the split then writes each group's scores to its first rank only.
+        replicas = tp_size // groups
         page_size = int(idx_k_cache.shape[2])
         runner = cutedsl_split_score_runner()
         if runner is None or not runner.is_supported(
@@ -1634,6 +1640,7 @@ class MiniMaxM3MsaSparseAttention(TrtllmAttention):
             k_tiles=k_tiles,
             q_row_bytes=local_heads * int(idx_q_view.shape[2]) * idx_q_view.element_size(),
             max_tokens=max_tokens,
+            replicas=replicas,
         )
         return tp_split_score(
             ws,
