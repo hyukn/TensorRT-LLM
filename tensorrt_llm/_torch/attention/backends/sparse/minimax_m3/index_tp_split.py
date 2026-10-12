@@ -125,22 +125,36 @@ def _gather_rows_barrier_kernel(
     rank,
     ROW_WORDS: tl.constexpr,
     WORLD: tl.constexpr,
-    BLOCK: tl.constexpr,
+    BLOCK_ROWS: tl.constexpr,
 ):
-    # Row t of this rank lands at row t * WORLD + rank of every rank's gather buffer.
-    e = tl.load(epoch_ptr) + 1
-    n_words = n_rows * ROW_WORDS
-    for p in tl.static_range(WORLD):
-        dst = tl.load(peer_dst_ptrs + p).to(tl.pointer_type(tl.int32))
-        for off in range(0, n_words, BLOCK):
-            o = off + tl.arange(0, BLOCK)
-            m = o < n_words
-            row = o // ROW_WORDS
-            col = o - row * ROW_WORDS
-            tl.store(dst + (row * WORLD + rank) * ROW_WORDS + col, tl.load(src + o, mask=m), mask=m)
+    # One program per destination rank p (grid = WORLD): copy this rank's rows into slot `rank` of
+    # p's gather buffer (row t lands at row t * WORLD + rank), then signal p. Only the program
+    # whose destination is this rank waits for the other ranks' signals; the kernel completes
+    # once it has, so the next kernel sees every rank's rows. Each program keeps its own epoch
+    # counter (epoch_ptr[p]); all of them advance once per call on every rank.
+    p = tl.program_id(0)
+    e = tl.load(epoch_ptr + p) + 1
+    dst = tl.load(peer_dst_ptrs + p).to(tl.pointer_type(tl.int32))
+    cols = tl.arange(0, ROW_WORDS)
+    for r0 in range(0, n_rows, BLOCK_ROWS):
+        rows = r0 + tl.arange(0, BLOCK_ROWS)
+        m = rows[:, None] < n_rows
+        vals = tl.load(src + rows[:, None] * ROW_WORDS + cols[None, :], mask=m)
+        tl.store(dst + (rows[:, None] * WORLD + rank) * ROW_WORDS + cols[None, :], vals, mask=m)
     tl.debug_barrier()
-    _signal_and_wait(peer_flag_ptrs, local_flags_addr, e, rank, WORLD)
-    tl.store(epoch_ptr, e)
+    lanes = tl.arange(0, WORLD)
+    peer_base = tl.load(peer_flag_ptrs + lanes)
+    # Lane p of program p (p != rank) signals rank p; every other lane hits the dummy slot.
+    signal = (lanes == p) & (p != rank)
+    dst_flag = tl.where(signal, peer_base + rank * 4, tl.load(peer_flag_ptrs + rank) + WORLD * 4)
+    _st_release_sys(dst_flag, tl.zeros([WORLD], tl.int32) + e)
+    if p == rank:
+        src_flag = local_flags_addr + lanes.to(tl.int64) * 4
+        is_peer = lanes != rank
+        v = tl.where(is_peer, _ld_acquire_sys(src_flag), e)
+        while tl.min(v - e) < 0:  # wrap-safe epoch comparison
+            v = tl.where(is_peer, _ld_acquire_sys(src_flag), e)
+    tl.store(epoch_ptr + p, e)
 
 
 def _wrap(ptr: int, numel: int, dtype: torch.dtype, device_id: int) -> torch.Tensor:
@@ -241,7 +255,8 @@ class IndexTpSplitWorkspace:
         )
         self.flag_a_local = ptrs[self.rank] + self._flag_off
         self.flag_b_local = ptrs[self.rank] + self._flag_off + _FLAG_SLOTS * 4
-        self.epochs = torch.zeros(2, dtype=torch.int32, device="cuda")
+        # epochs[:world]: one counter per gather program (destination rank); epochs[world]: barrier B.
+        self.epochs = torch.zeros(self.world + 1, dtype=torch.int32, device="cuda")
         torch.cuda.synchronize()
         logger.info(
             f"MiniMax-M3 index TP split workspace: rank {self.rank}/{self.world}, "
@@ -262,17 +277,17 @@ class IndexTpSplitWorkspace:
                 f"index-Q rows of {row_bytes} bytes x {tokens} do not fit the gather slot"
             )
         words = q_local.contiguous().view(torch.int32).view(-1)
-        _gather_rows_barrier_kernel[(1,)](
+        _gather_rows_barrier_kernel[(self.world,)](
             words,
             tokens,
             self.q_peer_ptrs,
             self.flag_a_ptrs,
             self.flag_a_local,
-            self.epochs[0:1],
+            self.epochs,
             self.rank,
             ROW_WORDS=row_bytes // 4,
             WORLD=self.world,
-            BLOCK=2048,
+            BLOCK_ROWS=64,
             num_warps=4,
         )
         dim = row // (num_heads_total // self.world)
@@ -300,7 +315,7 @@ class IndexTpSplitWorkspace:
         _flag_barrier_kernel[(1,)](
             self.flag_b_ptrs,
             self.flag_b_local,
-            self.epochs[1:2],
+            self.epochs[self.world :],
             self.rank,
             WORLD=self.world,
             num_warps=1,
