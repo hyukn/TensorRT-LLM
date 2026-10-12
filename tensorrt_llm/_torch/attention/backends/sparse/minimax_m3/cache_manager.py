@@ -30,6 +30,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, List, Optional, Sequence, Tuple
 
+import numpy as np
 import torch
 
 from tensorrt_llm._torch.disaggregation.resource.page import MapperKind
@@ -916,6 +917,20 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
             res.append(list(base_page_indices))
         return res
 
+    def _block_ids_fast_path_ok(self) -> bool:
+        """Whether get_batch_cache_indices(ids) is exactly pool 0 of this class's lookup.
+
+        get_block_ids_per_seq reads the page indices directly only while neither
+        the layer-to-pool resolution nor the per-pool lookup is overridden below
+        this class; any override keeps the generic path.
+        """
+        cls = type(self)
+        return (
+            cls.get_batch_cache_indices is KVCacheManagerV2.get_batch_cache_indices
+            and cls._get_batch_cache_indices_by_pool_id
+            is MiniMaxM3KVCacheManagerV2._get_batch_cache_indices_by_pool_id
+        )
+
     def get_block_ids_per_seq(self, request_ids):
         """Return per-request slot ids matching the per-layer paged view's dim-0.
 
@@ -927,7 +942,17 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
         pinned result, so the attention metadata builders ship it to the device
         in one asynchronous copy.
         """
-        block_ids_per_seq = self.get_batch_cache_indices(request_ids)
+        if self._block_ids_fast_path_ok():
+            # Read each request's pool-0 page indices through the buffer protocol
+            # instead of materializing them as Python lists: at AgentX context
+            # lengths (~1K pages per request) the per-element list building
+            # dominated the decode step's host-side metadata preparation.
+            block_ids_per_seq = [
+                np.asarray(self.kv_cache_map[req_id].get_base_page_indices(0))
+                for req_id in request_ids
+            ]
+        else:
+            block_ids_per_seq = self.get_batch_cache_indices(request_ids)
         batch = len(block_ids_per_seq)
         max_blocks = max((len(block_ids) for block_ids in block_ids_per_seq), default=0)
         padded_tensor = torch.zeros(
