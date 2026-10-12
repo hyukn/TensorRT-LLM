@@ -28,6 +28,7 @@ Provides:
 
 from __future__ import annotations
 
+import os
 from typing import TYPE_CHECKING, List, Optional, Sequence, Tuple
 
 import numpy as np
@@ -380,6 +381,32 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
                     dtype=torch_dtype,
                     device=device,
                 )
+        if os.environ.get("TRTLLM_M3_BENCH_RANDOM_INDEX_K", "0") == "1":
+            self._randomize_index_k_for_benchmark()
+
+    def _randomize_index_k_for_benchmark(self) -> None:
+        """Benchmark aid (TRTLLM_M3_BENCH_RANDOM_INDEX_K=1): fill the index-K cache with random values.
+
+        Gen-only benchmarks decode over KV that was never written. When that memory is zero, every
+        block's index score ties, which drives the block selection into its quadratic worst case
+        (tens to hundreds of us per layer instead of ~5) and makes step timings depend on whatever
+        the allocator handed out. Bytes 0x00-0x3F are finite, positive FP8 (e4m3) values.
+        """
+        for buf in self._index_k_buffers.values():
+            if buf is None:
+                continue
+            raw = buf.view(torch.uint8)
+            gen = torch.Generator(device=raw.device).manual_seed(1234)
+            chunk = 1024
+            for start in range(0, raw.shape[0], chunk):
+                part = raw[start : start + chunk]
+                part.copy_(
+                    torch.randint(
+                        0, 0x40, part.shape, dtype=torch.uint8, device=raw.device, generator=gen
+                    )
+                )
+        torch.cuda.synchronize()
+        logger.info("MiniMax-M3: index-K cache filled with random values (benchmark aid)")
 
     def _validate_speculative_config(self, spec_config: DecodingBaseConfig | None) -> None:
         # Dynamic-tree relocation moves packed K/V bytes without their NVFP4
