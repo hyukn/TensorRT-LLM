@@ -69,6 +69,30 @@ def tp_split_min_batch() -> Optional[int]:
     return int(os.environ.get(ENV_MIN_BATCH, str(DEFAULT_MIN_BATCH)))
 
 
+_PEER_ACCESS: Dict[Tuple[int, int, int], bool] = {}
+
+
+def tp_split_peer_access(mapping) -> bool:
+    """Whether every rank of the TP group can map this rank's peer buffers (same node, P2P).
+
+    The workspace uses IpcMemory, so a TP group spanning nodes (e.g. TP8 over two 4-GPU trays)
+    cannot split; every rank of such a group gets False, so they all keep the unsplit scorer.
+    """
+    key = (int(mapping.rank), int(mapping.tp_size), int(mapping.pp_rank))
+    ok = _PEER_ACCESS.get(key)
+    if ok is None:
+        from tensorrt_llm._ipc_utils import can_access_peer
+
+        ok = bool(can_access_peer(mapping))
+        _PEER_ACCESS[key] = ok
+        if not ok:
+            logger.info(
+                "MiniMax-M3 index TP split disabled: the TP group has no peer access "
+                "(spans nodes); using the unsplit scorer."
+            )
+    return ok
+
+
 def split_k_for_batch(batch: int) -> int:
     """CTAs per request: small batches need more of them to fill the GPU."""
     if batch <= 2:
@@ -397,6 +421,7 @@ def tp_split_score(
 
 __all__ = [
     "IndexTpSplitWorkspace",
+    "tp_split_peer_access",
     "split_k_for_batch",
     "tp_split_min_batch",
     "tp_split_score",
