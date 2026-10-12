@@ -36,6 +36,7 @@ Differences from upstream:
 
 from __future__ import annotations
 
+import functools
 import os
 from typing import Optional
 
@@ -1012,7 +1013,7 @@ def _check_nvfp4_inputs(
 
 
 @torch.no_grad()
-def minimax_m3_sparse_attn_decode(
+def _minimax_m3_sparse_attn_decode_triton(
     q: torch.Tensor,  # [total_q, num_heads, head_dim]
     k_paged: torch.Tensor,  # [num_pages, num_kv_heads, page_size, head_dim]
     v_paged: torch.Tensor,  # same layout as k_paged
@@ -1295,6 +1296,61 @@ def minimax_m3_sparse_attn_decode(
             **pdl_launch,
             **merge_launch_options,
         )
+
+
+def minimax_m3_sparse_attn_decode(
+    q: torch.Tensor,
+    k_paged: torch.Tensor,
+    v_paged: torch.Tensor,
+    topk_idx: torch.Tensor,
+    block_table: torch.Tensor,
+    seq_lens: torch.Tensor,
+    *,
+    sm_scale: float,
+    output: torch.Tensor,
+    decode_query_len: int,
+    kv_scale: Optional[torch.Tensor] = None,
+    k_block_scale: Optional[torch.Tensor] = None,
+    v_block_scale: Optional[torch.Tensor] = None,
+    k_global_scale: Optional[torch.Tensor] = None,
+    v_global_scale: Optional[torch.Tensor] = None,
+    num_topk_chunks: Optional[int] = None,
+) -> None:
+    """Block-sparse GQA decode attention (see _minimax_m3_sparse_attn_decode_triton).
+
+    With TRTLLM_M3_SPARSE_DECODE_V2=1 the NVFP4 path goes through sparse_decode_v2, a single-launch
+    CUDA kernel (page union over the Eagle query tokens, TMA ring, exact NVFP4 dequant into
+    mma.sync fragments, deterministic split merge) for the shapes where it was measured faster;
+    every other call stays on the Triton kernels.
+    """
+    kwargs = dict(
+        sm_scale=sm_scale,
+        output=output,
+        decode_query_len=decode_query_len,
+        kv_scale=kv_scale,
+        k_block_scale=k_block_scale,
+        v_block_scale=v_block_scale,
+        k_global_scale=k_global_scale,
+        v_global_scale=v_global_scale,
+        num_topk_chunks=num_topk_chunks,
+    )
+    if _sparse_decode_v2_enabled() and k_block_scale is not None:
+        from .sparse_decode_v2 import minimax_m3_sparse_attn_decode_v2
+
+        minimax_m3_sparse_attn_decode_v2(
+            q, k_paged, v_paged, topk_idx, block_table, seq_lens, **kwargs
+        )
+        return
+    _minimax_m3_sparse_attn_decode_triton(
+        q, k_paged, v_paged, topk_idx, block_table, seq_lens, **kwargs
+    )
+
+
+@functools.lru_cache(maxsize=1)
+def _sparse_decode_v2_enabled() -> bool:
+    import os
+
+    return os.environ.get("TRTLLM_M3_SPARSE_DECODE_V2", "0") == "1"
 
 
 __all__ = [
