@@ -21,6 +21,15 @@ barrier B of layer l, which the peer enters only after its scorer for layer l ha
 Q; and it writes layer l+1's scores only after barrier A of layer l+1, which the peer enters only
 after its block selection for layer l has consumed its scores.
 
+Replicated heads (TP wider than the index heads, e.g. TP8 with 4 index heads): consecutive
+groups of ``replicas`` ranks hold the same heads (``index_head_range``). Every rank still scores
+all heads on blocks rank::tp, but head h's scores go to the first rank of its group (the primary)
+only, and only primaries contribute index-Q rows (one gather slot per group). The other ranks of
+the group read the primary's score buffer in place (peer loads; block selection only reads it).
+Every rank still signals every barrier, so the single-buffer argument above holds for the
+replicas' reads as well: nobody writes layer l+1's scores before every rank -- replicas included --
+has passed barrier A of layer l+1, i.e. finished its block selection for layer l.
+
 Barriers use monotonically increasing epochs kept on the device, so they replay correctly in CUDA
 graphs as long as every rank issues the same sequence of barriers (the split is chosen from the
 batch shape, which is identical on all TP ranks). Peer signalling is a plain st.release.sys per
@@ -123,12 +132,15 @@ def _gather_rows_barrier_kernel(
     local_flags_addr,
     epoch_ptr,
     rank,
+    slot,
     ROW_WORDS: tl.constexpr,
     WORLD: tl.constexpr,
+    SLOTS: tl.constexpr,
     BLOCK_ROWS: tl.constexpr,
 ):
-    # One program per destination rank p (grid = WORLD): copy this rank's rows into slot `rank` of
-    # p's gather buffer (row t lands at row t * WORLD + rank), then signal p. Only the program
+    # One program per destination rank p (grid = WORLD): copy this rank's rows into slot `slot` of
+    # p's gather buffer (row t lands at row t * SLOTS + slot; n_rows is 0 on ranks that hold a
+    # replicated copy of another rank's heads), then signal p. Only the program
     # whose destination is this rank waits for the other ranks' signals; the kernel completes
     # once it has, so the next kernel sees every rank's rows. Each program keeps its own epoch
     # counter (epoch_ptr[p]); all of them advance once per call on every rank.
@@ -140,7 +152,7 @@ def _gather_rows_barrier_kernel(
         rows = r0 + tl.arange(0, BLOCK_ROWS)
         m = rows[:, None] < n_rows
         vals = tl.load(src + rows[:, None] * ROW_WORDS + cols[None, :], mask=m)
-        tl.store(dst + (rows[:, None] * WORLD + rank) * ROW_WORDS + cols[None, :], vals, mask=m)
+        tl.store(dst + (rows[:, None] * SLOTS + slot) * ROW_WORDS + cols[None, :], vals, mask=m)
     tl.debug_barrier()
     lanes = tl.arange(0, WORLD)
     peer_base = tl.load(peer_flag_ptrs + lanes)
@@ -171,11 +183,18 @@ def _align(n: int) -> int:
 class IndexTpSplitWorkspace:
     """Peer-accessible score/Q buffers and barrier flags of one TP group (one per process)."""
 
-    _instances: Dict[Tuple[int, int, int], "IndexTpSplitWorkspace"] = {}
+    _instances: Dict[Tuple[int, int, int, int], "IndexTpSplitWorkspace"] = {}
 
     @classmethod
     def get(
-        cls, mapping, *, local_heads: int, k_tiles: int, q_row_bytes: int, max_tokens: int
+        cls,
+        mapping,
+        *,
+        local_heads: int,
+        k_tiles: int,
+        q_row_bytes: int,
+        max_tokens: int,
+        replicas: int = 1,
     ) -> "IndexTpSplitWorkspace":
         """The process's workspace, (re)created if it cannot hold this geometry.
 
@@ -185,9 +204,9 @@ class IndexTpSplitWorkspace:
         created once and never replaced. It is only replaced when a later executor needs more
         (e.g. the final executor after the memory-profiling one, whose graphs are gone by then);
         that happens in an eager warmup forward, collectively on all ranks, since the geometry
-        is identical on every TP rank.
+        is identical on every TP rank. ``replicas`` consecutive ranks share the same heads.
         """
-        key = (int(mapping.pp_rank), int(mapping.tp_rank), int(mapping.tp_size))
+        key = (int(mapping.pp_rank), int(mapping.tp_rank), int(mapping.tp_size), int(replicas))
         ws = cls._instances.get(key)
         need_scores = int(local_heads) * int(k_tiles) * int(max_tokens)
         need_q = int(q_row_bytes) * int(max_tokens)
@@ -215,17 +234,28 @@ class IndexTpSplitWorkspace:
             score_numel=int(local_heads) * int(k_tiles) * tokens,
             q_row_bytes=q_row_bytes,
             max_tokens=tokens,
+            replicas=replicas,
         )
         cls._instances[key] = ws
         return ws
 
-    def __init__(self, mapping, *, score_numel: int, q_row_bytes: int, max_tokens: int):
+    def __init__(
+        self, mapping, *, score_numel: int, q_row_bytes: int, max_tokens: int, replicas: int = 1
+    ):
         from tensorrt_llm._ipc_utils import IpcMemory, can_access_peer
 
         if not can_access_peer(mapping):
             raise RuntimeError("MiniMax-M3 index TP split needs peer access between all TP ranks.")
         self.rank = int(mapping.tp_rank)
         self.world = int(mapping.tp_size)
+        self.replicas = int(replicas)
+        if self.replicas < 1 or self.world % self.replicas != 0:
+            raise ValueError(f"TP size {self.world} is not a multiple of replicas {replicas}")
+        # Head groups: ranks [g * replicas, (g + 1) * replicas) hold group g's heads; the first of
+        # them (the primary) owns the group's score buffer and contributes its index-Q rows.
+        self.groups = self.world // self.replicas
+        self.group = self.rank // self.replicas
+        self.primary = self.group * self.replicas
         self.score_numel = int(score_numel)
         self.q_bytes_per_rank_slot = int(q_row_bytes) * int(max_tokens)
         score_bytes = _align(self.score_numel * 4)
@@ -264,11 +294,11 @@ class IndexTpSplitWorkspace:
         )
 
     def gather_q(self, q_local: torch.Tensor, num_heads_total: int) -> torch.Tensor:
-        """All-gather index-Q over the TP group; returns [tokens, num_heads_total, dim].
+        """All-gather index-Q over the head groups; returns [tokens, num_heads_total, dim].
 
-        ``q_local`` is this rank's [tokens, local_heads * dim] rows (contiguous). Rank r's heads
-        become heads [r * local_heads, (r + 1) * local_heads) of the result, matching the
-        checkpoint's index-head order under TP sharding.
+        ``q_local`` is this rank's [tokens, local_heads * dim] rows (contiguous). Group g's heads
+        (from its primary rank) become heads [g * local_heads, (g + 1) * local_heads) of the
+        result, matching the checkpoint's index-head order under TP sharding.
         """
         tokens, row = int(q_local.shape[0]), int(q_local.shape[1])
         row_bytes = row * q_local.element_size()
@@ -279,37 +309,43 @@ class IndexTpSplitWorkspace:
         words = q_local.contiguous().view(torch.int32).view(-1)
         _gather_rows_barrier_kernel[(self.world,)](
             words,
-            tokens,
+            tokens if self.rank == self.primary else 0,
             self.q_peer_ptrs,
             self.flag_a_ptrs,
             self.flag_a_local,
             self.epochs,
             self.rank,
+            self.group,
             ROW_WORDS=row_bytes // 4,
             WORLD=self.world,
+            SLOTS=self.groups,
             BLOCK_ROWS=64,
             num_warps=4,
         )
-        dim = row // (num_heads_total // self.world)
+        dim = row // (num_heads_total // self.groups)
         return (
-            self.q_gather[: tokens * self.world * row_bytes]
+            self.q_gather[: tokens * self.groups * row_bytes]
             .view(q_local.dtype)
             .view(tokens, num_heads_total, dim)
         )
 
     def score_views(self, local_heads: int, k_tiles: int, tokens: int) -> List[torch.Tensor]:
-        """Per global index head h, the [tokens, k_tiles] score view in its owner's buffer."""
+        """Per global index head h, the [tokens, k_tiles] score view in its group primary's buffer."""
         numel = local_heads * k_tiles * tokens
         out = []
-        for h in range(local_heads * self.world):
-            owner, lh = divmod(h, local_heads)
+        for h in range(local_heads * self.groups):
+            group, lh = divmod(h, local_heads)
+            owner = group * self.replicas
             out.append(self.scores[owner][:numel].view(local_heads, k_tiles, tokens)[lh].t())
         return out
 
     def local_scores(self, local_heads: int, k_tiles: int, tokens: int) -> torch.Tensor:
-        """This rank's [local_heads, k_tiles, tokens] score block, as block selection reads it."""
+        """This rank's [local_heads, k_tiles, tokens] score block, as block selection reads it.
+
+        On a replica rank this is the group primary's buffer (peer memory, read in place).
+        """
         numel = local_heads * k_tiles * tokens
-        return self.scores[self.rank][:numel].view(local_heads, k_tiles, tokens)
+        return self.scores[self.primary][:numel].view(local_heads, k_tiles, tokens)
 
     def barrier(self) -> None:
         _flag_barrier_kernel[(1,)](
@@ -335,7 +371,7 @@ def tp_split_score(
 ) -> torch.Tensor:
     """Run steps 1-3 and return this rank's [local_heads, k_tiles, tokens] max-score buffer."""
     tokens = int(idx_q_local.shape[0])
-    total_heads = local_heads * ws.world
+    total_heads = local_heads * ws.groups
     q_all = ws.gather_q(idx_q_local.reshape(tokens, -1), total_heads)
     outs = ws.score_views(local_heads, k_tiles, tokens)
     outs = outs + [outs[0]] * (4 - len(outs))
