@@ -246,7 +246,19 @@ def run_msa_nvfp4_sparse_gqa(
         qhead_per_kv=int(q.shape[1]) // int(k_paged.shape[1]),
         return_schedule=True,
     )
-    result = sparse.sparse_atten_nvfp4_kv_func(
+    kwargs = dict(
+        cu_seqlens_q=cu_q,
+        cu_seqlens_k=cu_kv,
+        max_seqlen_q=max_q_len,
+        max_seqlen_k=max_kv_len,
+        blk_kv=page_size,
+        causal=True,
+        softmax_scale=sm_scale,
+        page_table=metadata.msa_block_table[:batch],
+        seqused_k=metadata.msa_seq_lens_cuda[:batch],
+        schedule=schedule,
+    )
+    args = (
         q,
         k_paged.view(torch.uint8),
         v_paged.view(torch.uint8),
@@ -257,20 +269,131 @@ def run_msa_nvfp4_sparse_gqa(
         k2q_row_ptr,
         k2q_q_indices,
         topk,
-        cu_seqlens_q=cu_q,
-        cu_seqlens_k=cu_kv,
-        max_seqlen_q=max_q_len,
-        max_seqlen_k=max_kv_len,
-        blk_kv=page_size,
-        causal=True,
-        softmax_scale=sm_scale,
-        partial_dtype=torch.bfloat16,
-        return_softmax_lse=False,
-        page_table=metadata.msa_block_table[:batch],
-        seqused_k=metadata.msa_seq_lens_cuda[:batch],
+    )
+    if not _sparse_atten_nvfp4_kv_into(sparse.sparse_atten_nvfp4_kv_func, out, *args, **kwargs):
+        result = sparse.sparse_atten_nvfp4_kv_func(
+            *args, partial_dtype=torch.bfloat16, return_softmax_lse=False, **kwargs
+        )
+        out.copy_(result)
+
+
+def _sparse_atten_nvfp4_kv_into(
+    api_func,
+    out: torch.Tensor,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    k_scale: torch.Tensor,
+    v_scale: torch.Tensor,
+    k_global_scale: torch.Tensor,
+    v_global_scale: torch.Tensor,
+    k2q_row_ptr: torch.Tensor,
+    k2q_q_indices: torch.Tensor,
+    topk: int,
+    *,
+    cu_seqlens_q: torch.Tensor,
+    cu_seqlens_k: torch.Tensor,
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+    blk_kv: int,
+    causal: bool,
+    softmax_scale: float,
+    page_table: torch.Tensor,
+    seqused_k: torch.Tensor,
+    schedule,
+) -> bool:
+    """MSA's sparse_atten_nvfp4_kv_func with the combine writing straight into `out`.
+
+    The packaged entry point always allocates its own [total_q, Hq, 128] output and the caller
+    then copied it into the attention output: one extra read+write of the whole context
+    output per sparse layer (~14 ms per 16K-token TP2 chunk). This replays the entry point's
+    plain path (BF16 partials, no LSE outputs) against its own module so the combine targets
+    `out` directly. Returns False, leaving the caller on the packaged path, when the module
+    does not expose the pieces this relies on or `out` cannot be a combine target.
+    """
+    import sys
+
+    iface = sys.modules.get(getattr(api_func, "__module__", ""))
+    needed = (
+        "_validate_csr_varlen_nvfp4_kv_inputs",
+        "_csr_row_capacity",
+        "_validate_fwd_schedule",
+        "_call_sparse_forward_sm100_csr_varlen_nvfp4_kv",
+        "combine",
+    )
+    if iface is None or not all(hasattr(iface, n) for n in needed) or schedule is None:
+        return False
+    total_q, head_q, dim = q.shape
+    if (
+        out.dtype != torch.bfloat16
+        or tuple(out.shape) != (total_q, head_q, dim)
+        or not out.is_contiguous()
+    ):
+        return False
+    _, head_kv = iface._validate_csr_varlen_nvfp4_kv_inputs(
+        q,
+        k,
+        v,
+        k_scale,
+        v_scale,
+        k_global_scale,
+        v_global_scale,
+        k2q_row_ptr,
+        k2q_q_indices,
+        topk,
+        blk_kv,
+        page_table,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        seqused_k,
+    )
+    max_num_kv_blocks = iface._csr_row_capacity(k2q_row_ptr)
+    o_partial = torch.empty(topk, total_q, head_q, dim, dtype=torch.bfloat16, device=q.device)
+    lse_partial = torch.empty(topk, total_q, head_q, dtype=torch.float32, device=q.device)
+    lse_out = torch.empty(total_q, head_q, dtype=torch.float32, device=q.device)
+    iface._validate_fwd_schedule(schedule, q=q, k2q_q_indices=k2q_q_indices, head_kv=head_kv)
+    iface._call_sparse_forward_sm100_csr_varlen_nvfp4_kv(
+        q.contiguous(),
+        k,
+        v,
+        k_scale,
+        v_scale,
+        None if k_global_scale is None else k_global_scale.contiguous(),
+        None if v_global_scale is None else v_global_scale.contiguous(),
+        k2q_row_ptr.contiguous(),
+        k2q_q_indices.contiguous(),
+        schedule.qsplit_indices.contiguous(),
+        schedule.split_counts.contiguous(),
+        cu_seqlens_q.contiguous(),
+        cu_seqlens_k.contiguous(),
+        page_table.contiguous(),
+        seqused_k.contiguous(),
+        o_partial,
+        lse_partial,
+        None,
+        float(softmax_scale),
+        1.0,
+        False,
+        max_num_kv_blocks,
+        int(blk_kv),
+        head_kv,
+        int(max_seqlen_q),
+        causal=bool(causal),
         schedule=schedule,
     )
-    out.copy_(result)
+    iface.combine(
+        o_partial,
+        lse_partial,
+        out,
+        lse_out,
+        lse_temperature_partial=None,
+        lse_temperature_out=None,
+        cu_seqlens=cu_seqlens_q,
+        split_counts=schedule.split_counts,
+        output_scale=None if q.dtype == torch.float8_e4m3fn else v_global_scale,
+        use_pdl=True,
+    )
+    return True
 
 
 def run_msa_prefill_gqa(
