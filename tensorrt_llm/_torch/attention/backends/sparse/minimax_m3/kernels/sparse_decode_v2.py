@@ -128,6 +128,12 @@ def kernel_geometry(
         if ntiles >= 3:
             # 512-thread CTAs run one per SM: fill exactly one wave.
             nsplit = max(1, min(8, sm_count // groups))
+            if nsplit == 1 and 3 * groups <= 2 * sm_count:
+                # Between half a wave and ~2/3 of a wave of groups, one CTA per group leaves SMs
+                # idle while each CTA walks all of its group's pages; three splits (two waves)
+                # are faster: kv4 B20/22/24 57.6/57.6/57.8 -> 48.3/50.2/51.2 us; from B28 (112
+                # groups) one split is best again (results/sweep_kvh4_full).
+                nsplit = 3
         else:
             # Small CTAs co-reside; measured best on GB300 (results/sweep_kvh*_dql1).
             nsplit = 8 if groups <= 32 else (4 if groups <= 128 else 1)

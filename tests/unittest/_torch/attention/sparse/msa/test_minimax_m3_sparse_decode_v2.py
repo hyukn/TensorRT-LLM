@@ -330,6 +330,18 @@ def test_select_v2_config_is_shape_only():
     assert a == select_v2_config(num_reqs=24, **common) and a is not None
     assert a["nsplit"] == 6 and a["ntiles"] == 4
     assert select_v2_config(num_reqs=64, **common)["nsplit"] == 2
+    # Attention DP (4 KV heads per rank): one wave of groups, three splits between half and
+    # two thirds of a wave, then one split.
+    kv4 = common | {"num_kv_heads": 4}
+    assert [select_v2_config(num_reqs=b, **kv4)["nsplit"] for b in (8, 18, 20, 24, 25, 28, 32)] == [
+        4,
+        2,
+        3,
+        3,
+        3,
+        1,
+        1,
+    ]
     # Measured slower than the old kernel -> dispatch keeps the old kernel.
     assert select_v2_config(num_reqs=8, **common) is None
     assert select_v2_config(num_reqs=16, **(common | {"decode_query_len": 1})) is None
