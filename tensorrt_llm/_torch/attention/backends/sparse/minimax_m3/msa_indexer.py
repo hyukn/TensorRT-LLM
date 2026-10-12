@@ -14,7 +14,7 @@ Results are [total_q, num_kv_heads, topk] int32, ascending with -1 padding.
 from __future__ import annotations
 
 import functools
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, NamedTuple, Optional
 
 import torch
 
@@ -54,6 +54,62 @@ def cutedsl_split_score_runner():
     except ImportError:
         return None
     return getattr(cute_dsl_custom_ops, "CuteDSLMiniMaxM3IndexDecodeScoreSplitRunner", None)
+
+
+CTX_SCORER_ENV = "TRTLLM_M3_CTX_INDEX_SCORER"
+
+
+@functools.lru_cache(maxsize=1)
+def ctx_scorer_module():
+    """The tcgen05 context-row scorer module, or None when disabled or unavailable.
+
+    Enabled with TRTLLM_M3_CTX_INDEX_SCORER=1. Resolved once per process.
+    """
+    import os
+
+    if os.environ.get(CTX_SCORER_ENV, "0") != "1":
+        return None
+    try:
+        from tensorrt_llm._torch.cute_dsl_kernels.blackwell import (
+            minimax_m3_index_ctx_score_tc as mod,
+        )
+    except ImportError:
+        return None
+    return mod
+
+
+class CtxScoreArgs(NamedTuple):
+    """Per-step inputs of the context-row scorer, covering context rows [0, num_rows)."""
+
+    cu_seqlens_q: torch.Tensor  # [num_rows + 1] int32, device
+    seq_lens: torch.Tensor  # [num_rows] int32 kv length incl. this step's tokens, device
+    block_table: torch.Tensor  # [num_rows, max_pages] int32, device
+    plan: tuple  # ctx_plan_tc(qo_lens_cpu, kv_lens_cpu, heads), built once per step
+    max_k_tiles: int  # max ceil(kv_len / page_size) over the rows
+
+
+def _ctx_scores(idx_q: torch.Tensor, idx_k_paged: torch.Tensor, args: CtxScoreArgs) -> torch.Tensor:
+    """Score context rows with the tcgen05 scorer into a [heads, max_k_tiles, tokens] buffer.
+
+    Same contents the fmha_sm100 proxy pass writes (raw Q.K block max; blocks past a token's
+    causal extent are -inf or unwritten, and the selector never reads past n_valid_blocks).
+    """
+    mod = ctx_scorer_module()
+    total_q, heads, _ = idx_q.shape
+    score = torch.empty(
+        (heads, args.max_k_tiles, total_q), dtype=torch.float32, device=idx_q.device
+    )
+    mod.ctx_index_score_tc(
+        idx_q.contiguous(),
+        idx_k_paged,
+        args.block_table,
+        args.cu_seqlens_q,
+        args.seq_lens,
+        score.transpose(1, 2),
+        plan=args.plan,
+        max_blocks_hint=args.max_k_tiles,
+    )
+    return score
 
 
 def _cutedsl_score(
@@ -246,6 +302,7 @@ class MsaIndexer:
         gen_token_first: int = 0,
         ctx_rows: int = 0,
         precomputed_gen_scores: Optional[torch.Tensor] = None,
+        ctx_score_args: Optional[CtxScoreArgs] = None,
     ) -> torch.Tensor:
         """Return [total_q, num_kv_heads, topk] selected block indices.
 
@@ -270,6 +327,9 @@ class MsaIndexer:
         `precomputed_gen_scores` is the generation span's max-score buffer already
         filled by another scorer (the TP-split one, see index_tp_split); the CuTe DSL
         scorer is then skipped.
+
+        `ctx_score_args` routes the context rows to the tcgen05 context scorer instead of the
+        fmha_sm100 proxy pass (see CtxScoreArgs).
         """
         page_size = int(idx_k_paged.shape[2])
         gen_first = int(gen_token_first)
@@ -307,7 +367,11 @@ class MsaIndexer:
 
         # The scorer took nothing, so the proxy runs every token under the
         # whole-batch plan it was handed.
-        if not scored:
+        if not scored and ctx_score_args is not None and gen_first == 0:
+            # Pure context step: every row is a context row.
+            gen_first = 0
+            max_score = _ctx_scores(idx_q, idx_k_paged, ctx_score_args)
+        elif not scored:
             gen_first = 0
             max_score = self._proxy_scores(
                 idx_q,
@@ -336,8 +400,15 @@ class MsaIndexer:
         # The proxy scores the context prefix into its own buffer, under the
         # plan prepare() built over rows [0, ctx_rows). Context pages are the
         # prefix of the flattened page table, so kv_indices needs no slice.
+        ctx_scores = (
+            _ctx_scores(idx_q[:gen_first], idx_k_paged, ctx_score_args)
+            if ctx_score_args is not None
+            else None
+        )
         ctx_table = self._select(
-            self._proxy_scores(
+            ctx_scores
+            if ctx_scores is not None
+            else self._proxy_scores(
                 idx_q[:gen_first],
                 idx_k_paged,
                 proxy_plan=proxy_plan,
@@ -416,4 +487,10 @@ class MsaIndexer:
         )
 
 
-__all__ = ["MsaIndexer", "cutedsl_score_runner", "cutedsl_split_score_runner"]
+__all__ = [
+    "CtxScoreArgs",
+    "MsaIndexer",
+    "ctx_scorer_module",
+    "cutedsl_score_runner",
+    "cutedsl_split_score_runner",
+]
