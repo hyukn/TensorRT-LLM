@@ -38,6 +38,7 @@ from strenum import StrEnum
 
 from tensorrt_llm._torch.disaggregation.resource.page import MapperKind, RoleLayout
 from tensorrt_llm._torch.distributed.communicator import Distributed, ReduceOp
+from tensorrt_llm._torch.pyexecutor.kv_cache import per_layer_block_offsets
 from tensorrt_llm._torch.utils import helix_local_len, maybe_compile
 from tensorrt_llm._utils import (
     TensorWrapper,
@@ -2753,6 +2754,24 @@ class KVCacheManagerV2(BaseResourceManager):
             num_contexts,
         )
         self._device_num_contexts.fill_(num_contexts)
+        if per_layer_block_offsets.enabled():
+            # Same values for the batch's rows only, straight into dst_tensor.
+            per_layer_block_offsets.copy_per_layer_block_offsets(
+                dst_tensor,
+                self._device_kv_cache_block_offsets_input,
+                device_copy_idx,
+                self._device_attention_op_pool_ids,
+                self._device_attention_op_scales,
+                self._device_attention_op_layer_offsets,
+                self._device_attention_op_scratch_pages,
+                scratch_begs,
+                scratch_ends,
+                scratch_slots,
+                self._device_num_contexts,
+                num_seqs,
+                BAD_PAGE_INDEX,
+            )
+            return
         _copy_swa_block_offsets_with_scratch_compiled(
             self._device_kv_cache_block_offsets_input,
             device_copy_idx,
