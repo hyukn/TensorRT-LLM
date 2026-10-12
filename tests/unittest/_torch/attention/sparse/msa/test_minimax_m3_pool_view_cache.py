@@ -64,3 +64,17 @@ def test_pool_view_cached_and_rebuilt_on_move():
     v4 = mgr._cached_pool_view("kv", 3, "HND", None, geo)
     assert v4.data_ptr() == v3.data_ptr() + (1 << 20) and len(calls) == n_calls + 2
     assert mgr._cached_pool_view("kv", 3, "HND", None, geo) is v4
+
+
+def test_pool_view_built_in_inference_mode_is_mutable_outside():
+    pool = torch.zeros(1 << 20, dtype=torch.uint8, device="cuda")
+    mgr = _manager(_FakeImpl(pool.data_ptr(), 16))
+    geo = _geometry(mgr, [])
+    with torch.inference_mode():
+        v = mgr._cached_pool_view("kv", 3, "HND", None, geo)
+        v.fill_(1)
+    assert not v.is_inference()
+    v.zero_()  # the KV cache NaN check does this outside inference mode
+    with torch.inference_mode():
+        assert mgr._cached_pool_view("kv", 3, "HND", None, geo) is v
+        v.add_(1)

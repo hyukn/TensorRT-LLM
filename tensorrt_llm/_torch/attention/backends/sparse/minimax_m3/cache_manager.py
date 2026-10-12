@@ -859,8 +859,14 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
             return hit[1]
         addr_key, torch_dtype, num_slots, scale, page_shape = geometry_fn(layer_idx, kv_layout)
         full_slot_shape = [num_slots, scale, *page_shape]
-        full_view = convert_to_torch_tensor(TensorWrapper(addr_key, torch_dtype, full_slot_shape))
-        view = full_view[:, :2]
+        # A cached view outlives the caller's mode: build it as a normal tensor so it can be
+        # updated in place both inside and outside torch.inference_mode (an inference tensor
+        # rejects in-place updates outside inference mode, e.g. the KV cache NaN check's zero_()).
+        with torch.inference_mode(False):
+            full_view = convert_to_torch_tensor(
+                TensorWrapper(addr_key, torch_dtype, full_slot_shape)
+            )
+            view = full_view[:, :2]
         cache[key] = (stamp, view)
         return view
 
