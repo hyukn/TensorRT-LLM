@@ -9399,11 +9399,43 @@ if IS_CUTLASS_DSL_AVAILABLE:
         into its own output tensor (the owning rank's buffer, usually peer
         memory). Compiled per (dtype, num_heads, max_decode_query_len,
         head_dim, split_k, rank, world); batch, token count, page count and
-        all output strides stay symbolic.
+        all output strides stay symbolic. split_k is the persistent grid
+        size; 0 sizes it to the device (CTAS_PER_SM CTAs per SM).
         """
 
         kernel_cache = dict()
         MAX_HEADS = 4
+        # Per device: the kernel's int64 work counter (zero between launches;
+        # the kernel resets it itself) and the SM count.
+        _work_counters = dict()
+        _sm_counts = dict()
+
+        @classmethod
+        def _grid_and_counter(cls, device: torch.device, split_k: int):
+            """Resolve split_k <= 0 to one CTA per SM slot; return it with the
+            device's work counter.
+
+            The counter is allocated on first use, which must not be inside a
+            CUDA graph capture (the eager warmup forwards before capture are
+            the first use, as for the compile). Launches sharing it must not
+            overlap, which holds for launches ordered on one stream.
+            """
+            idx = device.index if device.index is not None else torch.cuda.current_device(
+            )
+            counter = cls._work_counters.get(idx)
+            if counter is None:
+                if torch.cuda.is_current_stream_capturing():
+                    raise RuntimeError(
+                        "cute_dsl_minimax_m3_index_decode_score_split: first call "
+                        "on a device must be outside CUDA graph capture.")
+                counter = torch.zeros(1, dtype=torch.int64, device=device)
+                cls._work_counters[idx] = counter
+                cls._sm_counts[idx] = torch.cuda.get_device_properties(
+                    idx).multi_processor_count
+            if split_k <= 0:
+                split_k = (IndexDecodeScoreSplitKernel.CTAS_PER_SM *
+                           cls._sm_counts[idx])
+            return split_k, counter
 
         @classmethod
         def is_supported(cls, *, q_dtype: torch.dtype, num_heads: int,
@@ -9448,6 +9480,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
             sl_fake = cute.runtime.make_fake_compact_tensor(cutlass.Int32,
                                                             (sym_batch, ),
                                                             stride_order=(0, ))
+            counter_fake = cute.runtime.make_fake_compact_tensor(
+                cutlass.Int64, (1, ), stride_order=(0, ))
             fake_stream = cute.runtime.make_fake_stream(
                 use_tvm_ffi_env_stream=True)
             kernel = IndexDecodeScoreSplitKernel(cute_dtype,
@@ -9463,6 +9497,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                                                  bt_fake,
                                                  *score_fakes,
                                                  sl_fake,
+                                                 counter_fake,
                                                  fake_stream,
                                                  options="--enable-tvm-ffi")
             logger.debug(
@@ -9481,13 +9516,14 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 raise ValueError(
                     f"need one score tensor per index head ({num_heads}), "
                     f"got {len(scores)}")
+            split_k, counter = cls._grid_and_counter(idx_q.device, split_k)
             key = (idx_q.dtype, num_heads, max_decode_query_len, head_dim,
                    split_k, rank, world)
             if key not in cls.kernel_cache:
                 cls._compile(key)
             padded = list(scores) + [scores[0]] * (cls.MAX_HEADS - num_heads)
             cls.kernel_cache[key](idx_q, index_k_cache, block_table, *padded,
-                                  seq_lens)
+                                  seq_lens, counter)
 
     @torch.library.custom_op(
         "trtllm::cute_dsl_minimax_m3_index_decode_score_split",
@@ -9518,6 +9554,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
             score0..score3: [total_q, max_blocks] float32 per index head (any
                 strides); only the first num_heads are used. Head h receives
                 blocks rank::world below ceil(seq_len / page_size).
+            split_k: persistent grid size (CTAs); 0 picks one CTA per SM slot,
+                which is what the kernel is tuned for. The work is balanced
+                across the CTAs inside the kernel, whatever the batch.
         """
         if not is_sm_100f():
             raise ValueError(

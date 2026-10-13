@@ -94,12 +94,12 @@ def tp_split_peer_access(mapping) -> bool:
 
 
 def split_k_for_batch(batch: int) -> int:
-    """CTAs per request: small batches need more of them to fill the GPU."""
-    if batch <= 2:
-        return 256
-    if batch <= 4:
-        return 128
-    return 64
+    """Scorer grid size: 0 lets the op size its persistent grid to the GPU (one CTA per SM slot).
+
+    The kernel balances the rank's blocks across its CTAs itself, so the grid no longer depends
+    on the batch.
+    """
+    return 0
 
 
 @triton.jit
