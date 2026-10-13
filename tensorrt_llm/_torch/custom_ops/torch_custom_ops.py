@@ -601,6 +601,25 @@ def _get_mxfp8_large_m_tuning_buckets(max_num_tokens: int) -> tuple[int, ...]:
                  if bucket <= mapped_max)
 
 
+def _get_mxfp8_unbucketed_m_below(num_tokens: int) -> range:
+    """Return the unbucketed token counts below ``num_tokens``.
+
+    These are the counts above the nearest large-M band below ``num_tokens``,
+    which the native tactic cache keys exactly instead of mapping them to a
+    band bucket. The range excludes ``num_tokens`` and is empty when it lies
+    inside a band or below every band.
+    """
+    first_unbucketed = None
+    for lower_bound, upper_bound in MXFP8GemmRunner._LARGE_M_BANDS:
+        if lower_bound <= num_tokens <= upper_bound:
+            return range(0)
+        if upper_bound < num_tokens:
+            first_unbucketed = upper_bound + 1
+    if first_unbucketed is None:
+        return range(0)
+    return range(first_unbucketed, num_tokens)
+
+
 def _mxfp8_scale_infer_shape(input_shapes: List[List[int]]) -> int:
     """Infer the swizzled MXFP8 activation-scale storage size."""
     _, scale_shape = fp4_utils.get_fp4_shape(input_shapes[0], sf_vec_size=32)
@@ -650,10 +669,18 @@ class MXFP8GemmRunner(TunableRunner):
 
     @classmethod
     def sync_all_tactic_caches(cls, tuner: AutoTuner) -> None:
-        """Register every profiled MXFP8 tactic in the native serving cache."""
+        """Register every profiled MXFP8 tactic in the native serving cache.
+
+        A profiled M outside the large-M bands is also registered for the
+        unbucketed M values below it, down to the band below. A batch slightly
+        smaller than a tuned token count, such as a partially filled context
+        chunk, then rounds up to that tactic as the bands do instead of
+        running the generic fallback.
+        """
         cache = tuner.profiling_cache.get_specific_custom_op(
             _MXFP8_AUTOTUNED_OP)
         runners = {str(key): runner for key, runner in cls.runner_dict.items()}
+        profiled_tactics = []
         for cache_key, (_runner_id, tactic, _min_time) in cache.items():
             _, cached_runner_name, cached_unique_id, profile = cache_key
             if cached_runner_name != cls.__name__:
@@ -667,6 +694,17 @@ class MXFP8GemmRunner(TunableRunner):
                 raise ValueError(
                     f"MXFP8 autotuner cache has mismatched K dimensions: "
                     f"activation K={k}, weight K={weight_k}")
+            profiled_tactics.append((native_runner, m, n, k, tactic))
+
+        # Fill from the largest M down so each unbucketed M ends up with the
+        # tactic of the nearest profiled M above it; the profiled shapes are
+        # registered last so they always keep their own tactics.
+        for native_runner, m, n, k, tactic in sorted(profiled_tactics,
+                                                     key=lambda entry: entry[1],
+                                                     reverse=True):
+            for unbucketed_m in _get_mxfp8_unbucketed_m_below(m):
+                native_runner.register_tactic(unbucketed_m, n, k, tactic)
+        for native_runner, m, n, k, tactic in profiled_tactics:
             native_runner.register_tactic(m, n, k, tactic)
 
     def forward(

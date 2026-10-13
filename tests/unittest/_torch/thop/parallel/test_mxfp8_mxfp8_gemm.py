@@ -13,13 +13,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from unittest.mock import Mock
+
 import pytest
 import torch
 import torch.nn.functional as F
 from utils.util import getSMVersion
 
 import tensorrt_llm._torch.custom_ops.torch_custom_ops  # noqa: F401
-from tensorrt_llm._torch.custom_ops.torch_custom_ops import _map_to_mxfp8_large_m_bucket
+from tensorrt_llm._torch.custom_ops.torch_custom_ops import (
+    _MXFP8_AUTOTUNED_OP,
+    MXFP8GemmRunner,
+    _map_to_mxfp8_large_m_bucket,
+)
 
 
 @pytest.mark.skipif(
@@ -188,3 +194,49 @@ def test_mxfp8_native_tactic_cache_large_m_bucket_boundaries(
         assert runner.get_cached_tactic(upper_bound + 1, n, k) == -2
     finally:
         runner.clear_tactic_cache()
+
+
+@pytest.mark.skipif(
+    getSMVersion() not in (100, 103),
+    reason="MXFP8 tactic cache requires SM100 or SM103. Current SM is %d." % getSMVersion(),
+)
+def test_mxfp8_native_tactic_cache_covers_partial_chunks():
+    """A tuned M between the large-M bands also serves the M values below it."""
+    torch.manual_seed(42)
+    profiled_m, partial_m, n, k = 8704, 8650, 256, 512
+    runner = MXFP8GemmRunner(torch.bfloat16)
+    native_runner = runner.mxfp8_gemm_runner
+    tactic = native_runner.get_num_configs() - 1
+    profile = ((profiled_m, k), (-1,), (n, k), (n * k // 32,), (1,))
+    cache_key = (_MXFP8_AUTOTUNED_OP, MXFP8GemmRunner.__name__, str(runner.unique_id()), profile)
+    profiling_cache = Mock()
+    profiling_cache.get_specific_custom_op.return_value = {cache_key: (0, tactic, 0.25)}
+
+    mat_a = torch.randn((partial_m, k), device="cuda", dtype=torch.bfloat16)
+    mat_b = torch.randn((n, k), device="cuda", dtype=torch.bfloat16)
+    fp8_a, a_block_sf = torch.ops.trtllm.mxfp8_quantize(mat_a, True)
+    fp8_b, b_block_sf = torch.ops.trtllm.mxfp8_quantize(mat_b, True)
+    global_scale = torch.ones((1,), device="cuda", dtype=torch.float32)
+    inputs = (fp8_a, a_block_sf, fp8_b, b_block_sf, global_scale)
+
+    try:
+        native_runner.clear_tactic_cache()
+        assert native_runner.get_cached_tactic(partial_m, n, k) == -2
+
+        MXFP8GemmRunner.sync_all_tactic_caches(Mock(profiling_cache=profiling_cache))
+
+        for m in (8193, partial_m, profiled_m - 1, profiled_m):
+            assert native_runner.get_cached_tactic(m, n, k) == tactic
+        assert native_runner.get_cached_tactic(8192, n, k) == -2
+        assert native_runner.get_cached_tactic(profiled_m + 1, n, k) == -2
+
+        cached_output = torch.ops.trtllm.mxfp8_mxfp8_gemm(*inputs, torch.bfloat16)
+        tuned_output = native_runner.run_gemm(*inputs, tactic)
+        fallback_output = native_runner.run_gemm(*inputs, -1)
+        torch.testing.assert_close(cached_output, tuned_output, rtol=0, atol=0)
+        similarity = F.cosine_similarity(
+            cached_output.float().flatten(), fallback_output.float().flatten(), dim=0
+        )
+        assert similarity.item() > 0.9999
+    finally:
+        native_runner.clear_tactic_cache()

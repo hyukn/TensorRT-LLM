@@ -30,6 +30,7 @@ from tensorrt_llm._torch.custom_ops.torch_custom_ops import (
     MXFP8GemmRunner,
     MXFP8QuantizeRunner,
     _get_mxfp8_large_m_tuning_buckets,
+    _get_mxfp8_unbucketed_m_below,
     _map_to_mxfp8_large_m_bucket,
 )
 from tensorrt_llm._torch.modules.linear import (
@@ -558,6 +559,83 @@ def test_mxfp8_native_autotuner_rejects_mismatched_k(monkeypatch):
     tuner = Mock(profiling_cache=profiling_cache)
     with pytest.raises(ValueError, match="mismatched K dimensions"):
         MXFP8GemmRunner.sync_all_tactic_caches(tuner)
+
+
+@pytest.mark.parametrize(
+    "num_tokens,expected",
+    [
+        (1, range(0)),
+        (6552, range(0)),
+        (8192, range(0)),
+        (8193, range(0)),
+        (8704, range(8193, 8704)),
+        (13105, range(8193, 13105)),
+        (13106, range(0)),
+        (16384, range(0)),
+        (17000, range(16385, 17000)),
+        (32768, range(0)),
+        (40000, range(32769, 40000)),
+    ],
+)
+def test_mxfp8_unbucketed_m_below(num_tokens, expected):
+    assert _get_mxfp8_unbucketed_m_below(num_tokens) == expected
+
+
+class _RecordingMXFP8NativeRunner:
+    """Keep the last tactic registered per shape, as the native cache does."""
+
+    def __init__(self):
+        self.tactics = {}
+
+    def register_tactic(self, m, n, k, tactic):
+        self.tactics[(m, n, k)] = tactic
+
+
+def _sync_mxfp8_profiles(monkeypatch, n, k, tactics_by_m):
+    native_runner = _RecordingMXFP8NativeRunner()
+    monkeypatch.setattr(
+        MXFP8GemmRunner,
+        "runner_dict",
+        {(torch.bfloat16, 100): native_runner},
+    )
+    cache = {
+        (
+            "trtllm::mxfp8_mxfp8_gemm_autotuned::gemm",
+            "MXFP8GemmRunner",
+            str((torch.bfloat16, 100)),
+            ((m, k), (-1,), (n, k), (n * k // 32,), (1,)),
+        ): (0, tactic, 0.25)
+        for m, tactic in tactics_by_m.items()
+    }
+    profiling_cache = Mock()
+    profiling_cache.get_specific_custom_op.return_value = cache
+    MXFP8GemmRunner.sync_all_tactic_caches(Mock(profiling_cache=profiling_cache))
+    return native_runner.tactics
+
+
+def test_mxfp8_native_autotuner_covers_partial_chunks(monkeypatch):
+    """Token counts between the 8K band and the tuned limit reuse its tactic."""
+    n, k = 9216, 6144
+    tactics_by_m = {1: 5, 8192: 1, 8704: 3}
+
+    registered = _sync_mxfp8_profiles(monkeypatch, n, k, tactics_by_m)
+
+    expected = {(m, n, k): 3 for m in range(8193, 8704)}
+    expected.update({(m, n, k): tactic for m, tactic in tactics_by_m.items()})
+    assert registered == expected
+
+
+@pytest.mark.parametrize("profiled_ms", [(8650, 8704), (8704, 8650)])
+def test_mxfp8_native_autotuner_rounds_up_to_nearest_profile(monkeypatch, profiled_ms):
+    """Each unbucketed M takes the tactic of the nearest profiled M above it."""
+    n, k = 6144, 8192
+    tactics = {8650: 7, 8704: 3}
+
+    registered = _sync_mxfp8_profiles(monkeypatch, n, k, {m: tactics[m] for m in profiled_ms})
+
+    expected = {(m, n, k): 7 for m in range(8193, 8651)}
+    expected.update({(m, n, k): 3 for m in range(8651, 8705)})
+    assert registered == expected
 
 
 def test_mxfp8_rejects_unknown_backend(monkeypatch):
