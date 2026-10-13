@@ -52,7 +52,9 @@ from .kernels.msa_utils import (
     MSA_REQUIRED_HEAD_DIM,
     MSA_REQUIRED_TOPK,
     build_kv_page_indices,
+    fmha_context_variants,
     per_token_valid_blocks,
+    prewarm_fmha_variants,
     require_msa_module,
 )
 from .kernels.trtllm_gen_dense_decode import (
@@ -995,6 +997,34 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
             dev_buf = self._ensure_prefill_n_valid_buffer(total_q, _cache_device(self))
             dev_buf[:total_q].copy_(n_valid_host.to(torch.int32), non_blocking=True)
             self._msa_prefill_n_valid_blocks = dev_buf[:total_q]
+
+    def prewarm_fmha_kernels(self) -> None:
+        """Compile every fmha_sm100 kernel the plans of _build_step_plans can select.
+
+        fmha_sm100 otherwise compiles a kernel when a step first selects it,
+        and which one a step selects follows the length of its context rows,
+        so the first short chunk can trigger a build long after warmup. Every
+        row length up to max_num_tokens is covered; see fmha_context_variants.
+        """
+        params = self._msa_params
+        kv_cache_manager = self.kv_cache_manager
+        if params is None or kv_cache_manager is None:
+            return
+        fmha_sm100 = require_msa_module()
+        num_q_heads, num_kv_heads = params.sharded_head_counts(self.mapping)
+        variants = fmha_context_variants(
+            fmha_sm100,
+            max_qo_len=int(self.max_num_tokens),
+            page_size=int(kv_cache_manager.tokens_per_block),
+            num_q_heads=num_q_heads,
+            num_kv_heads=num_kv_heads,
+            num_index_heads=params.sharded_index_head_count(self.mapping),
+            # run_msa_prefill_gqa casts q to the FP8 cache dtype and otherwise
+            # passes MiniMax-M3's BF16 activations.
+            attn_dtype=torch.float8_e4m3fn if self._msa_main_kv_is_fp8() else torch.bfloat16,
+            index_dtype=self._msa_index_kv_dtype(),
+        )
+        prewarm_fmha_variants(fmha_sm100, variants)
 
     def _build_msa_fields(self) -> None:
         """Populate the MSA cache-write buffers for this step.

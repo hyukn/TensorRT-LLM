@@ -6,14 +6,18 @@ from __future__ import annotations
 
 import functools
 import importlib.util
+import logging
 import types
-from typing import Optional, Tuple
+from concurrent.futures import ThreadPoolExecutor
+from typing import List, Optional, Sequence, Tuple
 
 import torch
 
 from tensorrt_llm._torch.attention.backends.interface import AttentionInputType
 from tensorrt_llm._utils import is_sm_100f, maybe_pin_memory
+from tensorrt_llm.logger import logger
 
+from .msa_jit import configure_fmha_sm100_jit
 from .paged_cache import write_kv_slots
 
 # fmha_sm100 ships only head_dim 128 variants and the MiniMax-M3 checkpoint
@@ -21,6 +25,12 @@ from .paged_cache import write_kv_slots
 # with a clear message rather than a cryptic shape error inside the kernel.
 MSA_REQUIRED_TOPK = 16
 MSA_REQUIRED_HEAD_DIM = 128
+
+# The fmha_sm100 sparse_mode each MSA call site runs; _fmha_sm100 in
+# fmha_sm100/api.py derives it from the outputs and block table it is handed.
+_FMHA_SPARSE_MODE_SPARSE = 0  # paged GQA over the indexer's top-k blocks
+_FMHA_SPARSE_MODE_ONLY_SCORE = 2  # indexer proxy: per-block max score only
+_FMHA_SPARSE_MODE_OFF = 3  # paged GQA over the full page table
 
 
 def check_decode_span_shape(kernel: str, total_q: int, batch: int, query_len: int) -> None:
@@ -81,14 +91,47 @@ def msa_package_available() -> bool:
     return True
 
 
+class _TrtllmLogHandler(logging.Handler):
+    """Re-emit log records through the TensorRT-LLM logger at their severity."""
+
+    def emit(self, record: logging.LogRecord) -> None:
+        message = f"{record.name}: {record.getMessage()}"
+        if record.levelno >= logging.ERROR:
+            logger.error(message)
+        elif record.levelno >= logging.WARNING:
+            logger.warning(message)
+        else:
+            logger.info(message)
+
+
+@functools.lru_cache(maxsize=1)
+def _forward_fmha_jit_log() -> None:
+    """Send fmha_sm100's JIT log to the TensorRT-LLM logger.
+
+    fmha_sm100 compiles a kernel variant with nvcc when a step first selects
+    it, stalling that rank for a minute or more, and logs each build at INFO
+    on a logger nothing configures, so the build would otherwise leave no
+    trace in the server log.
+    """
+    jit_logger = logging.getLogger("fmha_sm100.jit")
+    jit_logger.setLevel(logging.INFO)
+    jit_logger.addHandler(_TrtllmLogHandler())
+    # The handler is this logger's output now; propagating as well would print
+    # each record twice wherever the root logger has a handler.
+    jit_logger.propagate = False
+
+
 def require_msa_module() -> types.ModuleType:
     """Import the packaged fmha_sm100 module or raise a clear error.
 
     The import is deferred to first kernel use so the MSA backend can be
     advertised in the config schema on systems where the kernels cannot load.
     A missing package is a hard error, never a silent fallback to another backend.
+    The first import also limits the kernels fmha_sm100 compiles on first use
+    to this device's architecture.
     """
     _install_msa_cutlass_compatibility()
+    _forward_fmha_jit_log()
     try:
         import fmha_sm100
     except ImportError as exc:
@@ -96,7 +139,120 @@ def require_msa_module() -> types.ModuleType:
             "MiniMax-M3 MSA attention requires the fmha_sm100 kernels packaged "
             "with TensorRT-LLM. Reinstall TensorRT-LLM from a complete build."
         ) from exc
+    configure_fmha_sm100_jit(fmha_sm100)
     return fmha_sm100
+
+
+def fmha_context_variants(
+    fmha_sm100: types.ModuleType,
+    *,
+    max_qo_len: int,
+    page_size: int,
+    num_q_heads: int,
+    num_kv_heads: int,
+    num_index_heads: int,
+    attn_dtype: torch.dtype,
+    index_dtype: torch.dtype,
+) -> List[Tuple]:
+    """List the fmha_sm100 kernel variants a context step can dispatch to.
+
+    A context step reaches fmha_sm100 at three sites: the indexer proxy over
+    the MQA index-K cache, and the paged GQA of the sparse and of the dense
+    layers. Each plans a paged cache with num_kv_splits=1, so the variant it
+    runs follows from its dtype, its head counts and the longest query row of
+    its plan alone, and walking every row length a step can hold covers them
+    all. The selection mirrors _fmha_sm100_plan and _fmha_sm100 in
+    fmha_sm100/api.py.
+
+    Args:
+        fmha_sm100: The imported fmha_sm100 package.
+        max_qo_len: Longest query row a step can plan, its token budget.
+        page_size: Tokens per KV cache page.
+        num_q_heads: Per-rank attention query heads.
+        num_kv_heads: Per-rank attention KV heads.
+        num_index_heads: Per-rank indexer heads.
+        attn_dtype: Query dtype of the paged GQA, that of the main KV cache.
+        index_dtype: Query dtype of the indexer proxy, that of the index-K cache.
+
+    Returns:
+        Variant keys, each in fmha_sm100.jit.get_fmha_variant's argument order.
+    """
+    api = fmha_sm100.api
+    sites = (
+        # (query dtype, query heads, KV heads, sparse_mode)
+        (index_dtype, num_index_heads, 1, _FMHA_SPARSE_MODE_ONLY_SCORE),
+        (attn_dtype, num_q_heads, num_kv_heads, _FMHA_SPARSE_MODE_SPARSE),
+        (attn_dtype, num_q_heads, num_kv_heads, _FMHA_SPARSE_MODE_OFF),
+    )
+    variants = set()
+    # Rows past 128 tokens pack no heads and all run the 256-row tile, so a
+    # longer row selects no new variant.
+    for qo_len in range(1, min(max_qo_len, 129) + 1):
+        for dtype, heads, kv_heads, sparse_mode in sites:
+            is_sparse = sparse_mode == _FMHA_SPARSE_MODE_SPARSE
+            if is_sparse and qo_len > api._prefill_qlen_threshold(True):
+                # Longer sparse rows run the CuTe DSL sparse prefill instead.
+                continue
+            pack_factor = api._compute_pack_factor(qo_len, heads, kv_heads)
+            # The sparse plan gives every query token a row of its own.
+            packed_len = pack_factor if is_sparse else qo_len * pack_factor
+            variants.add(
+                (
+                    fmha_sm100.jit._dlpack_dtype_code(dtype),
+                    128 if packed_len <= 128 else 256,
+                    packed_len <= 64,
+                    sparse_mode,
+                    page_size,
+                    False,
+                    pack_factor,
+                )
+            )
+    return sorted(variants)
+
+
+def prewarm_fmha_variants(fmha_sm100: types.ModuleType, variants: Sequence[Tuple]) -> None:
+    """Build and load the given fmha_sm100 kernel variants now.
+
+    fmha_sm100 otherwise compiles each of them with nvcc on first use, one at a
+    time per process and on the order of a minute apiece. Here the builds run
+    concurrently. Each takes the per-variant file lock and existence check
+    get_fmha_variant uses, so processes sharing the kernel cache build every
+    variant once between them. A variant that fails to build is left to
+    compile on first use, as before.
+
+    Args:
+        fmha_sm100: The imported fmha_sm100 package.
+        variants: Variant keys, as fmha_context_variants returns them.
+    """
+    jit = fmha_sm100.jit
+    manager = jit._variant_manager
+    # A build renders the variant's sources from jinja2 templates the manager
+    # loads lazily, and unlocked: loading them here, before the builds fan out,
+    # leaves the threads to only read them.
+    manager._load_templates()
+
+    def build(key: Tuple) -> None:
+        name, params = jit._variant_key_from_runtime(*key)
+        lock_fd = jit._acquire_file_lock(jit.CACHE_BASE / name / ".compile.lock")
+        try:
+            manager._compile_only(name, params)
+        finally:
+            jit._release_file_lock(lock_fd)
+
+    with ThreadPoolExecutor(max_workers=max(1, len(variants))) as pool:
+        builds = [(key, pool.submit(build, key)) for key in variants]
+    built = 0
+    for key, future in builds:
+        try:
+            future.result()
+            jit.get_fmha_variant(*key)
+        except (OSError, RuntimeError, ValueError) as e:
+            # Reported rather than raised: the kernel still compiles on first
+            # use, so a prewarm miss must not fail startup.
+            logger.warning(f"fmha_sm100 variant {key} prewarm failed. {type(e).__name__}: {e}")
+        else:
+            built += 1
+    logger.info(f"Prewarmed {built} of {len(variants)} fmha_sm100 kernel variants")
 
 
 def msa_paged_kv(kv_cache_manager, layer_idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -295,9 +451,11 @@ __all__ = [
     "MSA_REQUIRED_TOPK",
     "build_kv_page_indices",
     "check_decode_span_shape",
+    "fmha_context_variants",
     "msa_package_available",
     "msa_paged_kv",
     "per_token_valid_blocks",
+    "prewarm_fmha_variants",
     "require_msa_module",
     "select_blocks_from_maxscore",
     "write_msa_main_kv",

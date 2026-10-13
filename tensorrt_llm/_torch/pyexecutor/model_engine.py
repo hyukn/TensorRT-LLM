@@ -1516,6 +1516,8 @@ class PyTorchModelEngine(ModelEngine):
         with self._warmup_timer.phase("cute_dsl_indexer_q"):
             self._prewarm_cute_dsl_indexer_q()
         log_mem_snapshot("warmup/after_cute_dsl_indexer_q")
+        with self._warmup_timer.phase("msa_fmha_prewarm"):
+            self._prewarm_msa_fmha_kernels(resource_manager)
         if not is_enc_dec:
             with self._warmup_timer.phase(
                     "attention_jit",
@@ -1813,6 +1815,47 @@ class PyTorchModelEngine(ModelEngine):
         if self.mapping.tp_size > 1 and self.dist is not None:
             self.dist.tp_allgather(1)
         logger.info("indexer-Q CuTe DSL prewarm complete")
+
+    def _prewarm_msa_fmha_kernels(self,
+                                  resource_manager: ResourceManager) -> None:
+        """Pre-compile the MiniMax-M3 MSA fmha_sm100 kernels, then barrier.
+
+        fmha_sm100 compiles a kernel variant with nvcc when a step first
+        selects it, and the variant follows the length of the step's context
+        rows, so warmup shapes leave most of them cold. Hit mid-serving, the
+        build stalls its rank for minutes while the other attention-DP ranks
+        wait for it at their next collective. Building every reachable variant
+        here, concurrently and before the first collective-bearing forward,
+        keeps that out of serving.
+
+        No-op on models without MSA attention.
+        """
+        try:
+            from ..attention.backends.sparse.minimax_m3.msa_backend import \
+                MiniMaxM3MsaSparseAttentionMetadata
+        except ImportError:
+            return
+        metadata_cls = getattr(self.attn_backend, "Metadata", None)
+        if metadata_cls is None or not issubclass(
+                metadata_cls, MiniMaxM3MsaSparseAttentionMetadata):
+            return
+        kv_cache_manager = resource_manager.get_resource_manager(
+            self.kv_cache_manager_key)
+        # The metadata the first warmup forward would otherwise build.
+        attn_metadata = self._set_up_attn_metadata(
+            kv_cache_manager,
+            self._get_draft_kv_cache_manager(resource_manager))
+        try:
+            attn_metadata.prewarm_fmha_kernels()
+        except Exception as e:
+            # Never fail startup for a prewarm miss; the kernels would simply
+            # be compiled on first use, as they are without it.
+            logger.warning(
+                f"MSA fmha_sm100 prewarm skipped. {type(e).__name__}: {e}")
+        # Hold every rank here until the slowest has finished compiling, so the
+        # first MoE all-to-all dispatch is entered without JIT skew.
+        if self.mapping.tp_size > 1 and self.dist is not None:
+            self.dist.tp_allgather(1)
 
     def _ensure_dsa_attn_metadata_for_warmup(
             self, resource_manager: ResourceManager) -> None:
