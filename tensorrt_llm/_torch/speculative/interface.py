@@ -545,9 +545,11 @@ class SpecMetadata:
     is_all_greedy_sample: bool = True
     # Group-synchronized override for ``is_all_greedy_sample`` (AND over the
     # TP group's local flags; None = no group sync configured, use the local
-    # value). Under ADP + LM-head TP with rejection sampling, the greedy-vs-
-    # advanced choice gates group collectives, so all ranks must take the same
-    # path even though their batches (and thus local flags) differ. Set by
+    # value). Under ADP + LM-head TP with rejection sampling, or with Eagle3
+    # one-model (whose verify head takes the argmax from vocab shards only for
+    # all-greedy batches), the greedy-vs-advanced choice gates group
+    # collectives, so all ranks must take the same path even though their
+    # batches (and thus local flags) differ. Set by
     # ``_sync_group_all_greedy_sample`` before the CUDA graph key is built and
     # re-applied by ``_scan_one_model_sampling`` on every rescan. AND is safe:
     # a greedy rank pulled onto the advanced path still samples greedily via
@@ -1897,6 +1899,7 @@ class SpecWorkerBase(nn.Module, ABC):
         num_contexts: int,
         batch_size: int,
         spec_metadata,
+        target_tokens: Optional[torch.Tensor] = None,
     ):
         """
         Base implementation for sampling and accepting draft tokens.
@@ -1911,6 +1914,9 @@ class SpecWorkerBase(nn.Module, ABC):
             num_contexts: Number of context requests
             batch_size: Total number of requests
             spec_metadata: Speculative decoding metadata
+            target_tokens: [num_tokens] - Target tokens already chosen by the
+                caller (e.g. a greedy argmax taken from vocab shards); sampled
+                from ``logits`` when None
 
         Returns:
             accepted_tokens: [batch_size, runtime_draft_len + 1] - Accepted tokens (padded)
@@ -1934,8 +1940,9 @@ class SpecWorkerBase(nn.Module, ABC):
                                          device=logits.device)
 
         # Sample tokens using per-request sampling parameters
-        target_tokens = self._sample_tokens_for_batch(logits, spec_metadata,
-                                                      num_contexts, batch_size)
+        if target_tokens is None:
+            target_tokens = self._sample_tokens_for_batch(
+                logits, spec_metadata, num_contexts, batch_size)
 
         # Context requests: only accept the sampled token (no draft tokens yet)
         accepted_tokens[:num_contexts, 0] = target_tokens[:num_contexts]
@@ -2615,11 +2622,16 @@ class SpecWorkerBase(nn.Module, ABC):
         """Pack each rank's local (global_argmax_index, max_value) for a
         distributed argmax over a vocab-sharded draft LM head.
         """
-        local_max_values, local_argmax = torch.max(logits, dim=-1, keepdim=True)
-        vocab_per_rank = logits.shape[-1]
         mapping_lm_tp = mapping_lm_tp if mapping_lm_tp is not None else self.mapping
-        max_index_per_rank = local_argmax.type(
-            torch.int32) + (mapping_lm_tp.tp_rank * vocab_per_rank)
+        return self._pack_local_max(logits,
+                                    mapping_lm_tp.tp_rank * logits.shape[-1])
+
+    @torch.compile(options={"max-autotune": True})
+    def _pack_local_max(self, logits, vocab_offset: int):
+        """Fused body of ``_get_local_max_and_combined``: a reduction over a
+        few long rows, then the index shift and the pairing."""
+        local_max_values, local_argmax = torch.max(logits, dim=-1, keepdim=True)
+        max_index_per_rank = local_argmax.type(torch.int32) + vocab_offset
         max_index_per_rank_float = max_index_per_rank.float()
         local_max_values_float32 = local_max_values.float()
         # Interleaved layout: [idx0, val0, idx1, val1, ...] after all-gather.

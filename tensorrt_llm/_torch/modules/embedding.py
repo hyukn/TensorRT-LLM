@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import math
 from typing import Dict, List, Optional, Tuple
 
@@ -11,6 +14,7 @@ from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.math_utils import ceil_div
 
 from ..distributed import allgather
+from ..utils import create_lm_head_tp_mapping
 from .linear import Linear, TensorParallelMode
 
 
@@ -150,6 +154,69 @@ class LMHead(Linear):
             output = output[..., :-self.padding_size]
 
         return output
+
+    def forward_lm_head_tp_in_adp(
+            self, input: torch.Tensor,
+            num_rows_per_rank: int) -> Tuple[torch.Tensor, Mapping]:
+        """Project the attention-DP group's rows onto this rank's vocab shard.
+
+        Under attention DP every rank holds the whole weight, so a batch of a
+        few rows re-reads all of it on every rank. Instead, every rank pads its
+        rows to ``num_rows_per_rank``, the rows are all-gathered over the
+        LM-head TP group, and each rank projects them onto its slice of the
+        vocabulary only.
+
+        Args:
+            input: This rank's ``[num_rows, hidden_size]`` rows.
+            num_rows_per_rank: The row count every rank pads to. It must be
+                identical on all ranks and at least the largest ``num_rows``.
+
+        Returns:
+            The ``[group_size * num_rows_per_rank, shard_size]`` logits, with
+            the rows of LM-head TP rank ``r`` at ``[r * num_rows_per_rank,
+            (r + 1) * num_rows_per_rank)``, and the LM-head TP mapping. The
+            shard of rank ``r`` covers vocab ids ``[r * shard_size,
+            (r + 1) * shard_size)``; ids past the vocabulary hold ``-inf``.
+        """
+        assert self.enable_lm_head_tp_in_adp, (
+            "forward_lm_head_tp_in_adp requires enable_lm_head_tp_in_adp")
+        num_rows = input.shape[0]
+        if num_rows > num_rows_per_rank:
+            raise ValueError(f"LM head input has {num_rows} rows, more than "
+                             f"num_rows_per_rank={num_rows_per_rank}")
+        mapping_lm_head_tp = create_lm_head_tp_mapping(self.mapping,
+                                                       num_rows_per_rank)
+        if num_rows < num_rows_per_rank:
+            input = F.pad(input, (0, 0, 0, num_rows_per_rank - num_rows))
+        input = allgather(input, mapping_lm_head_tp, dim=0)
+        output = self.forward(input,
+                              mapping_lm_head_tp=mapping_lm_head_tp,
+                              is_spec_decoding_head=True)
+        shard_size = ceil_div(self.out_features, mapping_lm_head_tp.tp_size)
+        if output.shape[-1] < shard_size:
+            output = F.pad(output, (0, shard_size - output.shape[-1]),
+                           value=float("-inf"))
+        return output, mapping_lm_head_tp
+
+    def forward_lm_head_tp_in_adp_full_vocab(
+            self, input: torch.Tensor, num_rows_per_rank: int) -> torch.Tensor:
+        """Full-vocab logits of this rank's rows, computed vocab-parallel.
+
+        Runs :meth:`forward_lm_head_tp_in_adp`, then gathers every LM-head TP
+        rank's vocab shard of this rank's own rows, so the result has the
+        ``[num_rows, vocab_size]`` layout of :meth:`forward`.
+        """
+        num_rows = input.shape[0]
+        shards, mapping_lm_head_tp = self.forward_lm_head_tp_in_adp(
+            input, num_rows_per_rank)
+        group_size = mapping_lm_head_tp.tp_size
+        # [shard owner, row owner, row, shard column]
+        shards = allgather(shards, mapping_lm_head_tp,
+                           dim=0).view(group_size, group_size,
+                                       num_rows_per_rank, -1)
+        logits = shards[:, mapping_lm_head_tp.tp_rank, :num_rows]
+        logits = logits.transpose(0, 1).reshape(num_rows, -1)
+        return logits[:, :self.out_features]
 
     def skip_forward(
             self,

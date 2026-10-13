@@ -551,8 +551,16 @@ class Eagle3OneModelWorker(SpecWorkerBase):
                       attn_metadata,
                       spec_metadata,
                       draft_model,
-                      resource_manager=None):
+                      resource_manager=None,
+                      mapping_lm_head_tp=None):
+        """Verify the previous drafts and propose the next ones.
 
+        ``mapping_lm_head_tp`` marks ``logits`` as the LM-head TP group's
+        row-stacked vocab shards of an all-greedy batch rather than this rank's
+        full-vocab logits (see ``forward_lm_head_tp_in_adp``): the target
+        tokens are then their distributed argmax, and no full-vocab logits are
+        returned.
+        """
         runtime_draft_len = spec_metadata.runtime_draft_len
         # skip the draft forward if the runtime draft length is 0
         if runtime_draft_len == 0:
@@ -564,14 +572,18 @@ class Eagle3OneModelWorker(SpecWorkerBase):
         num_contexts = attn_metadata.num_contexts
         num_gens = batch_size - num_contexts
 
-        raw_logits = logits
+        raw_logits = logits if mapping_lm_head_tp is None else None
 
         self._execute_guided_decoder_if_present(logits)
 
         # Sample and accept tokens. ``input_ids`` is required by the relaxed-
         # acceptance path (scans for thinking-phase tokens); ignored otherwise.
         accepted_tokens, num_accepted_tokens = self.sample_and_accept_draft_tokens(
-            input_ids, logits, attn_metadata, spec_metadata)
+            input_ids,
+            logits,
+            attn_metadata,
+            spec_metadata,
+            mapping_lm_head_tp=mapping_lm_head_tp)
 
         # Mamba hybrid models need state updates after token acceptance because
         # the accepted token count affects which Mamba states are valid. The
@@ -852,7 +864,10 @@ class Eagle3OneModelWorker(SpecWorkerBase):
                 # MTP Eagle: shared_head of the MTP layer, with optional
                 #   ADP+LM-head-TP padding to ``max_num_requests`` so every TP
                 #   rank produces logits of the same shape.
-                # Eagle3: logits_processor of the EAGLE draft model.
+                # Eagle3: logits_processor of the EAGLE draft model, or with
+                #   ADP+LM-head-TP the draft LM head's vocab-sharded projection
+                #   of the group's rows, each rank padded to the largest
+                #   per-rank batch of the step.
                 #
                 # The LM-head-TP fast path (group-stacked rows, vocab-sharded
                 # weight) is only usable when the consumer is an argmax: the
@@ -874,11 +889,20 @@ class Eagle3OneModelWorker(SpecWorkerBase):
                     spec_metadata.wants_advanced_draft_sampling)
                 # enable_lm_head_tp_in_adp implies enable_attention_dp
                 # (asserted in Mapping.__init__); no separate ADP check.
-                lm_head_tp_in_adp_configured = (
-                    self.is_mtp_eagle and self.model_config is not None
-                    and self.model_config.mapping.enable_lm_head_tp_in_adp)
+                if self.is_mtp_eagle:
+                    lm_head_tp_in_adp_configured = (
+                        self.model_config is not None
+                        and self.model_config.mapping.enable_lm_head_tp_in_adp)
+                else:
+                    # The guided decoder masks each request's own full-vocab
+                    # draft logits, so it keeps the local projection.
+                    lm_head_tp_in_adp_configured = (
+                        self.mapping is not None
+                        and self.mapping.enable_lm_head_tp_in_adp
+                        and self.guided_decoder is None)
                 use_lm_head_tp_in_adp = (lm_head_tp_in_adp_configured
                                          and not advanced_draft_sampling)
+                mapping_lm_head_tp = None
                 if self.is_mtp_eagle:
                     # One row per request: the LM-head input on this step and
                     # the draft input on the next.
@@ -906,6 +930,12 @@ class Eagle3OneModelWorker(SpecWorkerBase):
                         logits = draft_model.mtp_layers[0].shared_head(
                             padded_hidden_states, draft_model.lm_head,
                             attn_metadata, True)
+                        # The MTP head built this per-forward mapping when
+                        # producing the vocab-sharded logits; the sampler needs
+                        # it to gather.
+                        mapping_lm_head_tp = getattr(
+                            draft_model.mtp_layers[0].shared_head,
+                            "mapping_lm_head_tp", None)
                     elif lm_head_tp_in_adp_configured:
                         # Advanced-sampling bypass: the model's shared_head
                         # would re-apply the LM-head-TP stacked/sharded path
@@ -929,6 +959,12 @@ class Eagle3OneModelWorker(SpecWorkerBase):
                         logits = draft_model.mtp_layers[0].shared_head(
                             request_hidden_states, draft_model.lm_head,
                             attn_metadata, True)
+                elif use_lm_head_tp_in_adp:
+                    token_count = batch_size
+                    logits, mapping_lm_head_tp = (
+                        draft_model.lm_head.forward_lm_head_tp_in_adp(
+                            hidden_states[gather_ids],
+                            max(spec_metadata.all_rank_num_seqs)))
                 else:
                     logits = draft_model.logits_processor(
                         hidden_states[gather_ids], draft_model.lm_head,
@@ -944,21 +980,14 @@ class Eagle3OneModelWorker(SpecWorkerBase):
                                                                 draft_step=i)
 
                 # ADP+LM-head-TP logits are the LM-head-TP group's row-stacked
-                # batch (each rank's rows padded to max_num_requests, then
+                # batch (each rank's rows padded to a common count, then
                 # all-gathered along dim 0) with the vocab sharded across the
                 # group. Rows [:token_count] would be group rank 0's requests,
                 # not this rank's, and a per-rank argmax would return a
                 # shard-local index -- so keep the full stacked logits and let
                 # greedy_sample_draft_with_tp_gather combine the group's vocab
                 # shards and slice this rank's own row segment; only then trim
-                # the max_num_requests padding down to token_count.
-                mapping_lm_head_tp = None
-                if use_lm_head_tp_in_adp:
-                    # The MTP head built this per-forward mapping when producing
-                    # the vocab-sharded logits; the sampler needs it to gather.
-                    mapping_lm_head_tp = getattr(
-                        draft_model.mtp_layers[0].shared_head,
-                        "mapping_lm_head_tp", None)
+                # the padding down to token_count.
                 new_draft_token = self.sample_draft_tokens(
                     logits,
                     spec_metadata,
@@ -1118,17 +1147,37 @@ class Eagle3OneModelWorker(SpecWorkerBase):
         logits: torch.Tensor,
         attn_metadata: AttentionMetadata,
         spec_metadata: Eagle3OneModelSpecMetadata,
+        mapping_lm_head_tp: Optional[Mapping] = None,
     ):
         """Sample the golden token and verify previously proposed draft tokens.
 
         ``input_ids`` is scanned for thinking-phase tokens when relaxed
         acceptance is enabled (both Eagle3 and MTP Eagle); ignored otherwise.
+        With ``mapping_lm_head_tp``, ``logits`` are the LM-head TP group's
+        vocab shards of an all-greedy batch (see ``_forward_impl``).
         """
         batch_size = attn_metadata.num_seqs
         num_contexts = attn_metadata.num_contexts
         num_gens = batch_size - num_contexts
 
         runtime_draft_len = spec_metadata.runtime_draft_len
+
+        if mapping_lm_head_tp is not None:
+            # Greedy verification only needs each row's argmax, which the
+            # distributed sampler recovers from the group's vocab-shard maxima.
+            num_rows = num_contexts + num_gens * (runtime_draft_len + 1)
+            target_tokens = self.greedy_sample_draft_with_tp_gather(
+                logits, spec_metadata, mapping_lm_head_tp)[:num_rows]
+            draft_tokens = spec_metadata.draft_tokens.reshape(
+                num_gens, runtime_draft_len) if num_gens > 0 else torch.empty(
+                    0, runtime_draft_len, dtype=torch.int, device=logits.device)
+            return self._sample_and_accept_draft_tokens_base(
+                logits,
+                draft_tokens,
+                num_contexts,
+                batch_size,
+                spec_metadata,
+                target_tokens=target_tokens)
 
         if getattr(self.spec_config, 'use_relaxed_acceptance_for_thinking',
                    False):

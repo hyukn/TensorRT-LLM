@@ -13,6 +13,7 @@ from torch import nn
 from transformers import LlamaConfig, PretrainedConfig
 
 from tensorrt_llm.logger import logger
+from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
 
@@ -27,6 +28,7 @@ from ..modules.embedding import Embedding, LMHead, get_masked_input_and_mask
 from ..modules.gated_mlp import GatedMLP
 from ..modules.linear import (Linear, TensorParallelMode, WeightMode,
                               WeightsLoadingConfig)
+from ..modules.logits_processor import LogitsProcessor
 from ..modules.rms_norm import RMSNorm
 from ..moe.fused_moe import moe_load_balancer_set_repeated_for_next_layer
 from ..pyexecutor.guided_decoder import CapturableGuidedDecoder
@@ -1806,6 +1808,12 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
                 # draft_model.model.d2t on every forward.
                 self.spec_worker.set_draft_model(self.draft_model)
                 self.epilogue.append(self.spec_worker)
+        # Eagle3 shards its verify head together with its draft head when the
+        # LM head is tensor-parallel under attention DP.
+        self._verify_with_lm_head_tp_in_adp = (
+            spec_config is not None
+            and spec_config.spec_dec_mode.is_eagle3_one_model()
+            and model_config.mapping.enable_lm_head_tp_in_adp)
         self.layer_idx = -1
 
     def setup_aliases(self) -> None:
@@ -1841,12 +1849,13 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
 
         if self.spec_worker is not None:
             # get logits
-            logits = self.logits_processor.forward(
-                hidden_states[spec_metadata.gather_ids],
-                self.lm_head,
-                attn_metadata,
-                True,
-            )
+            logits, mapping_lm_head_tp = self._compute_verify_logits(
+                hidden_states[spec_metadata.gather_ids], attn_metadata,
+                spec_metadata)
+            # Only a worker handed vocab shards learns their mapping.
+            spec_worker_kwargs = ({} if mapping_lm_head_tp is None else {
+                "mapping_lm_head_tp": mapping_lm_head_tp
+            })
 
             # VLM wrappers (e.g. Qwen3VLModelBase) replace input_ids with
             # fused inputs_embeds; fall back to the pre-fusion token IDs
@@ -1871,7 +1880,8 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
                                     attn_metadata=attn_metadata,
                                     spec_metadata=spec_metadata,
                                     draft_model=self.draft_model,
-                                    resource_manager=resource_manager)
+                                    resource_manager=resource_manager,
+                                    **spec_worker_kwargs)
         else:
             logits = self.logits_processor.forward(
                 hidden_states,
@@ -1881,6 +1891,53 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
             )
 
         return logits
+
+    def _compute_verify_logits(
+            self, hidden_states: torch.Tensor, attn_metadata: AttentionMetadata,
+            spec_metadata: SpecMetadata
+    ) -> Tuple[torch.Tensor, Optional[Mapping]]:
+        """Target logits for the rows the spec worker verifies.
+
+        Returns full-vocab logits and None, or, for a batch the worker can
+        verify greedily from vocab shards, the LM-head TP group's row-stacked
+        vocab shards and the mapping that produced them (see
+        ``LMHead.forward_lm_head_tp_in_adp``).
+        """
+        # The vocab-parallel head replaces only the plain projection; a model
+        # whose logits processor transforms the hidden states first keeps it.
+        if not (self._verify_with_lm_head_tp_in_adp
+                and type(self.logits_processor) is LogitsProcessor):
+            return self.logits_processor.forward(hidden_states, self.lm_head,
+                                                 attn_metadata, True), None
+        # A verify step has only a few rows per rank, so the replicated LM head
+        # is bound by reading its weight on every attention-DP rank; project
+        # the group's rows onto per-rank vocab shards instead. A request
+        # contributes at most tokens_per_gen_step rows.
+        num_rows_per_rank = (max(spec_metadata.all_rank_num_seqs) *
+                             self.spec_config.tokens_per_gen_step)
+        if self._can_verify_from_vocab_shards(spec_metadata):
+            return self.lm_head.forward_lm_head_tp_in_adp(
+                hidden_states, num_rows_per_rank)
+        logits = self.lm_head.forward_lm_head_tp_in_adp_full_vocab(
+            hidden_states, num_rows_per_rank)
+        return logits.float(), None
+
+    def _can_verify_from_vocab_shards(self,
+                                      spec_metadata: SpecMetadata) -> bool:
+        """Whether the worker only needs each verify row's argmax.
+
+        The choice decides which collectives the verify head runs, so it must
+        agree across the LM-head TP group: every condition is configuration
+        except ``is_all_greedy_sample``, which the model engine synchronizes
+        across the group under LM-head TP in attention DP.
+        """
+        return (spec_metadata.is_all_greedy_sample
+                and spec_metadata.runtime_draft_len > 0
+                and not spec_metadata.is_spec_dec_tree
+                and not spec_metadata.enable_penalty
+                and self.spec_worker.guided_decoder is None
+                and not getattr(self.spec_config,
+                                "use_relaxed_acceptance_for_thinking", False))
 
     def _quantization_named_modules(self) -> Iterator[tuple[str, nn.Module]]:
         if not getattr(self.spec_config, "uses_replacement_heads", False):

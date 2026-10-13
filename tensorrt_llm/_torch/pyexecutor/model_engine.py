@@ -4206,8 +4206,9 @@ class PyTorchModelEngine(ModelEngine):
         """
         # enable_lm_head_tp_in_adp implies enable_attention_dp (asserted in
         # Mapping.__init__), so ADP needs no separate check here.
-        if not (self.mapping.enable_lm_head_tp_in_adp
-                and spec_metadata.use_rejection_sampling):
+        if not (self.mapping.enable_lm_head_tp_in_adp and
+                (spec_metadata.use_rejection_sampling
+                 or spec_metadata.spec_dec_mode.is_eagle3_one_model())):
             return
         local_flag = bool(spec_metadata.is_all_greedy_sample)
         all_flags = self.dist.tp_allgather_int64([local_flag])[:, 0]
@@ -6596,6 +6597,11 @@ class PyTorchModelEngine(ModelEngine):
             return
 
         logits_tensor = outputs["logits"]
+        if logits_tensor is None:
+            # A one-model speculative worker that verified the step from vocab
+            # shards returns no full-vocab logits; it chose the tokens inside
+            # the forward, so there is nothing for a post processor to act on.
+            return
 
         logits_row_offset = 0
         request_groups = (

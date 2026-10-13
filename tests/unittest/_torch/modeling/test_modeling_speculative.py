@@ -35,6 +35,7 @@ from tensorrt_llm._torch.models.modeling_speculative import (
     _set_draft_kv_cache_quant_algo,
     external_drafter_config_kwargs,
 )
+from tensorrt_llm._torch.modules.logits_processor import LogitsProcessor
 from tensorrt_llm._torch.modules.rms_norm import RMSNorm
 from tensorrt_llm._torch.speculative.interface import SpeculativeDecodingMode
 from tensorrt_llm.models.modeling_utils import QuantConfig
@@ -712,3 +713,118 @@ def test_internal_mtp_rejects_nemotron_backend_mismatch() -> None:
 
     with pytest.raises(ValueError, match="Nemotron-H embedded MTP layers"):
         _build_mtp_one_model_draft(target_config, None, sentinel.lm_head, target_model)
+
+
+# ---------------------------------------------------------------------------
+# SpecDecOneEngineForCausalLM: verify head under LM-head TP in attention DP
+# ---------------------------------------------------------------------------
+
+
+def _verify_head_stub(logits_processor, *, lm_head_tp_in_adp=True, guided_decoder=None, **spec):
+    """Stand-in carrying just what _compute_verify_logits reads."""
+    lm_head = MagicMock()
+    lm_head.forward_lm_head_tp_in_adp.return_value = (sentinel.shards, sentinel.mapping)
+    lm_head.forward_lm_head_tp_in_adp_full_vocab.return_value = torch.zeros(
+        2, 8, dtype=torch.bfloat16
+    )
+    stub = SimpleNamespace(
+        _verify_with_lm_head_tp_in_adp=lm_head_tp_in_adp,
+        logits_processor=logits_processor,
+        lm_head=lm_head,
+        spec_config=SimpleNamespace(tokens_per_gen_step=4, **spec),
+        spec_worker=SimpleNamespace(guided_decoder=guided_decoder),
+    )
+    stub._can_verify_from_vocab_shards = lambda spec_metadata: (
+        SpecDecOneEngineForCausalLM._can_verify_from_vocab_shards(stub, spec_metadata)
+    )
+    return stub
+
+
+def _verify_spec_metadata(**overrides):
+    fields = dict(
+        all_rank_num_seqs=[1, 2, 1, 1],
+        is_all_greedy_sample=True,
+        runtime_draft_len=3,
+        is_spec_dec_tree=False,
+        enable_penalty=False,
+    )
+    fields.update(overrides)
+    return SimpleNamespace(**fields)
+
+
+def _mocked_logits_processor(cls=LogitsProcessor):
+    processor = cls()
+    processor.forward = MagicMock(return_value=sentinel.logits)
+    return processor
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("lm_head_tp_in_adp", [False, True])
+def test_verify_head_keeps_a_model_specific_logits_processor(lm_head_tp_in_adp) -> None:
+    """A processor that transforms the hidden states before the LM head (e.g. a
+    hyper-connection head) must keep running; only the plain one is replaced."""
+
+    class _TransformingLogitsProcessor(LogitsProcessor):
+        pass
+
+    stub = _verify_head_stub(
+        _mocked_logits_processor(_TransformingLogitsProcessor),
+        lm_head_tp_in_adp=lm_head_tp_in_adp,
+    )
+    assert SpecDecOneEngineForCausalLM._compute_verify_logits(
+        stub, sentinel.hidden, sentinel.attn_metadata, _verify_spec_metadata()
+    ) == (sentinel.logits, None)
+    stub.logits_processor.forward.assert_called_once_with(
+        sentinel.hidden, stub.lm_head, sentinel.attn_metadata, True
+    )
+    stub.lm_head.forward_lm_head_tp_in_adp.assert_not_called()
+    stub.lm_head.forward_lm_head_tp_in_adp_full_vocab.assert_not_called()
+
+
+@pytest.mark.cpu_only
+def test_verify_head_uses_the_logits_processor_without_lm_head_tp() -> None:
+    stub = _verify_head_stub(_mocked_logits_processor(), lm_head_tp_in_adp=False)
+    assert SpecDecOneEngineForCausalLM._compute_verify_logits(
+        stub, sentinel.hidden, sentinel.attn_metadata, _verify_spec_metadata()
+    ) == (sentinel.logits, None)
+
+
+@pytest.mark.cpu_only
+def test_verify_head_hands_a_greedy_batch_its_vocab_shards() -> None:
+    stub = _verify_head_stub(_mocked_logits_processor())
+    logits, mapping = SpecDecOneEngineForCausalLM._compute_verify_logits(
+        stub, sentinel.hidden, sentinel.attn_metadata, _verify_spec_metadata()
+    )
+    assert (logits, mapping) == (sentinel.shards, sentinel.mapping)
+    # Every rank pads to the largest per-rank request count of the step times
+    # the rows a request can contribute.
+    stub.lm_head.forward_lm_head_tp_in_adp.assert_called_once_with(sentinel.hidden, 2 * 4)
+    stub.logits_processor.forward.assert_not_called()
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "metadata,stub_kwargs",
+    [
+        (dict(is_all_greedy_sample=False), {}),
+        (dict(enable_penalty=True), {}),
+        (dict(is_spec_dec_tree=True), {}),
+        (dict(runtime_draft_len=0), {}),
+        ({}, dict(guided_decoder=sentinel.guided_decoder)),
+        ({}, dict(use_relaxed_acceptance_for_thinking=True)),
+    ],
+    ids=["sampled", "penalties", "tree", "no_drafts", "guided", "relaxed_acceptance"],
+)
+def test_verify_head_returns_full_vocab_logits_when_the_worker_needs_them(
+    metadata, stub_kwargs
+) -> None:
+    stub = _verify_head_stub(_mocked_logits_processor(), **stub_kwargs)
+    logits, mapping = SpecDecOneEngineForCausalLM._compute_verify_logits(
+        stub, sentinel.hidden, sentinel.attn_metadata, _verify_spec_metadata(**metadata)
+    )
+    assert mapping is None
+    assert logits.dtype == torch.float32
+    stub.lm_head.forward_lm_head_tp_in_adp_full_vocab.assert_called_once_with(
+        sentinel.hidden, 2 * 4
+    )
+    stub.lm_head.forward_lm_head_tp_in_adp.assert_not_called()

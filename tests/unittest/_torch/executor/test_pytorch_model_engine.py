@@ -2724,5 +2724,47 @@ def test_runner_input_buffers_support_repeated_cuda_graph_replay(
     graph.reset()
 
 
+@pytest.mark.parametrize("use_rejection_sampling,is_eagle3_one_model,synced",
+                         [(True, False, True), (False, True, True),
+                          (False, False, False)],
+                         ids=["rejection", "eagle3", "neither"])
+def test_group_all_greedy_sample_sync_gate(use_rejection_sampling,
+                                           is_eagle3_one_model, synced) -> None:
+    """Under LM-head TP in attention DP the greedy choice is synchronized
+    whenever it decides group collectives: with rejection sampling, and for
+    Eagle3 one-model, whose verify head reads vocab shards for greedy batches.
+    """
+    engine = object.__new__(PyTorchModelEngine)
+    engine.mapping = SimpleNamespace(enable_lm_head_tp_in_adp=True)
+    # This rank's batch is greedy; another rank's is not.
+    engine.dist = SimpleNamespace(tp_allgather_int64=Mock(
+        return_value=torch.tensor([[1], [0]])))
+    spec_metadata = SimpleNamespace(
+        use_rejection_sampling=use_rejection_sampling,
+        spec_dec_mode=SimpleNamespace(
+            is_eagle3_one_model=lambda: is_eagle3_one_model),
+        is_all_greedy_sample=True,
+        group_all_greedy_sample=None)
+
+    engine._sync_group_all_greedy_sample(spec_metadata)
+
+    assert spec_metadata.is_all_greedy_sample is not synced
+    assert spec_metadata.group_all_greedy_sample is (False if synced else None)
+    assert engine.dist.tp_allgather_int64.called is synced
+
+
+def test_logit_post_processors_skip_a_step_without_full_vocab_logits() -> None:
+    engine = object.__new__(PyTorchModelEngine)
+    engine.mapping = SimpleNamespace(is_last_pp_rank=lambda: True)
+    engine._apply_logits_processors = Mock()
+    request = SimpleNamespace(py_logits_post_processors=[Mock()])
+    scheduled_requests = SimpleNamespace(context_requests=[],
+                                         generation_requests=[request])
+
+    engine._execute_logit_post_processors(scheduled_requests, {"logits": None})
+
+    engine._apply_logits_processors.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()
