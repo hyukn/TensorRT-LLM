@@ -807,11 +807,35 @@ class MXFP8QuantizeRunner(TunableRunner):
         return torch.ops.trtllm.mxfp8_quantize(activation, True)
 
 
+_MXFP8_CUTE_DSL_TUNED_ENV = "TRTLLM_MXFP8_CUTE_DSL_TUNED_CONFIG"
+
+
+def mxfp8_cute_dsl_tuned_config_enabled() -> bool:
+    """Whether ``TRTLLM_MXFP8_CUTE_DSL_TUNED_CONFIG=1`` adds the swept CuTeDSL tactic."""
+    return os.environ.get(_MXFP8_CUTE_DSL_TUNED_ENV, "0") == "1"
+
+
 class FlashInferMXFP8GemmRunner(TunableRunner):
-    """Profile the FlashInfer CUTLASS and CuTeDSL MXFP8 GEMMs."""
+    """Profile the FlashInfer CUTLASS and CuTeDSL MXFP8 GEMMs.
+
+    CUTE_DSL runs FlashInfer's heuristic CuTeDSL config. With
+    ``TRTLLM_MXFP8_CUTE_DSL_TUNED_CONFIG=1`` (experimental, default off) a
+    third tactic, CUTE_DSL_TUNED, lets FlashInfer sweep its CuTeDSL configs
+    for the bucket's representative shape and replays FlashInfer's cached pick
+    afterwards; a shape FlashInfer holds no pick for runs the heuristic config.
+    The autotuner keeps the heuristic tactic wherever the swept one is slower.
+    NOT bitwise in general: at M < 64 FlashInfer can pick configs whose output
+    differs from the heuristic config's in the last bf16 bit, so the tactic is
+    offered from M = 64 only (``TRTLLM_MXFP8_CUTE_DSL_TUNED_MIN_M`` lowers it),
+    where its picks matched the other tactics bitwise at the MiniMax-M3 decode
+    shapes (tests/unittest/_torch/thop/parallel/
+    test_mxfp8_cute_dsl_tuned_config.py). Needs an accuracy gate.
+    """
 
     CUTLASS = -1  # -1 is the AutoTuner fallback tactic.
     CUTE_DSL = 0
+    CUTE_DSL_TUNED = 1
+    CUTE_DSL_TUNED_MIN_M = 64
 
     tuning_config = TuningConfig(
         dynamic_tensor_specs=(DynamicTensorSpec(
@@ -828,7 +852,32 @@ class FlashInferMXFP8GemmRunner(TunableRunner):
 
     def get_valid_tactics(self, inputs: List[torch.Tensor],
                           profile: OptimizationProfile, **kwargs) -> List[int]:
-        return [self.CUTLASS, self.CUTE_DSL]
+        min_m = int(
+            os.environ.get("TRTLLM_MXFP8_CUTE_DSL_TUNED_MIN_M",
+                           self.CUTE_DSL_TUNED_MIN_M))
+        if (not mxfp8_cute_dsl_tuned_config_enabled()
+                or inputs[0].shape[0] < min_m):
+            return [self.CUTLASS, self.CUTE_DSL]
+        if not torch.cuda.is_current_stream_capturing():
+            # Let FlashInfer sweep its CuTeDSL configs for this shape now, on
+            # the eager path: this autotuner then profiles CUTE_DSL_TUNED (and
+            # serving replays it) with FlashInfer's cached pick.
+            self._run_cute_dsl(inputs, tune=True)
+        return [self.CUTLASS, self.CUTE_DSL, self.CUTE_DSL_TUNED]
+
+    def _run_cute_dsl(self, inputs: List[torch.Tensor],
+                      tune: bool) -> torch.Tensor:
+        act, act_scale, weight, weight_scale = inputs
+        with _flashinfer_autotune(tune_mode=tune):
+            return _flashinfer_mm_mxfp8(
+                act,
+                weight.t(),
+                act_scale,
+                weight_scale,
+                out_dtype=self.output_dtype,
+                use_8x4_sf_layout=False,
+                backend="cute-dsl",
+            )
 
     def forward(
         self,
@@ -839,6 +888,10 @@ class FlashInferMXFP8GemmRunner(TunableRunner):
         if tactic == self.CUTLASS:
             backend = "cutlass"
             context = nullcontext()
+        elif tactic == self.CUTE_DSL_TUNED:
+            # FlashInfer's pick for this shape (swept in get_valid_tactics),
+            # or its heuristic config when it holds none.
+            return self._run_cute_dsl(inputs, tune=False)
         else:
             # Skip FlashInfer's CuTeDSL config sweep; use its heuristic config.
             backend = "cute-dsl"
