@@ -155,6 +155,31 @@ class LMHead(Linear):
 
         return output
 
+    def supports_vocab_shard_projection(self) -> bool:
+        """Whether :meth:`forward_vocab_shard` can replace :meth:`forward`.
+
+        True for a vocab-parallel head under plain tensor parallelism whose
+        gathered output is exactly the rank-ordered concatenation of equal,
+        unpadded shards, so rank ``r``'s shard covers vocab ids
+        ``[r * out_features, (r + 1) * out_features)``.
+        """
+        return (self.tp_mode == TensorParallelMode.COLUMN and self.tp_size > 1
+                and self.gather_output and self.padding_size == 0
+                and self.gather_output_sizes is None
+                and not self.mapping.enable_attention_dp and self.lora is None)
+
+    def forward_vocab_shard(self, input: torch.Tensor) -> torch.Tensor:
+        """This rank's vocab shard of :meth:`forward`, without the all-gather.
+
+        The same GEMM :meth:`forward` runs before gathering, so the result is
+        bitwise the shard's columns of the gathered logits. A consumer that
+        only needs each row's argmax combines the shards' maxima instead of
+        gathering ``[rows, vocab]`` logits (see
+        ``SpecWorkerBase.greedy_sample_draft_with_tp_gather``). Requires
+        :meth:`supports_vocab_shard_projection`.
+        """
+        return self.apply_linear(input, self.bias)
+
     def forward_lm_head_tp_in_adp(
             self, input: torch.Tensor,
             num_rows_per_rank: int) -> Tuple[torch.Tensor, Mapping]:

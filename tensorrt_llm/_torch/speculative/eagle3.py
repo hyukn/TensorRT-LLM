@@ -17,12 +17,14 @@ from ..attention.backends import AttentionMetadata
 from ..attention.backends.flashinfer import FlashInferAttentionMetadata
 from ..attention.backends.sparse.params import MTPIndexShareMetadata
 from ..model_config import ModelConfig
+from ..modules.embedding import LMHead
+from ..modules.logits_processor import LogitsProcessor
 from ..pyexecutor.kv_cache.mamba_cache_manager import MambaHybridCacheManager
 from ..pyexecutor.llm_request import LlmRequest
 from ..pyexecutor.resource_manager import BaseResourceManager, SlotManager
 from ..pyexecutor.scheduler import ScheduledRequests
 from .interface import (INVALID_PROMPT_LOOKAHEAD_TOKEN, SpecMetadata,
-                        SpecWorkerBase)
+                        SpecWorkerBase, tp_vocab_shard_greedy_enabled)
 from .mtp import _select_mtp_position_ids
 from .sa_enhancer import SADraftEnhancer
 from .spec_tree_manager import SpecTreeManager
@@ -491,6 +493,23 @@ class Eagle3OneModelWorker(SpecWorkerBase):
     @property
     def max_draft_len(self) -> int:
         return self.spec_config.max_draft_len
+
+    def _draft_from_tp_vocab_shards(self, draft_model) -> bool:
+        """Whether a greedy Eagle3 draft step can sample from vocab shards.
+
+        Opt-in (``TRTLLM_SPEC_TP_VOCAB_SHARD_GREEDY=1``), plain TP only: the
+        draft head is vocab-parallel and unpadded, its logits processor is the
+        plain projection, and nothing needs the full-vocab draft logits.
+        Every input is configuration, so all TP ranks take the same branch.
+        """
+        if self.is_mtp_eagle or self.guided_decoder is not None:
+            return False
+        if not tp_vocab_shard_greedy_enabled():
+            return False
+        lm_head = getattr(draft_model, "lm_head", None)
+        return (type(getattr(draft_model, "logits_processor", None))
+                is LogitsProcessor and isinstance(lm_head, LMHead)
+                and lm_head.supports_vocab_shard_projection())
 
     def _prepare_attn_metadata_for_spec_dec(self, attn_metadata):
         attn_metadata.prepare_for_spec_dec("_seq_lens", "_seq_lens_cuda")
@@ -965,6 +984,14 @@ class Eagle3OneModelWorker(SpecWorkerBase):
                         draft_model.lm_head.forward_lm_head_tp_in_adp(
                             hidden_states[gather_ids],
                             max(spec_metadata.all_rank_num_seqs)))
+                elif (not advanced_draft_sampling
+                      and self._draft_from_tp_vocab_shards(draft_model)):
+                    # Plain TP, greedy drafts: this rank's vocab shard of every
+                    # row; the sampler combines the shards' (index, max) pairs
+                    # instead of all-gathering [rows, vocab] logits.
+                    logits = draft_model.lm_head.forward_vocab_shard(
+                        hidden_states[gather_ids])
+                    mapping_lm_head_tp = draft_model.lm_head.mapping
                 else:
                     logits = draft_model.logits_processor(
                         hidden_states[gather_ids], draft_model.lm_head,

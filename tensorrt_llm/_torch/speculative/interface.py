@@ -110,6 +110,17 @@ _FORCE_ACCEPT_RNG_SEED = 0xACCE9D
 _FORCE_ACCEPT_RNG_COUNTER_STRIDE = 6007
 _FORCE_ACCEPT_RNG_SLOT_STRIDE = 1009
 
+# Opt-in: under plain tensor parallelism, the Eagle3 one-model verify head and
+# draft head of an all-greedy batch project onto this rank's vocab shard only and
+# take each row's argmax from the shards' (index, max) pairs, instead of
+# all-gathering [rows, vocab] logits. Bitwise the same tokens.
+TP_VOCAB_SHARD_GREEDY_ENV_VAR = "TRTLLM_SPEC_TP_VOCAB_SHARD_GREEDY"
+
+
+def tp_vocab_shard_greedy_enabled() -> bool:
+    """Whether ``TRTLLM_SPEC_TP_VOCAB_SHARD_GREEDY=1`` is set."""
+    return os.environ.get(TP_VOCAB_SHARD_GREEDY_ENV_VAR, "0") == "1"
+
 
 def should_use_separate_draft_kv_cache(spec_config) -> bool:
     """
@@ -2673,6 +2684,11 @@ class SpecWorkerBase(nn.Module, ABC):
         must combine the group's vocab shards, and each rank must read its own
         row segment at offset ``tp_rank * max_num_requests`` -- NOT rows
         ``[:batch]``, which belong to group rank 0.
+
+        Under plain tensor parallelism a ``mapping_lm_head_tp`` without
+        attention DP marks ``logits`` as this rank's vocab shard of rows every
+        rank shares (``LMHead.forward_vocab_shard``): the shards' maxima are
+        combined and every row is returned.
         """
         if (mapping_lm_head_tp is not None
                 and getattr(mapping_lm_head_tp, "tp_size", 1) > 1):
@@ -2680,6 +2696,8 @@ class SpecWorkerBase(nn.Module, ABC):
             combined = self._get_local_max_and_combined(logits,
                                                         mapping_lm_head_tp)
             gathered = allgather(combined, mapping_lm_head_tp, dim=-1)
+            if not getattr(mapping_lm_head_tp, "enable_attention_dp", False):
+                return self._get_draft_tokens_from_gathered(gathered)
             group_size = mapping_lm_head_tp.tp_size
             local_rows = logits.shape[0] // group_size
             own_segment = gathered.view(group_size, local_rows,

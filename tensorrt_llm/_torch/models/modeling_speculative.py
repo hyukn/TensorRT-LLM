@@ -34,7 +34,8 @@ from ..moe.fused_moe import moe_load_balancer_set_repeated_for_next_layer
 from ..pyexecutor.guided_decoder import CapturableGuidedDecoder
 from ..speculative import (SpecMetadata, get_spec_worker,
                            should_use_separate_draft_kv_cache)
-from ..speculative.interface import SpeculativeDecodingMode
+from ..speculative.interface import (SpeculativeDecodingMode,
+                                     tp_vocab_shard_greedy_enabled)
 from ..utils import AuxStreamType
 from .checkpoints.base_weight_mapper import BaseWeightMapper
 from .modeling_auto import AutoModelForCausalLM
@@ -1814,6 +1815,15 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
             spec_config is not None
             and spec_config.spec_dec_mode.is_eagle3_one_model()
             and model_config.mapping.enable_lm_head_tp_in_adp)
+        # Plain TP: verify an all-greedy batch from the vocab-parallel head's
+        # shards (argmax of the shard maxima) instead of all-gathering
+        # [rows, vocab] logits. Same tokens bitwise; opt-in.
+        self._verify_from_tp_vocab_shards = (
+            spec_config is not None
+            and spec_config.spec_dec_mode.is_eagle3_one_model()
+            and tp_vocab_shard_greedy_enabled()
+            and not model_config.mapping.enable_attention_dp
+            and model_config.mapping.tp_size > 1)
         self.layer_idx = -1
 
     def setup_aliases(self) -> None:
@@ -1901,8 +1911,21 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
         Returns full-vocab logits and None, or, for a batch the worker can
         verify greedily from vocab shards, the LM-head TP group's row-stacked
         vocab shards and the mapping that produced them (see
-        ``LMHead.forward_lm_head_tp_in_adp``).
+        ``LMHead.forward_lm_head_tp_in_adp``), or, under plain TP with
+        ``TRTLLM_SPEC_TP_VOCAB_SHARD_GREEDY=1``, this rank's vocab shard of
+        every row and the TP mapping (see ``LMHead.forward_vocab_shard``).
         """
+        if (self._verify_from_tp_vocab_shards
+                and type(self.logits_processor) is LogitsProcessor
+                and isinstance(self.lm_head, LMHead)
+                and self.lm_head.supports_vocab_shard_projection()
+                and self._can_verify_from_vocab_shards(spec_metadata)):
+            # Every TP rank holds every row; the worker recovers each row's
+            # argmax from the shards' (index, max) pairs. The mapping has no
+            # attention DP, which is how the worker tells this layout from the
+            # LM-head-TP-in-ADP row stacking below.
+            return (self.lm_head.forward_vocab_shard(hidden_states),
+                    self.lm_head.mapping)
         # The vocab-parallel head replaces only the plain projection; a model
         # whose logits processor transforms the hidden states first keeps it.
         if not (self._verify_with_lm_head_tp_in_adp
