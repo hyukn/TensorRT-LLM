@@ -1141,6 +1141,59 @@ def test_build_paged_kv_slot_mapping_out_cache_loc_matches_slot_grid():
         assert slot in req_to_token[b].tolist()
 
 
+@pytest.mark.parametrize(
+    "device",
+    [
+        "cpu",
+        pytest.param(
+            "cuda",
+            marks=pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required"),
+        ),
+    ],
+)
+def test_build_paged_kv_slot_mapping_without_req_to_token(device):
+    """with_req_to_token=False (the MSA backend's call) skips only the per-token
+    grid: every other field is bitwise what the full build returns."""
+    from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.common import (
+        build_paged_kv_slot_mapping,
+    )
+
+    g = torch.Generator().manual_seed(3)
+    block_ids = torch.randint(0, 5000, (24, 257), generator=g, dtype=torch.int32)
+
+    class FakeCacheManager:
+        tokens_per_block = 128
+
+        def get_block_ids_per_seq(self, request_ids):
+            return block_ids[: len(request_ids)]
+
+    kv_lens_cpu = torch.randint(1, 257 * 128 - 8, (24,), generator=g, dtype=torch.int32)
+    for qo_len in (1, 4):
+        qo_lens_cpu = torch.full((24,), qo_len, dtype=torch.int32)
+        qo_offset_cpu = (kv_lens_cpu - qo_lens_cpu).clamp(min=-1)
+        kwargs = dict(
+            kv_cache_manager=FakeCacheManager(),
+            request_ids=list(range(24)),
+            qo_lens_cpu=qo_lens_cpu,
+            qo_offset_cpu=qo_offset_cpu,
+            device=torch.device(device),
+        )
+        full = build_paged_kv_slot_mapping(**kwargs)
+        lean = build_paged_kv_slot_mapping(**kwargs, with_req_to_token=False)
+        assert full.req_to_token is not None and lean.req_to_token is None
+        assert torch.equal(lean.slot_ids, full.slot_ids)
+        assert lean.out_cache_loc.dtype == full.out_cache_loc.dtype == torch.int32
+        assert torch.equal(lean.out_cache_loc, full.out_cache_loc)
+        assert torch.equal(lean.block_ids_cpu, full.block_ids_cpu)
+        # The slots still index the grid the full build produced.
+        rows = torch.arange(24).repeat_interleave(qo_len)
+        pos = qo_offset_cpu.to(torch.long).repeat_interleave(qo_len) + torch.arange(qo_len).repeat(
+            24
+        )
+        expected = full.req_to_token.cpu()[rows, pos.clamp(min=0)]
+        assert torch.equal(lean.out_cache_loc.cpu(), expected)
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_lazily_allocated_scratch_publishes_the_bound_it_used(monkeypatch):
     """The scratch is normally sized in _create_msa_buffers, but a metadata

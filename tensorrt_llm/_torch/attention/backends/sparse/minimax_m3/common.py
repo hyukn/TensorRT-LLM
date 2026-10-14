@@ -204,7 +204,7 @@ class MiniMaxM3SparseConfig:
 class PagedKvSlotMapping(NamedTuple):
     """One step's paged-cache slot mapping (see build_paged_kv_slot_mapping)."""
 
-    req_to_token: torch.Tensor
+    req_to_token: Optional[torch.Tensor]
     slot_ids: torch.Tensor
     out_cache_loc: torch.Tensor
     block_ids_cpu: torch.Tensor
@@ -217,6 +217,7 @@ def build_paged_kv_slot_mapping(
     qo_lens_cpu: torch.Tensor,
     qo_offset_cpu: torch.Tensor,
     device: torch.device,
+    with_req_to_token: bool = True,
 ) -> PagedKvSlotMapping:
     """Build the backend-neutral paged-cache slot mapping.
 
@@ -239,6 +240,10 @@ def build_paged_kv_slot_mapping(
     staged with non-blocking copies, so this neither syncs the host nor reads
     device memory back. It still allocates per step, so call it from prepare(),
     never from the forward path.
+
+    req_to_token spans max_blocks_per_seq at full width (max_seq_len tokens per
+    row, ~100 MB of device work per 24 rows at a 1M max_seq_len), so a caller
+    that does not read it passes ``with_req_to_token=False`` and gets None.
     """
     tokens_per_block = int(kv_cache_manager.tokens_per_block)
     # block_ids_per_seq is a [batch, max_blocks_per_seq] tensor; row b holds the
@@ -250,12 +255,14 @@ def build_paged_kv_slot_mapping(
     max_blocks = int(block_ids.shape[1])
     max_kv_len = max_blocks * tokens_per_block
 
-    # Expand block ids -> per-token slot ids.
-    block_ids_dev = block_ids.to(device, non_blocking=True).to(torch.int64)
-    within_block = torch.arange(tokens_per_block, device=device, dtype=torch.int64)
-    # Outer product per batch entry: [batch, max_blocks, tokens_per_block]
-    slot_grid = block_ids_dev.unsqueeze(-1) * tokens_per_block + within_block
-    req_to_token = slot_grid.reshape(batch, max_kv_len).to(torch.int32)
+    req_to_token = None
+    if with_req_to_token:
+        # Expand block ids -> per-token slot ids.
+        block_ids_dev = block_ids.to(device, non_blocking=True).to(torch.int64)
+        within_block = torch.arange(tokens_per_block, device=device, dtype=torch.int64)
+        # Outer product per batch entry: [batch, max_blocks, tokens_per_block]
+        slot_grid = block_ids_dev.unsqueeze(-1) * tokens_per_block + within_block
+        req_to_token = slot_grid.reshape(batch, max_kv_len).to(torch.int32)
     slot_ids = torch.arange(batch, device=device, dtype=torch.int32)
 
     # out_cache_loc: per-new-token slot ids, in flattened query-token order.

@@ -1092,13 +1092,17 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
         # Built in prepare() (outside capture), so these transients are
         # fine: forwards read only the persistent buffers filled below.
         # qo_offset is the prefix length, so one build covers prefill
-        # (num_cached) and decode (kv_len - qo_len).
+        # (num_cached) and decode (kv_len - qo_len). MSA reads the host block
+        # ids and the new-token slots only, never the per-token req_to_token
+        # grid, whose full-max_seq_len width made it the largest device op of
+        # a decode step's prepare.
         mapping = build_paged_kv_slot_mapping(
             kv_cache_manager=kv_cache_manager,
             request_ids=request_ids,
             qo_lens_cpu=qo_lens_cpu,
             qo_offset_cpu=qo_offset_cpu,
             device=cache_device,
+            with_req_to_token=False,
         )
         out_cache_loc = mapping.out_cache_loc
         # Only fmha_sm100 reads the flattened page table (the decode kernels
