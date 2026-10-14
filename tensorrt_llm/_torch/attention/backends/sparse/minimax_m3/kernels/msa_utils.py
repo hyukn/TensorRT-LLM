@@ -19,6 +19,13 @@ from tensorrt_llm.logger import logger
 
 from .msa_jit import configure_fmha_sm100_jit
 from .paged_cache import write_kv_slots
+from .select_blocks_ctx import (
+    ctx_select_enabled,
+    ctx_select_verify,
+    select_blocks_ctx,
+    verify_against_packaged,
+)
+from .select_blocks_ctx import supports as ctx_select_supports
 
 # fmha_sm100 ships only head_dim 128 variants and the MiniMax-M3 checkpoint
 # selects topk 16. Callers enforce these early so a misconfiguration fails
@@ -436,6 +443,22 @@ def select_blocks_from_maxscore(
     copy.
     """
     nvb = n_valid_blocks.to(device=max_score_kv.device, dtype=torch.int32).contiguous()
+    if ctx_select_enabled() and ctx_select_supports(max_score_kv, nvb, topk):
+        # Same result, read 32 queries per line from the query-contiguous scores; see
+        # select_blocks_ctx.py.
+        selected = select_blocks_ctx(
+            max_score_kv,
+            nvb,
+            topk=topk,
+            init_blocks=init_blocks,
+            local_blocks=local_blocks,
+            head_major_output=head_major_output,
+        )
+        if ctx_select_verify():
+            verify_against_packaged(
+                selected, max_score_kv, nvb, topk, init_blocks, local_blocks, head_major_output
+            )
+        return selected
     return torch.ops.trtllm.minimax_m3_select_blocks(
         max_score_kv,
         nvb,

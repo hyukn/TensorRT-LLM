@@ -63,6 +63,8 @@ from .kernels.msa_utils import (
     prewarm_fmha_variants,
     require_msa_module,
 )
+from .kernels.select_blocks_ctx import ctx_select_enabled
+from .kernels.select_blocks_ctx import prebuild as prebuild_ctx_select
 from .kernels.trtllm_gen_dense_decode import (
     dense_decode_unsupported_reason,
     uniform_subpages_per_slot,
@@ -1054,6 +1056,11 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
             index_dtype=self._msa_index_kv_dtype(),
         )
         prewarm_fmha_variants(fmha_sm100, variants)
+        if ctx_select_enabled() and not prebuild_ctx_select():
+            # The packaged selector still serves every call (supports() never changes this).
+            raise RuntimeError(
+                "TRTLLM_M3_CTX_SELECT=1 but the MiniMax-M3 context select kernel failed to build"
+            )
 
     def _build_msa_fields(self) -> None:
         """Populate the MSA cache-write buffers for this step.
