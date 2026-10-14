@@ -328,6 +328,90 @@ def minimax_m3_trtllm_gen_dense_decode(
     )
 
 
+DENSE_PREFILL_ENV = "TRTLLM_M3_DENSE_PREFILL_TRTLLM_GEN"
+
+
+@functools.lru_cache(maxsize=1)
+def dense_prefill_trtllm_gen_enabled() -> bool:
+    """TRTLLM_M3_DENSE_PREFILL_TRTLLM_GEN=1: context rows of the dense layers run on trtllm-gen.
+
+    Off by default. Not bitwise equal to fmha_sm100's dense plan (another kernel, another
+    accumulation order); see minimax_m3_trtllm_gen_dense_prefill.
+    """
+    import os
+
+    return os.environ.get(DENSE_PREFILL_ENV, "0") == "1" and flashinfer_available()
+
+
+@functools.lru_cache(maxsize=None)
+def _log_dense_prefill_once(num_heads: int, num_kv_heads: int) -> None:
+    from tensorrt_llm.logger import logger
+
+    logger.info(
+        f"MiniMax-M3 dense-layer context attention on trtllm-gen ({num_heads} q / {num_kv_heads} kv heads)"
+    )
+
+
+def minimax_m3_trtllm_gen_dense_prefill(
+    q: torch.Tensor,  # [total_q, num_heads, head_dim] of the context rows, FP8 for an FP8 pool
+    kv_cache_manager,
+    layer_idx: int,
+    *,
+    block_table: torch.Tensor,  # [batch, max_blocks] slot ids of the context rows
+    seq_lens: torch.Tensor,  # [batch] int32 attended KV length (cached + new)
+    cu_seqlens_q: torch.Tensor,  # [batch + 1] int32
+    cu_seqlens_kv: torch.Tensor,  # [batch + 1] int32
+    max_q_len: int,
+    max_kv_len: int,
+    sm_scale: float,
+    output: torch.Tensor,  # [total_q, num_heads, head_dim] bf16
+    staged_subpage_table: Optional[torch.Tensor] = None,
+    staged_subpages_per_slot: int = 0,
+    enable_pdl: bool = True,
+) -> None:
+    """Causal full-context prefill attention of a dense M3 layer through trtllm-gen, in place.
+
+    The context counterpart of minimax_m3_trtllm_gen_dense_decode: the same flat sub-page pool
+    and [batch, 2, max_blocks] table, handed to flashinfer's trtllm-gen context entry point (the
+    persistent context kernels the Eagle3 draft layer already runs on), instead of fmha_sm100's
+    dense plan. Each query row attends KV positions [0, cached + its offset].
+    """
+    import flashinfer
+
+    kv_pool, subpages_per_slot = kv_cache_manager.get_kv_subpage_pool(layer_idx, "HND")
+    if kv_pool.dtype == torch.float8_e4m3fn and q.dtype != torch.float8_e4m3fn:
+        q = q.to(torch.float8_e4m3fn)
+    num_heads = int(q.shape[1])
+    workspace = _workspace_buffer(
+        _workspace(q.dtype, num_heads, int(q.shape[2]), int(kv_pool.shape[1])), False
+    )
+    if staged_subpage_table is None or staged_subpages_per_slot != subpages_per_slot:
+        staged_subpage_table = subpage_block_table(block_table, subpages_per_slot)
+    batch = int(seq_lens.shape[0])
+    _log_dense_prefill_once(num_heads, int(kv_pool.shape[1]))
+    flashinfer.prefill.trtllm_batch_context_with_kv_cache(
+        query=q,
+        kv_cache=(kv_pool, kv_pool),
+        workspace_buffer=workspace,
+        block_tables=staged_subpage_table,
+        seq_lens=seq_lens,
+        max_q_len=int(max_q_len),
+        max_kv_len=int(max_kv_len),
+        bmm1_scale=sm_scale,
+        bmm2_scale=1.0,
+        batch_size=batch,
+        cum_seq_lens_q=cu_seqlens_q,
+        cum_seq_lens_kv=cu_seqlens_kv,
+        window_left=-1,
+        out=output,
+        kv_layout="HND",
+        enable_pdl=enable_pdl,
+        kv_cache_sf=None,  # M3 stores unscaled E4M3
+        uses_shared_paged_kv_idx=False,
+        causal=True,
+    )
+
+
 @functools.lru_cache(maxsize=1)
 def flashinfer_available() -> bool:
     """Whether flashinfer can be imported, resolved once for the process.
@@ -359,7 +443,10 @@ def dense_decode_unsupported_reason(kv_cache_manager, head_dim: int) -> Optional
 
 
 __all__ = [
+    "DENSE_PREFILL_ENV",
     "DenseDecodeWorkspaceLayout",
+    "dense_prefill_trtllm_gen_enabled",
+    "minimax_m3_trtllm_gen_dense_prefill",
     "dense_decode_unsupported_reason",
     "dense_decode_workspace_layout",
     "flashinfer_available",

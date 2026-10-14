@@ -460,6 +460,23 @@ def run_msa_prefill_gqa(
     if use_fp8:
         q_view = q_view.to(torch.float8_e4m3fn)
 
+    if kv_block_indexes is None and use_fp8 and row_first == 0:
+        from ..sparse.minimax_m3.kernels.trtllm_gen_dense_decode import (
+            dense_prefill_trtllm_gen_enabled,
+            minimax_m3_trtllm_gen_dense_prefill,
+        )
+
+        if dense_prefill_trtllm_gen_enabled() and _run_dense_prefill_trtllm_gen(
+            attn,
+            q_view,
+            metadata,
+            out_view,
+            num_rows=num_rows,
+            sm_scale=sm_scale,
+            run=minimax_m3_trtllm_gen_dense_prefill,
+        ):
+            return
+
     def rows_of(lens: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
         """Narrow a per-request host length tensor to this phase's rows.
 
@@ -486,6 +503,49 @@ def run_msa_prefill_gqa(
         out=out_view,
         use_fp8=use_fp8,
     )
+
+
+def _run_dense_prefill_trtllm_gen(
+    attn: "TrtllmAttention",
+    q_view: torch.Tensor,
+    metadata: "TrtllmAttentionMetadata",
+    out_view: torch.Tensor,
+    *,
+    num_rows: int,
+    sm_scale: float,
+    run,
+) -> bool:
+    """Dense layer, context prefix rows [0, num_rows): trtllm-gen context attention.
+
+    Reads the per-step staging prepare() built for the NVFP4 sparse layers (device lengths,
+    cumulative lengths, the context-prefix bounds and the sub-page block table). Returns False,
+    leaving the caller on fmha_sm100, when any of it is missing.
+    """
+    cu_q = getattr(metadata, "msa_cu_q_lens", None)
+    cu_kv = getattr(metadata, "msa_cu_kv_lens", None)
+    bounds = getattr(metadata, "_msa_context_prefix_bounds", None)
+    if cu_q is None or cu_kv is None or bounds is None or num_rows <= 0:
+        return False
+    max_q_len, max_kv_len, _, _ = bounds
+    if max_q_len <= 0:
+        return False
+    staged_table, staged_factor = metadata.msa_subpage_rows(0, num_rows)
+    run(
+        q_view,
+        metadata.kv_cache_manager,
+        attn.layer_idx,
+        block_table=metadata.msa_block_table[:num_rows],
+        seq_lens=metadata.msa_seq_lens_cuda[:num_rows],
+        cu_seqlens_q=cu_q[: num_rows + 1],
+        cu_seqlens_kv=cu_kv[: num_rows + 1],
+        max_q_len=int(max_q_len),
+        max_kv_len=int(max_kv_len),
+        sm_scale=sm_scale,
+        output=out_view,
+        staged_subpage_table=staged_table,
+        staged_subpages_per_slot=staged_factor,
+    )
+    return True
 
 
 class MsaPrefillFmha(PhasedFmha):
