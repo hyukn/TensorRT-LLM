@@ -550,6 +550,10 @@ def _build_swiglu_oai_dense_mlp(
     )
 
 
+# TRTLLM_M3_ROUTER_FAST_UPCAST=1: eager steps upcast the router input with a vectorized kernel.
+_ROUTER_FAST_UPCAST = os.environ.get("TRTLLM_M3_ROUTER_FAST_UPCAST", "0") == "1"
+
+
 class MiniMaxM3Gate(nn.Module):
     """MiniMax-M3 router gate: float32 sigmoid scoring + per-expert bias correction.
 
@@ -584,6 +588,12 @@ class MiniMaxM3Gate(nn.Module):
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         # Router runs in fp32 to match SGLang.
+        if _ROUTER_FAST_UPCAST and not is_torch_compiling():
+            # Same fp32 values as .to(torch.float32), through a vectorized cast: the dynamic-casting
+            # torch copy runs at ~1/3 of HBM bandwidth on context-sized activations.
+            from ..modules.fp32_upcast import upcast_to_fp32
+
+            return torch.nn.functional.linear(upcast_to_fp32(hidden_states), self.weight)
         return torch.nn.functional.linear(hidden_states.to(torch.float32), self.weight)
 
     def load_weights(self, weights: List[Dict]):
