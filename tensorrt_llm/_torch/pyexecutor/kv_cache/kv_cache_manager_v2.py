@@ -2758,7 +2758,20 @@ class KVCacheManagerV2(BaseResourceManager):
         )
         self._device_num_contexts.fill_(num_contexts)
         if per_layer_block_offsets.enabled():
-            # Same values for the batch's rows only, straight into dst_tensor.
+            # Same values for the batch's rows only, straight into dst_tensor; with
+            # TRTLLM_KV_PER_LAYER_OFFSETS_LIVE_COLUMNS=1 only the columns the batch's
+            # sequences own (see live_columns_enabled).
+            num_cols = None
+            if per_layer_block_offsets.live_columns_enabled():
+                num_cols = max(
+                    (int(self.kv_cache_map[rid].num_blocks) for rid in request_ids[:num_seqs]),
+                    default=0,
+                )
+                if num_contexts > 0:
+                    num_cols = max(
+                        num_cols,
+                        int(self._host_scratch_ends_staging[:, :num_contexts].max()),
+                    )
             per_layer_block_offsets.copy_per_layer_block_offsets(
                 dst_tensor,
                 self._device_kv_cache_block_offsets_input,
@@ -2773,6 +2786,7 @@ class KVCacheManagerV2(BaseResourceManager):
                 self._device_num_contexts,
                 num_seqs,
                 BAD_PAGE_INDEX,
+                num_cols=num_cols,
             )
             return
         _copy_swa_block_offsets_with_scratch_compiled(

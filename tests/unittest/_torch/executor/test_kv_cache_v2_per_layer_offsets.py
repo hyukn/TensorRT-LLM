@@ -123,3 +123,36 @@ def test_per_layer_offsets_empty_batch_is_noop():
     dst = torch.full((3, 5, 2, 64), SENTINEL, dtype=torch.int32, device="cuda")
     copy_per_layer_block_offsets(dst, *args, 0, BAD_PAGE_INDEX)
     assert bool((dst == SENTINEL).all())
+
+
+@pytest.mark.parametrize("num_cols", [1, 150, 299, 300, 10_000])
+@pytest.mark.parametrize("num_contexts", [0, 2])
+def test_per_layer_offsets_live_columns(num_cols, num_contexts):
+    """num_cols (TRTLLM_KV_PER_LAYER_OFFSETS_LIVE_COLUMNS) writes exactly the full call's columns
+    [0, num_cols) and leaves every later column as it was."""
+    num_pools, capacity, m, layers, num_seqs, slots = 3, 13, 300, 7, 5, 4
+    args = _case(num_pools, capacity, m, layers, num_seqs, num_contexts, slots, seed=num_cols)
+    full = torch.full((layers + 1, capacity, 2, m + 3), SENTINEL, dtype=torch.int32, device="cuda")
+    copy_per_layer_block_offsets(full, *args, num_seqs, BAD_PAGE_INDEX)
+    got = torch.full_like(full, SENTINEL)
+    copy_per_layer_block_offsets(got, *args, num_seqs, BAD_PAGE_INDEX, num_cols=num_cols)
+    torch.cuda.synchronize()
+    live = min(num_cols, m)
+    assert torch.equal(got[..., :live], full[..., :live])
+    assert bool((got[..., live:] == SENTINEL).all())
+
+
+def test_per_layer_offsets_live_columns_zero_is_noop():
+    args = _case(2, 5, 64, 3, 2, 0, 2, seed=2)
+    dst = torch.full((3, 5, 2, 64), SENTINEL, dtype=torch.int32, device="cuda")
+    copy_per_layer_block_offsets(dst, *args, 2, BAD_PAGE_INDEX, num_cols=0)
+    assert bool((dst == SENTINEL).all())
+
+
+def test_live_columns_gate(monkeypatch):
+    from tensorrt_llm._torch.pyexecutor.kv_cache import per_layer_block_offsets as plo
+
+    monkeypatch.delenv(plo.LIVE_COLUMNS_ENV, raising=False)
+    assert not plo.live_columns_enabled()
+    monkeypatch.setenv(plo.LIVE_COLUMNS_ENV, "1")
+    assert plo.live_columns_enabled()

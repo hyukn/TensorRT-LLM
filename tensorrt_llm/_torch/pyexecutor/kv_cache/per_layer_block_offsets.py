@@ -16,19 +16,32 @@ writes into the destination table. Bitwise equal to the compiled path on every r
 (tests/unittest/_torch/executor/test_kv_cache_v2_per_layer_offsets.py).
 
 Opt-in with TRTLLM_KV_PER_LAYER_OFFSETS_TRITON=1.
+
+With TRTLLM_KV_PER_LAYER_OFFSETS_LIVE_COLUMNS=1 as well, the caller bounds the columns to the ones
+the batch's sequences own (their largest block count, and any context scratch range): at a 1M-token
+max_seq_len and ~150K-token contexts that is ~1/7 of the full width (TP4 decode B48: 92 us -> ~15
+us per step). Columns past the bound keep whatever an earlier step wrote instead of being rewritten
+with the BAD_PAGE_INDEX padding, which is equivalent for any consumer that, like every attention
+kernel, walks a sequence's pages only up to its own length.
 """
 
 import os
+from typing import Optional
 
 import torch
 import triton
 import triton.language as tl
 
 ENV = "TRTLLM_KV_PER_LAYER_OFFSETS_TRITON"
+LIVE_COLUMNS_ENV = "TRTLLM_KV_PER_LAYER_OFFSETS_LIVE_COLUMNS"
 
 
 def enabled() -> bool:
     return os.environ.get(ENV, "0") == "1"
+
+
+def live_columns_enabled() -> bool:
+    return os.environ.get(LIVE_COLUMNS_ENV, "0") == "1"
 
 
 @triton.jit
@@ -97,12 +110,20 @@ def copy_per_layer_block_offsets(
     num_contexts: torch.Tensor,
     num_seqs: int,
     bad_page_index: int,
+    num_cols: Optional[int] = None,
 ) -> None:
-    """dst[:L, :num_seqs] = the compiled path's staging[:L, :num_seqs] (see module docstring)."""
+    """dst[:L, :num_seqs] = the compiled path's staging[:L, :num_seqs] (see module docstring).
+
+    With num_cols, only block columns [0, num_cols) are written.
+    """
     num_layers = int(pool_ids.shape[0])
     if num_seqs <= 0 or num_layers == 0:
         return
     m = int(block_offsets.shape[-1])
+    if num_cols is not None:
+        m = min(m, int(num_cols))
+        if m <= 0:
+            return
     assert block_offsets.is_contiguous() and block_offsets.shape[2] == 2
     assert dst.stride(-1) == 1 and dst.shape[2] == 2 and dst.shape[-1] >= m
     assert scratch_begs.is_contiguous() and scratch_ends.is_contiguous()
@@ -139,4 +160,10 @@ def copy_per_layer_block_offsets(
     )
 
 
-__all__ = ["ENV", "copy_per_layer_block_offsets", "enabled"]
+__all__ = [
+    "ENV",
+    "LIVE_COLUMNS_ENV",
+    "copy_per_layer_block_offsets",
+    "enabled",
+    "live_columns_enabled",
+]
