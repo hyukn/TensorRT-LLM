@@ -579,6 +579,12 @@ _ATTN_OUT_MXFP8 = os.environ.get("TRTLLM_M3_ATTN_OUT_MXFP8", "0") == "1"
 # qkv_proj's own mxfp8_quantize), and the next layer's fused QKV+index projection takes it, dropping one
 # quantize kernel per layer. Needs the C++ op (libtensorrt_llm.so + libth_common.so with that fusion op).
 _AR_MXFP8_QKV = os.environ.get("TRTLLM_M3_AR_MXFP8_QKV", "0") == "1"
+# TRTLLM_M3_AR_F32_ROUTER=1: the post-attention MNNVL AllReduce + residual + RMSNorm (PRE fusion)
+# also writes an fp32 copy of the norm output (RESIDUAL_RMS_NORM_OUT_F32), and the MoE router GEMM
+# reads it instead of upcasting the bf16 norm in a separate launch on the routed (critical) branch.
+# The copy is exact, so the router logits are bitwise unchanged. Needs the C++ op
+# (libtensorrt_llm.so + libth_common.so with that fusion op).
+_AR_F32_ROUTER = os.environ.get("TRTLLM_M3_AR_F32_ROUTER", "0") == "1"
 
 
 def _open_attn_out_mxfp8_request() -> Optional[Mxfp8OutputRequest]:
@@ -645,7 +651,18 @@ class MiniMaxM3Gate(nn.Module):
             requires_grad=False,
         )
 
+    def stage_fp32_input(
+        self, hidden_states: torch.Tensor, hidden_states_fp32: torch.Tensor
+    ) -> None:
+        """Hand the router an fp32 copy of ``hidden_states`` (the exact tensor its next forward receives)."""
+        self._staged_fp32_input = (hidden_states, hidden_states_fp32)
+
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        staged = getattr(self, "_staged_fp32_input", None)
+        if staged is not None:
+            self._staged_fp32_input = None
+            if staged[0] is hidden_states and not is_torch_compiling():
+                return torch.nn.functional.linear(staged[1], self.weight)
         # Router runs in fp32 to match SGLang.
         if _ROUTER_FAST_UPCAST and not is_torch_compiling():
             # Same fp32 values as .to(torch.float32), through a vectorized cast: the dynamic-casting
@@ -2779,6 +2796,20 @@ class MiniMaxM3DecoderLayer(DecoderLayer):
         add+RMSNorm and the attention already reduced its own output.
         """
         if self.pre_feed_forward_fusion:
+            gate = self._fp32_router_gate(hidden_states)
+            if gate is not None:
+                norm, norm_fp32, residual = self.allreduce(
+                    hidden_states,
+                    all_reduce_params=AllReduceParams(
+                        fusion_op=AllReduceFusionOp.RESIDUAL_RMS_NORM_OUT_F32,
+                        residual=residual,
+                        norm_weight=self.post_attention_layernorm.weight,
+                        eps=self.post_attention_layernorm.variance_epsilon,
+                        trigger_completion_at_end=False,
+                    ),
+                )
+                gate.stage_fp32_input(norm, norm_fp32)
+                return norm, residual
             return self.allreduce(
                 hidden_states,
                 all_reduce_params=AllReduceParams(
@@ -2790,6 +2821,17 @@ class MiniMaxM3DecoderLayer(DecoderLayer):
                 ),
             )
         return self.post_attention_layernorm(hidden_states, residual)
+
+    def _fp32_router_gate(self, hidden_states: torch.Tensor) -> Optional["MiniMaxM3Gate"]:
+        """The MoE router gate to hand an fp32 norm copy from the post-attention AllReduce, else None."""
+        if not _AR_F32_ROUTER or self.block_sparse_moe is None or hidden_states.dim() != 2:
+            return None
+        if is_torch_compiling() or torch.compiler.is_compiling():
+            return None
+        if self.allreduce is None or getattr(self.allreduce, "mnnvl_allreduce", None) is None:
+            return None
+        gate = getattr(self.block_sparse_moe, "gate", None)
+        return gate if isinstance(gate, MiniMaxM3Gate) else None
 
     def _apply_next_layer_layernorm(
         self,
