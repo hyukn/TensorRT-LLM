@@ -974,6 +974,14 @@ class Eagle3DraftModel(DecoderModel):
                 attn_metadata.all_rank_num_tokens = previous_all_rank_num_tokens
 
 
+def draft_lm_head_fp8_enabled() -> bool:
+    """TRTLLM_SPEC_DRAFT_LM_HEAD_FP8=1: an Eagle3 draft that owns its lm_head
+    projects with an FP8 copy of it (see LMHead.enable_fp8_rowwise_projection).
+    Drafts only choose what the target verifies, so outputs are unchanged; the
+    acceptance rate can move."""
+    return os.environ.get("TRTLLM_SPEC_DRAFT_LM_HEAD_FP8", "0") == "1"
+
+
 # We use Llama3 as the base architecture for EAGLE3 draft layers
 @register_auto_model("EAGLE3LlamaForCausalLM")
 @register_auto_model("Eagle3DeepSeekV3ForCausalLM")
@@ -1080,6 +1088,12 @@ class Eagle3ForCausalLM(DecoderModelForCausalLM[Eagle3DraftModel,
             else:
                 super().load_weights(weights=new_weights,
                                      weight_mapper=weight_mapper)
+        # Only a head the draft owns: a head shared with the target would
+        # change the target's logits too.
+        if not self.load_lm_head_from_target and draft_lm_head_fp8_enabled():
+            self.lm_head.enable_fp8_rowwise_projection()
+            logger.info("Eagle3 draft lm_head projects in FP8 (rowwise scales; "
+                        "TRTLLM_SPEC_DRAFT_LM_HEAD_FP8=1)")
 
     def load_weights_from_target_model(self,
                                        target_model: torch.nn.Module) -> None:

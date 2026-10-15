@@ -18,6 +18,23 @@ from ..utils import create_lm_head_tp_mapping
 from .linear import Linear, TensorParallelMode
 
 
+def fp8_rowwise_linear(input: torch.Tensor, weight_fp8: torch.Tensor,
+                       weight_scale_t: torch.Tensor) -> torch.Tensor:
+    """``input @ dequant(weight_fp8).T`` with per-token E4M3 activations.
+
+    ``weight_fp8`` is ``[N, K]`` E4M3 and ``weight_scale_t`` its ``[1, N]``
+    fp32 row scales; the activation is quantized per row (amax / 448).
+    """
+    x = input.float()
+    x_scale = (x.abs().amax(dim=1, keepdim=True) / 448.0).clamp(min=1e-12)
+    x_fp8 = (x / x_scale).to(torch.float8_e4m3fn)
+    return torch._scaled_mm(x_fp8,
+                            weight_fp8.t(),
+                            scale_a=x_scale,
+                            scale_b=weight_scale_t,
+                            out_dtype=input.dtype)
+
+
 class LMHead(Linear):
     """LM head layer.
 
@@ -154,6 +171,44 @@ class LMHead(Linear):
             output = output[..., :-self.padding_size]
 
         return output
+
+    def enable_fp8_rowwise_projection(self, chunk_rows: int = 4096) -> None:
+        """Project with an FP8 copy of this head's weight from now on.
+
+        E4M3 weight with one scale per vocab row (amax / 448) and a per-token
+        dynamic E4M3 activation scale, through ``torch._scaled_mm``; the bf16
+        weight stays allocated but unused by :meth:`apply_linear`. Meant for an
+        Eagle3 draft head that owns its weight: draft tokens only steer which
+        candidates the target verifies, so the generated tokens do not change,
+        while the head's (memory-bound) weight read halves. The conversion
+        runs once, here, in row chunks to bound the fp32 temporaries.
+        """
+        if self.has_any_quant or self.weight.dim() != 2:
+            raise NotImplementedError(
+                "FP8 rowwise LM head needs a dense high-precision weight")
+        w = self.weight.detach()
+        fp8 = torch.empty(w.shape, dtype=torch.float8_e4m3fn, device=w.device)
+        scale = torch.empty((w.shape[0], 1),
+                            dtype=torch.float32,
+                            device=w.device)
+        for r0 in range(0, w.shape[0], chunk_rows):
+            wf = w[r0:r0 + chunk_rows].float()
+            sc = (wf.abs().amax(dim=1, keepdim=True) / 448.0).clamp(min=1e-12)
+            fp8[r0:r0 + chunk_rows] = (wf / sc).to(torch.float8_e4m3fn)
+            scale[r0:r0 + chunk_rows] = sc
+        self._fp8_weight = fp8
+        self._fp8_weight_scale = scale.t().contiguous()
+
+    @property
+    def uses_fp8_rowwise_projection(self) -> bool:
+        return getattr(self, "_fp8_weight", None) is not None
+
+    def apply_linear(self, input, bias, lora_params=None, layer_idx=None):
+        if (self.uses_fp8_rowwise_projection and bias is None
+                and not lora_params and input.dim() == 2):
+            return fp8_rowwise_linear(input, self._fp8_weight,
+                                      self._fp8_weight_scale)
+        return super().apply_linear(input, bias, lora_params, layer_idx)
 
     def supports_vocab_shard_projection(self) -> bool:
         """Whether :meth:`forward_vocab_shard` can replace :meth:`forward`.
