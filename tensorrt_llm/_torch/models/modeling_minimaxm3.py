@@ -64,13 +64,19 @@ from ..modules.linear import (
     copy_weight,
     load_weight_shard,
 )
-from ..modules.multi_stream_utils import maybe_execute_in_parallel
+from ..modules.multi_stream_utils import do_multi_stream, maybe_execute_in_parallel
 from ..modules.rms_norm import RMSNorm
 from ..moe.fused_moe import MiniMaxM3MoeRoutingMethod, SwigluBiasActivation, create_moe
 from ..moe.fused_moe.interface import MoESchedulerKind
 from ..pyexecutor.breakable_cuda_graph import eager_on_graph, is_in_breakable_cuda_graph
 from ..speculative import SpecMetadata
-from ..utils import AuxStreamType, EventType, get_model_extra_attrs, is_torch_compiling
+from ..utils import (
+    AuxStreamType,
+    EventType,
+    Fp4QuantizedTensor,
+    get_model_extra_attrs,
+    is_torch_compiling,
+)
 from .checkpoints.base_weight_mapper import BaseWeightMapper
 from .checkpoints.hf.minimaxm3_weight_mapper import MINIMAX_M3_PARAMS_MAP, MiniMaxM3HfWeightMapper
 from .modeling_speculative import SpecDecOneEngineForCausalLM
@@ -552,6 +558,31 @@ def _build_swiglu_oai_dense_mlp(
 
 # TRTLLM_M3_ROUTER_FAST_UPCAST=1: eager steps upcast the router input with a vectorized kernel.
 _ROUTER_FAST_UPCAST = os.environ.get("TRTLLM_M3_ROUTER_FAST_UPCAST", "0") == "1"
+# TRTLLM_M3_MOE_PREQUANT_OVERLAP=1: quantize the routed experts' NVFP4 input on the shared-expert
+# stream, concurrently with the router GEMM, instead of after the router inside the fused MoE. Same
+# kernel and arguments, so bitwise; decode CUDA graphs only (where the routed and shared branches
+# already run on two streams).
+_MOE_PREQUANT_OVERLAP = os.environ.get("TRTLLM_M3_MOE_PREQUANT_OVERLAP", "0") == "1"
+
+
+def _moe_prequant_backend(experts: nn.Module) -> Optional[nn.Module]:
+    """The routed-expert backend whose input quantize can run ahead of the router, or None.
+
+    Only the TRTLLM-Gen NVFP4 backend without MoE communication qualifies: its
+    ``quantize_input`` is a pure function of the activation (``fp4_quantize`` with the
+    static ``fc31_input_scale`` and linear scale layout), and it unpacks an
+    ``Fp4QuantizedTensor`` input without re-quantizing it.
+    """
+    from ..moe.fused_moe.trtllm_gen.fp4_block_scale import TRTLLMGenNvfp4Base
+
+    backend = getattr(experts, "backend", None)
+    if not isinstance(backend, TRTLLMGenNvfp4Base):
+        return None
+    if getattr(experts, "comm", None) is not None or getattr(experts, "enable_dwdp", False):
+        return None
+    if getattr(experts, "apply_router_weight_on_input", False):
+        return None
+    return backend
 
 
 class MiniMaxM3Gate(nn.Module):
@@ -775,6 +806,52 @@ class MiniMaxM3MoE(nn.Module):
         # ``maybe_execute_in_parallel`` runs fn0/fn1 sequentially.
         self.aux_stream = aux_stream_dict[AuxStreamType.MoeShared]
         self.event_dict = {key: torch.cuda.Event() for key in [EventType.Main, EventType.MoeShared]}
+        self._prequant_event = torch.cuda.Event()
+
+    def _use_prequant_overlap(self, hidden_states: torch.Tensor, lora_params) -> bool:
+        """Whether this forward takes the routed-input pre-quantize path (see _MOE_PREQUANT_OVERLAP)."""
+        if not _MOE_PREQUANT_OVERLAP or self.shared_experts is None or lora_params is not None:
+            return False
+        if self.aux_stream is None or not do_multi_stream() or is_torch_compiling():
+            return False
+        if hidden_states.dim() != 2 or _moe_prequant_backend(self.experts) is None:
+            return False
+        calc = getattr(self.experts, "calculate_num_chunks", None)
+        return calc is None or calc([hidden_states.shape[0]]) == 1
+
+    def _forward_prequant_overlap(
+        self,
+        hidden_states: torch.Tensor,
+        all_rank_num_tokens: Optional[List[int]],
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Routed + shared branches with the routed input quantize next to the router GEMM.
+
+        Main stream: router GEMM -> (wait for the quantize) -> fused MoE (routing, FC1, FC2,
+        finalize). Aux stream: NVFP4 quantize of the routed input -> shared expert. The
+        quantize is the backend's own ``quantize_input`` call, so the fused MoE gets the
+        FP4 tensor and scales it would have produced itself, one router GEMM earlier.
+        """
+        backend = _moe_prequant_backend(self.experts)
+        event_main = self.event_dict[EventType.Main]
+        event_shared = self.event_dict[EventType.MoeShared]
+        event_main.record()
+        with torch.cuda.stream(self.aux_stream):
+            event_main.wait()
+            x_fp4, x_sf = backend.quantize_input(hidden_states, post_quant_comm=False)
+            self._prequant_event.record()
+            shared_output = self.shared_experts(hidden_states)
+            event_shared.record()
+        router_logits = self.gate(hidden_states)
+        self._prequant_event.wait()
+        routed_output = self.experts(
+            Fp4QuantizedTensor(fp4_tensor=x_fp4, scaling_factor=x_sf, is_sf_swizzled=False),
+            router_logits,
+            output_dtype=hidden_states.dtype,
+            all_rank_num_tokens=all_rank_num_tokens,
+            use_dp_padding=False,
+        )
+        event_shared.wait()
+        return routed_output, shared_output
 
     def forward(
         self,
@@ -802,14 +879,19 @@ class MiniMaxM3MoE(nn.Module):
             routed_output = _compute_routed_output()
             result = routed_output
         else:
-            routed_output, shared_output = maybe_execute_in_parallel(
-                _compute_routed_output,
-                _compute_shared_output,
-                self.event_dict[EventType.Main],
-                self.event_dict[EventType.MoeShared],
-                self.aux_stream,
-                disable_on_compile=True,
-            )
+            if self._use_prequant_overlap(hidden_states, lora_params):
+                routed_output, shared_output = self._forward_prequant_overlap(
+                    hidden_states, all_rank_num_tokens
+                )
+            else:
+                routed_output, shared_output = maybe_execute_in_parallel(
+                    _compute_routed_output,
+                    _compute_shared_output,
+                    self.event_dict[EventType.Main],
+                    self.event_dict[EventType.MoeShared],
+                    self.aux_stream,
+                    disable_on_compile=True,
+                )
             if self.routed_output_is_global and self.allreduce is not None:
                 # Fused-communication backends have already combined the routed
                 # branch across ranks. Reduce only the still-local shared branch.
