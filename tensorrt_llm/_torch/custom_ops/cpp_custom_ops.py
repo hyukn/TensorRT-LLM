@@ -59,6 +59,18 @@ def _register_fake():
             norm_out = torch.empty_like(input)
             residual_out = torch.empty_like(input)
             return [norm_out, quant_fp4, scale_fp4, residual_out]
+        elif op == int(AllReduceFusionOp.RESIDUAL_RMS_NORM_OUT_QUANT_MXFP8):
+            # Like mxfp8_quantize(norm, True): E4M3 of the input's shape, 1-D UE8M0 scales in the 128x4
+            # swizzled layout (rows padded to 128, scale columns to 4).
+            hidden = input.shape[-1]
+            num_rows = input.numel() // hidden
+            sf_size = (num_rows + 127) // 128 * 128 * (
+                (hidden // 32 + 3) // 4 * 4)
+            norm_out = torch.empty_like(input)
+            quant_out = torch.empty_like(input, dtype=torch.float8_e4m3fn)
+            scale_out = input.new_empty((sf_size, ), dtype=torch.uint8)
+            residual_out = torch.empty_like(input)
+            return [norm_out, quant_out, scale_out, residual_out]
         else:
             return [torch.empty_like(input)]
 

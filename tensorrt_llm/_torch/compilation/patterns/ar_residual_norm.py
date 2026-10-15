@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import os
 from operator import getitem
 from typing import Callable, List, Optional
 
@@ -429,6 +430,100 @@ def register_ar_residual_norm_out_fp4_quant(custom_pass: PatternMatcherPass,
     def extra_check(match: Match) -> bool:
         return check_f16_bf16_input(
             match, input_node) and check_non_ub_strategy(match, strategy_node)
+
+    register_replacement(
+        empty_pattern,
+        target_pattern,
+        _make_pattern_example_inputs(empty_pattern),
+        fwd_only,
+        custom_pass,
+        search_fn_pattern=pattern,
+        extra_check=extra_check,
+    )
+
+
+def ar_mxfp8_out_fusion_enabled() -> bool:
+    """TRTLLM_AR_MXFP8_OUT_FUSION=1: fold an MXFP8 quantize of an AllReduce's norm output into the AllReduce.
+
+    Needs libtensorrt_llm.so / libth_common.so with RESIDUAL_RMS_NORM_OUT_QUANT_MXFP8 in the non-fused (NCCL)
+    AllReduce path, hence opt-in.
+    """
+    return os.environ.get("TRTLLM_AR_MXFP8_OUT_FUSION", "0") == "1"
+
+
+def register_ar_residual_norm_out_mxfp8_quant(custom_pass: PatternMatcherPass,
+                                              mapping: Mapping,
+                                              allreduce_func: Callable):
+    """AllReduce(+residual+RMSNorm) whose norm output is MXFP8-quantized -> one AllReduce that also quantizes.
+
+    Matches ``torch.ops.trtllm.mxfp8_quantize(norm, True)`` (the MXFP8 linear's activation quantize, swizzled
+    scales) on the norm output of a RESIDUAL_RMS_NORM AllReduce, whatever else reads that norm (router, routed
+    experts, other projections), and replaces both with RESIDUAL_RMS_NORM_OUT_QUANT_MXFP8, which returns the
+    norm, its E4M3 values and UE8M0 scales bit-identical to mxfp8_quantize, and the residual. After a non-fused
+    AllReduce (NCCL) the norm and the quantize run as one kernel instead of two passes over the norm output.
+    """
+    input_node = KeywordArg("input")
+    strategy_node = KeywordArg("strategy")
+    allreduce_default = CallFunction(allreduce_func.default,
+                                     input_node,
+                                     KeywordArg("residual"),
+                                     KeywordArg("gamma"),
+                                     None,
+                                     None,
+                                     KeywordArg("workspace"),
+                                     mapping.tp_group,
+                                     strategy_node,
+                                     int(AllReduceFusionOp.RESIDUAL_RMS_NORM),
+                                     KeywordArg("eps"),
+                                     KeywordArg("trigger_completion_at_end"),
+                                     _users=2)
+    getitem_0 = CallFunction(getitem, allreduce_default, 0, _users=MULTIPLE)
+    getitem_1 = CallFunction(getitem, allreduce_default, 1)
+    # mxfp8_quantize(norm, True): the traced node drops the trailing default arguments (swizzled=True,
+    # alignment=32), so it is mxfp8_quantize.default(norm). A linear-layout quantize, mxfp8_quantize(norm, False),
+    # keeps its second argument and does not match.
+    mxfp8_quant_default = CallFunction(torch.ops.trtllm.mxfp8_quantize.default,
+                                       getitem_0,
+                                       _users=2)
+    getitem_2 = CallFunction(getitem, mxfp8_quant_default, 0)
+    getitem_3 = CallFunction(getitem, mxfp8_quant_default, 1)
+    pattern = MultiOutputPattern([getitem_0, getitem_1, getitem_2, getitem_3])
+
+    def empty_pattern(
+        input: torch.Tensor,
+        residual: torch.Tensor,
+        gamma: torch.Tensor,
+        workspace: torch.LongTensor,
+        strategy: int,
+        eps: float,
+        trigger_completion_at_end: bool,
+    ):
+        return
+
+    def target_pattern(
+        input: torch.Tensor,
+        residual: torch.Tensor,
+        gamma: torch.Tensor,
+        workspace: torch.LongTensor,
+        strategy: int,
+        eps: float,
+        trigger_completion_at_end: bool,
+    ):
+        allreduce = allreduce_func(
+            input, residual, gamma, None, None, workspace, mapping.tp_group,
+            int(strategy),
+            int(AllReduceFusionOp.RESIDUAL_RMS_NORM_OUT_QUANT_MXFP8),
+            float(eps), trigger_completion_at_end)
+        return allreduce[0], allreduce[3], allreduce[1], allreduce[2]
+
+    def extra_check(match: Match) -> bool:
+        if not (check_f16_bf16_input(match, input_node)
+                and check_non_ub_strategy(match, strategy_node)):
+            return False
+        # The fused kernel takes the hidden size from the input; MXFP8 needs 32-element groups.
+        input = match.ctx.pattern_to_node[input_node]
+        hidden = input.meta["tensor_meta"].shape[-1]
+        return isinstance(hidden, int) and hidden % 32 == 0
 
     register_replacement(
         empty_pattern,
@@ -957,6 +1052,12 @@ def register_ar_fusions(custom_passes: List[PatternMatcherPass],
                                             allreduce_func)
         register_ar_residual_norm_fp4_quant(custom_passes[-1], mapping,
                                             allreduce_func)
+
+        # Not a Userbuffers pattern (strategy UB is excluded): the MXFP8 output comes from the non-fused
+        # AllReduce path, so it is registered with or without Userbuffers.
+        if ar_mxfp8_out_fusion_enabled():
+            register_ar_residual_norm_out_mxfp8_quant(custom_passes[-1],
+                                                      mapping, allreduce_func)
 
         # AR-Residual-Norm-Out-Quant-X is not supported by Userbuffers kernel.
         if not enable_ub:
