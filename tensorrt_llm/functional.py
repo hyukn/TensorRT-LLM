@@ -129,6 +129,8 @@ class AllReduceFusionOp(IntEnum):
     RESIDUAL_RMS_NORM_OUT_QUANT_NVFP4 = 7
     MOE_FINALIZE_ALLREDUCE_RESIDUAL_RMS_NORM = 8
     RMS_NORM = 9
+    # MNNVL only: norm output plus its MXFP8 quantization (E4M3, swizzled UE8M0 1x32 scales).
+    RESIDUAL_RMS_NORM_OUT_QUANT_MXFP8 = 10
 
 
 class AllReduceParams:

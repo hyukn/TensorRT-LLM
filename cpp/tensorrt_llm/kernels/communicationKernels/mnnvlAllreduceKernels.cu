@@ -213,6 +213,17 @@ inline bool requiresTwoAccessScaleGroup(ar_fusion::AllReduceFusionPattern patter
         || pattern == ar_fusion::AllReduceFusionPattern::kARResidualRMSNormOutFP4Quant;
 }
 
+// Packed 16-byte accesses that share one block scale and must stay inside one CTA: 2 for NVFP4 (16 elements),
+// 4 for MXFP8 (32 elements), 1 otherwise.
+inline int scaleGroupAccesses(ar_fusion::AllReduceFusionPattern pattern)
+{
+    if (pattern == ar_fusion::AllReduceFusionPattern::kARResidualRMSNormOutMXFP8Quant)
+    {
+        return 4;
+    }
+    return requiresTwoAccessScaleGroup(pattern) ? 2 : 1;
+}
+
 // A helper function to tune the grid configuration for fused oneshot and RMSNorm kernels.
 // Return (block_size, cluster_size, loads_per_thread).
 template <bool UseCluster>
@@ -525,6 +536,20 @@ inline __device__ void quantizeEpilogue(PackedVec<PackedType, T> const& value,
         reinterpret_cast<uint32_t*>(params.quantOutPtr)[packedAccessIdx]
             = cvt_warp_fp16_to_fp4<T, kSFVecSize, false>(packVal, *params.scaleFactorPtr, sfOut);
     }
+    else if constexpr (ar_fusion::GetQuantType<Pattern> == ar_fusion::QuantType::kMXFP8)
+    {
+        // The same device code as quantize_with_block_size<FP16_TO_MXFP8> applied to the bf16 norm output, so the
+        // E4M3 bytes and UE8M0 scales match torch.ops.trtllm.mxfp8_quantize(norm_out, true) bit for bit.
+        static_assert(kELTS_PER_THREAD == 8, "MXFP8 quantization expects eight elements per 16-byte access.");
+        constexpr int kSFVecSize = 32;
+        using QuantPackedVec = tensorrt_llm::kernels::PackedVec<T>;
+        QuantPackedVec packVal = *reinterpret_cast<QuantPackedVec const*>(&value.packed);
+        auto* sfOut = cvt_quant_get_sf_out_offset<uint32_t, kSFVecSize / kELTS_PER_THREAD>(std::nullopt /* batchIdx */,
+            token, accessIdInToken, std::nullopt /* numRows */, params.tokenDim / kSFVecSize,
+            reinterpret_cast<uint32_t*>(params.scaleOutPtr), params.layout);
+        reinterpret_cast<uint64_t*>(params.quantOutPtr)[packedAccessIdx]
+            = cvt_warp_fp16_to_mxfp8<T, kSFVecSize>(packVal, sfOut);
+    }
     else if constexpr (ar_fusion::GetQuantType<Pattern> == ar_fusion::QuantType::kFP8)
     {
         float const scale = 1.F / *params.scaleFactorPtr;
@@ -738,6 +763,7 @@ __global__ void __launch_bounds__(1024) oneshotAllreduceFusionKernel(MnnvlAllRed
 
 using detail::adjustGridConfig;
 using detail::requiresTwoAccessScaleGroup;
+using detail::scaleGroupAccesses;
 
 void oneshotAllreduceFusionOp(AllReduceFusionParams const& params)
 {
@@ -747,7 +773,7 @@ void oneshotAllreduceFusionOp(AllReduceFusionParams const& params)
     int const numTokens = params.numTokens;
     int const tokenDim = params.tokenDim;
     int const eltsPerThread = sizeof(float4) / getDTypeSize(params.dType);
-    int const accessGroupSize = requiresTwoAccessScaleGroup(params.pattern) ? 2 : 1;
+    int const accessGroupSize = scaleGroupAccesses(params.pattern);
 
     auto [blockSize, clusterSize, loadsPerThread]
         = adjustGridConfig<true>(numTokens, tokenDim, eltsPerThread, accessGroupSize);
@@ -817,6 +843,18 @@ void oneshotAllreduceFusionOp(AllReduceFusionParams const& params)
         else                                                                                                           \
         {                                                                                                              \
             TLLM_CHECK_WITH_INFO(false, "[MNNVL AllReduceOneShot] NVFP4 quantization does not support FP32 input.");   \
+        }                                                                                                              \
+    }                                                                                                                  \
+    else if (params.pattern == ar_fusion::AllReduceFusionPattern::kARResidualRMSNormOutMXFP8Quant)                     \
+    {                                                                                                                  \
+        if constexpr (!std::is_same_v<T, float>)                                                                       \
+        {                                                                                                              \
+            LAUNCH_ALLREDUCE_KERNEL(                                                                                   \
+                WORLD_SIZE, T, ar_fusion::AllReduceFusionPattern::kARResidualRMSNormOutMXFP8Quant);                    \
+        }                                                                                                              \
+        else                                                                                                           \
+        {                                                                                                              \
+            TLLM_CHECK_WITH_INFO(false, "[MNNVL AllReduceOneShot] MXFP8 quantization does not support FP32 input.");   \
         }                                                                                                              \
     }                                                                                                                  \
     else if (params.pattern == ar_fusion::AllReduceFusionPattern::kARRMSNorm)                                          \
@@ -1257,7 +1295,7 @@ void twoshotAllreduceFusionOp(AllReduceFusionParams const& params)
     // Launch the rmsnorm lamport kernel if fusion is enabled
     if (params.rmsNormFusion)
     {
-        int const accessGroupSize = requiresTwoAccessScaleGroup(params.pattern) ? 2 : 1;
+        int const accessGroupSize = scaleGroupAccesses(params.pattern);
         auto gridConfig = adjustGridConfig<true>(numTokens, tokenDim, numEltsPerThread, accessGroupSize);
         int rnBlockSize = std::get<0>(gridConfig);
         int rnClusterSize = std::get<1>(gridConfig);
@@ -1345,6 +1383,18 @@ void twoshotAllreduceFusionOp(AllReduceFusionParams const& params)
         else                                                                                                           \
         {                                                                                                              \
             TLLM_CHECK_WITH_INFO(false, "[MNNVL AllReduceTwoShot] NVFP4 quantization does not support FP32 input.");   \
+        }                                                                                                              \
+    }                                                                                                                  \
+    else if (params.pattern == ar_fusion::AllReduceFusionPattern::kARResidualRMSNormOutMXFP8Quant)                     \
+    {                                                                                                                  \
+        if constexpr (!std::is_same_v<T, float>)                                                                       \
+        {                                                                                                              \
+            RUN_RMSNORM_KERNEL(                                                                                        \
+                T, ar_fusion::AllReduceFusionPattern::kARResidualRMSNormOutMXFP8Quant, USE_CGA, LOADS_PER_THREAD);     \
+        }                                                                                                              \
+        else                                                                                                           \
+        {                                                                                                              \
+            TLLM_CHECK_WITH_INFO(false, "[MNNVL AllReduceTwoShot] MXFP8 quantization does not support FP32 input.");   \
         }                                                                                                              \
     }                                                                                                                  \
     else if (params.pattern == ar_fusion::AllReduceFusionPattern::kARRMSNorm)                                          \
