@@ -45,6 +45,11 @@ import triton
 import triton.language as tl
 
 from tensorrt_llm._torch.memory_buffer_utils import get_memory_buffers
+from tensorrt_llm._torch.modules.mxfp8_triton import (
+    current_mxfp8_output_request,
+    mxfp8_quantize_rows,
+    sf_offset_128x4,
+)
 
 from .msa_utils import check_decode_span_shape
 
@@ -790,6 +795,109 @@ def _merge_topk_attn_out_kernel(
         tl.extra.cuda.gdc_launch_dependents()
 
 
+@triton.jit
+def _merge_topk_attn_out_mxfp8_kernel(
+    o_ptr,  # partials: [NUM_TOPK_CHUNKS, total_q, num_heads, head_dim]
+    lse_ptr,  # partials (log2): [NUM_TOPK_CHUNKS, total_q, num_heads]
+    out_ptr,  # merged out: [total_q, num_heads, head_dim]
+    q_ptr,  # MXFP8 merged out (E4M3 bytes): [total_q, num_heads * head_dim]
+    sf_ptr,  # its UE8M0 scales, 128x4 swizzled over [total_q, num_heads * head_dim / 32]
+    stride_o_c,
+    stride_o_b,
+    stride_o_h,
+    stride_o_d,
+    stride_l_c,
+    stride_l_b,
+    stride_l_h,
+    stride_out_n,
+    stride_out_h,
+    stride_out_d,
+    stride_q_n,
+    num_sf_k_tiles,
+    NUM_TOPK_CHUNKS: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    USE_PDL: tl.constexpr,
+):
+    """``_merge_topk_attn_out_kernel`` that also emits the MXFP8 form of its output.
+
+    The bf16 output is written exactly as the plain merge does; the MXFP8 bytes and
+    scales are those ``torch.ops.trtllm.mxfp8_quantize(out, True)`` would produce
+    from it (see modules/mxfp8_triton.py), so the o_proj GEMM can skip its quantize.
+    """
+    pid_b, pid_h = tl.program_id(0), tl.program_id(1)
+
+    if USE_PDL:
+        tl.extra.cuda.gdc_wait()
+
+    off_c = tl.arange(0, NUM_TOPK_CHUNKS)
+    off_d = tl.arange(0, HEAD_DIM)
+    o = tl.load(
+        o_ptr
+        + pid_b * stride_o_b
+        + pid_h * stride_o_h
+        + off_c[:, None] * stride_o_c
+        + off_d[None, :] * stride_o_d
+    ).to(tl.float32)
+    lse = tl.load(lse_ptr + pid_b * stride_l_b + pid_h * stride_l_h + off_c * stride_l_c)
+    lse_max = tl.max(lse, axis=0)
+    lse_max = tl.where(lse_max == float("-inf"), 0.0, lse_max)
+    weights = tl.exp2(lse - lse_max)
+    denom = tl.sum(weights, axis=0)
+    weights = weights / tl.where(denom > 0, denom, 1.0)
+    o_merged = tl.sum(o * weights[:, None], axis=0)
+    o_out = o_merged.to(out_ptr.dtype.element_ty)
+    tl.store(out_ptr + pid_b * stride_out_n + pid_h * stride_out_h + off_d * stride_out_d, o_out)
+
+    # MXFP8 of the rounded output: HEAD_DIM / 32 scale blocks per (token, head).
+    x = tl.reshape(o_out.to(tl.float32), (HEAD_DIM // 32, 32))
+    q, sf = mxfp8_quantize_rows(x)
+    off_blk = tl.arange(0, HEAD_DIM // 32)
+    off_e = tl.arange(0, 32)
+    cols = pid_h * HEAD_DIM + off_blk[:, None] * 32 + off_e[None, :]
+    tl.store(q_ptr + pid_b * stride_q_n + cols, q)
+    k_blk = pid_h * (HEAD_DIM // 32) + off_blk
+    tl.store(sf_ptr + sf_offset_128x4(pid_b, k_blk, num_sf_k_tiles), sf)
+
+    if USE_PDL:
+        tl.extra.cuda.gdc_launch_dependents()
+
+
+def _launch_merge_mxfp8(
+    request, o_arg, lse_arg, output, o_strides, lse_strides, num_topk_chunks, use_pdl, launch
+) -> bool:
+    """Run the merge with the fused MXFP8 epilogue if the open request is for ``output``."""
+    total_q, num_heads, head_dim = output.shape
+    if (
+        request is None
+        or not request.matches(output)
+        or head_dim % 32
+        or head_dim & (head_dim - 1)
+        or request.fp8.shape[1] != num_heads * head_dim
+        or not request.fp8.is_contiguous()
+    ):
+        return False
+    _merge_topk_attn_out_mxfp8_kernel[(total_q, num_heads)](
+        o_arg,
+        lse_arg,
+        output,
+        request.fp8.view(torch.uint8),
+        request.sf,
+        *o_strides,
+        *lse_strides,
+        output.stride(0),
+        output.stride(1),
+        output.stride(2),
+        request.fp8.stride(0),
+        (num_heads * head_dim // 32 + 3) // 4,
+        NUM_TOPK_CHUNKS=num_topk_chunks,
+        HEAD_DIM=head_dim,
+        USE_PDL=use_pdl,
+        **launch,
+    )
+    request.written = True
+    return True
+
+
 def resolve_num_topk_chunks(total_q: int, num_kv_heads: int, max_topk: int) -> int:
     """Split-K factor over the top-k blocks, as a power of two.
 
@@ -1281,21 +1389,32 @@ def _minimax_m3_sparse_attn_decode_triton(
             if kv_nvfp4
             else {}
         )
-        _merge_topk_attn_out_kernel[(total_q, num_heads)](
+        if not _launch_merge_mxfp8(
+            current_mxfp8_output_request(),
             o_arg,
             lse_arg,
             output,
-            head_dim,
-            *o_strides,
-            *lse_strides,
-            output.stride(0),
-            output.stride(1),
-            output.stride(2),
-            NUM_TOPK_CHUNKS=num_topk_chunks,
-            USE_PDL=use_pdl,
-            **pdl_launch,
-            **merge_launch_options,
-        )
+            o_strides,
+            lse_strides,
+            num_topk_chunks,
+            use_pdl,
+            {**pdl_launch, **merge_launch_options},
+        ):
+            _merge_topk_attn_out_kernel[(total_q, num_heads)](
+                o_arg,
+                lse_arg,
+                output,
+                head_dim,
+                *o_strides,
+                *lse_strides,
+                output.stride(0),
+                output.stride(1),
+                output.stride(2),
+                NUM_TOPK_CHUNKS=num_topk_chunks,
+                USE_PDL=use_pdl,
+                **pdl_launch,
+                **merge_launch_options,
+            )
 
 
 def minimax_m3_sparse_attn_decode(

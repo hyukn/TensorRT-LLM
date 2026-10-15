@@ -940,6 +940,28 @@ def mxfp8_quantize_gemm_autotuned(
                            gemm_inputs, tune))
 
 
+def mxfp8_gemm_autotuned(
+    act: torch.Tensor,
+    act_scale: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    output_dtype: torch.dtype,
+    tune: bool = False,
+) -> torch.Tensor:
+    """The GEMM stage of ``mxfp8_quantize_gemm_autotuned`` for an already quantized activation.
+
+    ``act`` / ``act_scale`` are what ``torch.ops.trtllm.mxfp8_quantize(x, True)`` returns;
+    the tactic comes from the same autotuner op and inputs, so the GEMM is the one the
+    quantize + GEMM path would run for this bucket.
+    """
+    gemm_runner = FlashInferMXFP8GemmRunner(output_dtype)
+    gemm_inputs = [act, act_scale, weight, weight_scale]
+    return gemm_runner(gemm_inputs,
+                       tactic=_choose_mxfp8_tactic(
+                           _FLASHINFER_MXFP8_GEMM_AUTOTUNED_OP, gemm_runner,
+                           gemm_inputs, tune))
+
+
 class FP4GemmRunner(TunableRunner):
     runner_dict = dict()
     tuning_config = TuningConfig(dynamic_tensor_specs=(DynamicTensorSpec(

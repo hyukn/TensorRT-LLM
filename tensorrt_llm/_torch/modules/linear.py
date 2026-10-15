@@ -20,7 +20,7 @@ from torch.nn.parameter import Parameter
 
 import tensorrt_llm.quantization.utils.fp4_utils as fp4_utils
 from tensorrt_llm._torch.custom_ops.torch_custom_ops import (
-    BufferKind, mxfp8_quantize_gemm_autotuned)
+    BufferKind, mxfp8_gemm_autotuned, mxfp8_quantize_gemm_autotuned)
 from tensorrt_llm._torch.peft.lora.layer import LoraLayer
 from tensorrt_llm._utils import is_device_integrated, mpi_disabled
 from tensorrt_llm.bindings import ipc_nvls_supported
@@ -40,9 +40,9 @@ from ..._utils import get_sm_version, is_sm_100f
 from ...models.modeling_utils import QuantConfig
 from ..cute_dsl_utils import (IS_CUTLASS_DSL_AVAILABLE,
                               IS_CUTLASS_DSL_RUBIN_AVAILABLE)
-from ..utils import (Fp4QuantizedTensor, get_model_extra_attrs,
-                     is_torch_compiling, replace_parameter_and_save_metadata,
-                     unswizzle_sf)
+from ..utils import (Fp4QuantizedTensor, MxFp8QuantizedTensor,
+                     get_model_extra_attrs, is_torch_compiling,
+                     replace_parameter_and_save_metadata, unswizzle_sf)
 from .low_m_gemm import _should_apply_low_m_gemm, apply_low_m_gemm
 
 
@@ -3549,9 +3549,38 @@ class MXFP8LinearMethod(LinearMethodBase):
         else:
             module.register_parameter("bias", None)
 
+    def accepts_prequantized_input(self, module: Linear) -> bool:
+        """Whether ``apply`` would take the decode-graph quantize + GEMM path right now.
+
+        On that path the activation quantize is ``torch.ops.trtllm.mxfp8_quantize(x, True)``
+        (or its bitwise-equal FlashInfer tactic), so a producer may hand over that result
+        as an ``MxFp8QuantizedTensor`` (swizzled scales) instead of the bf16 activation.
+        """
+        return (self.use_cutlass and self.tune_decode_graph_backends
+                and not is_torch_compiling()
+                and _FLASHINFER_MXFP8_DECODE_GRAPH_CAPTURE_ACTIVE.get())
+
     def apply(self, module: Linear, input: torch.Tensor,
               bias: Optional[torch.Tensor]):
         """Apply MXFP8 linear projection with eager or capture-safe dispatch."""
+        if isinstance(input, MxFp8QuantizedTensor):
+            # Pre-quantized by the producer (see accepts_prequantized_input).
+            if not (input.is_sf_swizzled
+                    and self.accepts_prequantized_input(module)):
+                raise RuntimeError(
+                    "MXFP8 Linear got a pre-quantized activation outside the "
+                    "decode-graph FlashInfer path or with linear scales")
+            output = mxfp8_gemm_autotuned(
+                input.fp8_tensor,
+                input.scaling_factor,
+                module.weight,
+                module.weight_scale,
+                module.dtype,
+                tune=_FLASHINFER_MXFP8_AUTOTUNE_ACTIVE.get(),
+            )
+            if bias is not None:
+                output = output + bias
+            return output
         original_shape = input.shape
         if input.dim() > 2:
             input = input.reshape(-1, input.shape[-1])

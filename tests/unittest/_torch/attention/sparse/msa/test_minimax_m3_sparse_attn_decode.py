@@ -1369,3 +1369,78 @@ def test_msa_jit_cache_tracks_sources_and_build_modes(
     checked = jit._compute_cache_base()
     assert checked.parent == tmp_path / ".cache/minfer/fmha_sm100_gmem_check"
     assert checked.name != default.name
+
+
+@skip_not_sm100
+@pytest.mark.parametrize("num_topk_chunks", [None, 2, 8])
+@pytest.mark.parametrize(
+    ("num_kv_heads", "group", "decode_query_len", "seq_lens"),
+    [(1, 16, 4, [4097, 300, 8192, 150]), (2, 8, 4, [1025, 4097]), (1, 16, 1, [130, 9000, 64])],
+)
+def test_nvfp4_sparse_decode_mxfp8_output_request(
+    num_topk_chunks, num_kv_heads, group, decode_query_len, seq_lens
+):
+    """The fused merge writes the same bf16 output plus mxfp8_quantize(output, True), bitwise."""
+    from tensorrt_llm._torch.modules.mxfp8_triton import Mxfp8OutputRequest, mxfp8_output_request
+
+    case = _make_nvfp4_inputs(
+        seq_lens,
+        num_kv_heads=num_kv_heads,
+        group=group,
+        decode_query_len=decode_query_len,
+        seed=91,
+    )
+    kwargs = {} if num_topk_chunks is None else {"num_topk_chunks": num_topk_chunks}
+    reference = _run_nvfp4(case, **kwargs)
+
+    total_q, num_heads, head_dim = case.q.shape
+    out = torch.empty((total_q, num_heads * head_dim), device="cuda", dtype=torch.bfloat16)
+    request = Mxfp8OutputRequest.allocate(total_q, num_heads * head_dim, out.device)
+    request.out_ptr = out.data_ptr()
+    with mxfp8_output_request(request):
+        minimax_m3_sparse_attn_decode(
+            case.q,
+            case.k_paged,
+            case.v_paged,
+            case.topk_idx,
+            case.block_table,
+            case.seq_lens,
+            sm_scale=HEAD_DIM**-0.5,
+            output=out.view(total_q, num_heads, head_dim),
+            decode_query_len=case.decode_query_len,
+            **case.scales,
+            **kwargs,
+        )
+    assert torch.equal(out.view_as(reference), reference)
+    # A single top-k chunk writes the output directly and leaves the request open.
+    if not request.written:
+        pytest.skip("this shape resolved to one top-k chunk (direct output, no merge)")
+    ref_q, ref_sf = torch.ops.trtllm.mxfp8_quantize(out, True)
+    assert torch.equal(request.fp8.view(torch.uint8), ref_q.view(total_q, -1).view(torch.uint8))
+    num_blocks = num_heads * head_dim // 32
+    rows = torch.arange(total_q, device="cuda")[:, None]
+    blks = torch.arange(num_blocks, device="cuda")[None, :]
+    off = (
+        (rows // 128) * (((num_blocks + 3) // 4) * 512)
+        + (blks // 4) * 512
+        + (rows % 32) * 16
+        + ((rows % 128) // 32) * 4
+        + (blks % 4)
+    ).reshape(-1)
+    assert torch.equal(request.sf[off], ref_sf.view(torch.uint8).reshape(-1)[off])
+
+
+@skip_not_sm100
+def test_nvfp4_sparse_decode_ignores_foreign_mxfp8_request():
+    """A request opened for another buffer (or a row slice of it) is left untouched."""
+    from tensorrt_llm._torch.modules.mxfp8_triton import Mxfp8OutputRequest, mxfp8_output_request
+
+    case = _make_nvfp4_inputs([4097, 300], num_kv_heads=1, group=16, decode_query_len=4, seed=7)
+    total_q, num_heads, head_dim = case.q.shape
+    request = Mxfp8OutputRequest.allocate(total_q, num_heads * head_dim, "cuda")
+    other = torch.empty((total_q, num_heads * head_dim), device="cuda", dtype=torch.bfloat16)
+    request.out_ptr = other.data_ptr()
+    with mxfp8_output_request(request):
+        out = _run_nvfp4(case, num_topk_chunks=8)
+    assert not request.written
+    torch.testing.assert_close(out, _run_nvfp4(case, num_topk_chunks=8), rtol=0, atol=0)

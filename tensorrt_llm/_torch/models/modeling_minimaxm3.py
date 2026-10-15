@@ -58,6 +58,7 @@ from ..modules.embedding import Embedding
 from ..modules.gated_mlp import GatedMLP
 from ..modules.linear import (
     Linear,
+    MXFP8LinearMethod,
     TensorParallelMode,
     WeightMode,
     WeightsLoadingConfig,
@@ -65,6 +66,11 @@ from ..modules.linear import (
     load_weight_shard,
 )
 from ..modules.multi_stream_utils import do_multi_stream, maybe_execute_in_parallel
+from ..modules.mxfp8_triton import (
+    Mxfp8OutputRequest,
+    current_mxfp8_output_request,
+    mxfp8_output_request,
+)
 from ..modules.rms_norm import RMSNorm
 from ..moe.fused_moe import MiniMaxM3MoeRoutingMethod, SwigluBiasActivation, create_moe
 from ..moe.fused_moe.interface import MoESchedulerKind
@@ -74,6 +80,7 @@ from ..utils import (
     AuxStreamType,
     EventType,
     Fp4QuantizedTensor,
+    MxFp8QuantizedTensor,
     get_model_extra_attrs,
     is_torch_compiling,
 )
@@ -563,6 +570,10 @@ _ROUTER_FAST_UPCAST = os.environ.get("TRTLLM_M3_ROUTER_FAST_UPCAST", "0") == "1"
 # kernel and arguments, so bitwise; decode CUDA graphs only (where the routed and shared branches
 # already run on two streams).
 _MOE_PREQUANT_OVERLAP = os.environ.get("TRTLLM_M3_MOE_PREQUANT_OVERLAP", "0") == "1"
+# TRTLLM_M3_ATTN_OUT_MXFP8=1: on decode graph steps the sparse-attention merge kernel also emits
+# the MXFP8 o_proj activation (bit-identical to the o_proj's own mxfp8_quantize), so the o_proj
+# quantize kernel drops out of every sparse layer.
+_ATTN_OUT_MXFP8 = os.environ.get("TRTLLM_M3_ATTN_OUT_MXFP8", "0") == "1"
 
 
 def _moe_prequant_backend(experts: nn.Module) -> Optional[nn.Module]:
@@ -2051,6 +2062,57 @@ class MiniMaxM3Attention(Attention):
 
         return output
 
+    def _attn_out_mxfp8_request(
+        self, q: torch.Tensor, attn_metadata: AttentionMetadata
+    ) -> Optional[Mxfp8OutputRequest]:
+        """An MXFP8 output request for this layer's attention, when o_proj can take it.
+
+        Sparse MSA layers on generation-only steps whose o_proj is about to run the
+        decode-graph MXFP8 quantize + GEMM; everything else keeps the bf16 handoff.
+        """
+        if not _ATTN_OUT_MXFP8 or not self.is_sparse_attention_layer:
+            return None
+        if not isinstance(self.attn, MiniMaxM3MsaSparseAttention) or is_torch_compiling():
+            return None
+        if self.register_to_config and is_in_breakable_cuda_graph():
+            return None
+        if getattr(attn_metadata, "num_contexts", None) != 0 or q.dim() != 2:
+            return None
+        quant_method = getattr(self.o_proj, "quant_method", None)
+        if getattr(self.o_proj, "lora", None) is not None or not isinstance(
+            quant_method, MXFP8LinearMethod
+        ):
+            return None
+        if not quant_method.accepts_prequantized_input(self.o_proj):
+            return None
+        if self.attn_activation_dtype != torch.bfloat16:
+            return None
+        return Mxfp8OutputRequest.allocate(q.shape[0], self.num_heads * self.head_dim, q.device)
+
+    def _attention_then_o_proj(
+        self,
+        q: torch.Tensor,
+        k: Optional[torch.Tensor],
+        v: Optional[torch.Tensor],
+        idx_q: Optional[torch.Tensor],
+        idx_k: Optional[torch.Tensor],
+        attn_metadata: AttentionMetadata,
+        all_reduce_params: Optional[AllReduceParams],
+    ) -> torch.Tensor:
+        """Attention core + o_proj, handing o_proj the MXFP8 activation when the core made it."""
+        request = self._attn_out_mxfp8_request(q, attn_metadata)
+        with mxfp8_output_request(request):
+            o = self._forward_attention_core(q, k, v, idx_q, idx_k, attn_metadata)
+        if request is not None and request.written:
+            o = MxFp8QuantizedTensor(
+                fp8_tensor=request.fp8, scaling_factor=request.sf, is_sf_swizzled=True
+            )
+        # all_reduce_params lets the decoder defer the o_proj output AllReduce so
+        # it can be fused with post_attention_layernorm (RESIDUAL_RMS_NORM).
+        # Passing None preserves the standalone o_proj reduction used by the
+        # single-GPU, attention-DP, and fusion-disabled paths.
+        return self.o_proj(o, all_reduce_params=all_reduce_params)
+
     def _forward_attention_core(
         self,
         q: torch.Tensor,
@@ -2066,6 +2128,9 @@ class MiniMaxM3Attention(Attention):
             (q.shape[0], self.num_heads * self.head_dim),
             dtype=self.attn_activation_dtype,
         )
+        request = current_mxfp8_output_request()
+        if request is not None:
+            request.out_ptr = output.data_ptr()
         if self.register_to_config and (is_torch_compiling() or is_in_breakable_cuda_graph()):
             maybe_bcg_minimax_m3_attn_custom_op_inplace(
                 q,
@@ -2289,8 +2354,9 @@ class MiniMaxM3Attention(Attention):
             )
             if horizontal is not None:
                 q, idx_q = horizontal
-                o = self._forward_attention_core(q, None, None, idx_q, None, attn_metadata)
-                return self.o_proj(o, all_reduce_params=all_reduce_params)
+                return self._attention_then_o_proj(
+                    q, None, None, idx_q, None, attn_metadata, all_reduce_params
+                )
             main_size = self.q_size + 2 * self.kv_size
             packed_qkv, packed_idx_qk = packed.split(
                 [main_size, self.index_q_size + self.index_k_size], dim=-1
@@ -2378,12 +2444,7 @@ class MiniMaxM3Attention(Attention):
             disable_on_compile=True,
         )
 
-        o = self._forward_attention_core(q, k, v, idx_q, idx_k, attn_metadata)
-        # all_reduce_params lets the decoder defer the o_proj output AllReduce so
-        # it can be fused with post_attention_layernorm (RESIDUAL_RMS_NORM).
-        # Passing None preserves the standalone o_proj reduction used by the
-        # single-GPU, attention-DP, and fusion-disabled paths.
-        return self.o_proj(o, all_reduce_params=all_reduce_params)
+        return self._attention_then_o_proj(q, k, v, idx_q, idx_k, attn_metadata, all_reduce_params)
 
     def _triton_sparse_attention_core(
         self,
