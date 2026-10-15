@@ -35,8 +35,11 @@
 #include <new>
 #include <optional>
 #include <pthread.h>
+#include <string>
+#include <sys/stat.h>
 #include <thread>
 #include <unistd.h>
+#include <unordered_map>
 #include <vector>
 
 namespace tc = tensorrt_llm::common;
@@ -148,14 +151,129 @@ bool runTasks(
     return success;
 }
 
+// ---- O_DIRECT host -> disk writes (TRTLLM_KV_DISK_IO_DIRECT=1) ----
+//
+// Buffered pwrites into one disk-tier file serialize on the file's inode lock (parallel writers are slower than
+// one) and are throttled by page-cache writeback when host memory is short. Aligned host -> disk writes can use a
+// second, O_DIRECT descriptor of the same file instead, reopened through /proc/self/fd; reads keep the buffered
+// descriptor and its page cache (the kernel drops the cached pages a direct write covers).
+constexpr size_t kDirectIoAlignment = 4096;
+
+bool directIoEnabled() noexcept
+{
+    static bool const enabled = []
+    {
+        char const* env = std::getenv("TRTLLM_KV_DISK_IO_DIRECT");
+        return env != nullptr && env[0] == '1' && env[1] == '\0';
+    }();
+    return enabled;
+}
+
+//! O_DIRECT descriptor of the file behind fd, or -1. Cached per descriptor and revalidated by device and inode,
+//! so a reused descriptor number never writes into the previous file.
+int directFdFor(int fd) noexcept
+{
+    struct DirectFd
+    {
+        dev_t dev;
+        ino_t ino;
+        int fd;
+    };
+
+    struct stat st
+    {
+    };
+
+    if (fstat(fd, &st) != 0)
+    {
+        return -1;
+    }
+    static std::mutex mutex;
+    static auto* cache
+        = new std::unordered_map<int, DirectFd>(); // never destroyed: workers may outlive static teardown
+    std::lock_guard<std::mutex> lock(mutex);
+    try
+    {
+        auto it = cache->find(fd);
+        if (it != cache->end())
+        {
+            if (it->second.dev == st.st_dev && it->second.ino == st.st_ino)
+            {
+                return it->second.fd;
+            }
+            if (it->second.fd >= 0)
+            {
+                close(it->second.fd);
+            }
+            cache->erase(it);
+        }
+        std::string const path = "/proc/self/fd/" + std::to_string(fd);
+        int const directFd = open(path.c_str(), O_RDWR | O_DIRECT | O_CLOEXEC);
+        if (directFd < 0)
+        {
+            TLLM_LOG_WARNING("KV cache disk I/O: cannot reopen %s with O_DIRECT (%s); writing it buffered",
+                path.c_str(), strerror(errno));
+        }
+        cache->emplace(fd, DirectFd{st.st_dev, st.st_ino, directFd});
+        return directFd;
+    }
+    catch (...)
+    {
+        return -1;
+    }
+}
+
+//! Writes size bytes through directFd; whatever O_DIRECT does not take (rejected, or a short write that leaves the
+//! rest unaligned) is written through the buffered bufferedFd.
+bool directWriteAll(int directFd, int bufferedFd, ssize_t pos, void const* data, ssize_t size) noexcept
+{
+    auto const* bytes = static_cast<std::byte const*>(data);
+    ssize_t count = 0;
+    while (count < size)
+    {
+        ssize_t const written = pwrite(directFd, bytes + count, size - count, pos + count);
+        if (written < 0 && errno == EINTR)
+        {
+            continue;
+        }
+        if (written <= 0)
+        {
+            break;
+        }
+        count += written;
+        if (written % static_cast<ssize_t>(kDirectIoAlignment) != 0)
+        {
+            break;
+        }
+    }
+    return count == size || writeAll(bufferedFd, pos + count, bytes + count, size - count);
+}
+
 bool runTasks(
     std::vector<Task<DiskAddress, MemAddress>> const& tasks, size_t begin, size_t end, ssize_t numBytes) noexcept
 {
+    bool const direct = directIoEnabled() && numBytes % static_cast<ssize_t>(kDirectIoAlignment) == 0;
+    int lastFd = -1;
+    int lastDirectFd = -1;
     bool success = true;
-    for (size_t i = begin; i < end; ++i)
+    for (size_t i = begin; i < end && success; ++i)
     {
         auto const& t = tasks[i];
-        success = success && writeAll(t.dst.fd, t.dst.pos, reinterpret_cast<void const*>(t.src), numBytes);
+        auto const* src = reinterpret_cast<void const*>(t.src);
+        if (direct && t.src % kDirectIoAlignment == 0 && t.dst.pos % static_cast<ssize_t>(kDirectIoAlignment) == 0)
+        {
+            if (t.dst.fd != lastFd)
+            {
+                lastFd = t.dst.fd;
+                lastDirectFd = directFdFor(t.dst.fd);
+            }
+            if (lastDirectFd >= 0)
+            {
+                success = directWriteAll(lastDirectFd, t.dst.fd, t.dst.pos, src, numBytes);
+                continue;
+            }
+        }
+        success = writeAll(t.dst.fd, t.dst.pos, src, numBytes);
     }
     return success;
 }

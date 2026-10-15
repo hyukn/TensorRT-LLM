@@ -220,13 +220,18 @@ def _round_trips(
         os.close(fd)
 
 
-def _run_in_subprocess(tmp_path: Path, threads: str | None, expect_pool_threads: int) -> None:
+def _run_in_subprocess(
+    tmp_path: Path, threads: str | None, expect_pool_threads: int, direct: bool = False
+) -> None:
     env = dict(os.environ)
     env.pop("TRTLLM_KV_DISK_IO_THREADS", None)
+    env.pop("TRTLLM_KV_DISK_IO_DIRECT", None)
     if threads is not None:
         env["TRTLLM_KV_DISK_IO_THREADS"] = threads
+    if direct:
+        env["TRTLLM_KV_DISK_IO_DIRECT"] = "1"
     result = subprocess.run(
-        [sys.executable, __file__, str(tmp_path), str(expect_pool_threads)],
+        [sys.executable, __file__, str(tmp_path), str(expect_pool_threads), str(int(direct))],
         env=env,
         capture_output=True,
         text=True,
@@ -269,6 +274,23 @@ def test_round_trips_per_thread_count(
     if expect_pool_threads > 0 and not _supports_stream_wait_value64():
         pytest.skip("the worker pool needs 64-bit stream memory operations")
     _run_in_subprocess(tmp_path, threads, expect_pool_threads)
+
+
+@pytest.mark.parametrize(
+    "threads, expect_pool_threads",
+    [pytest.param("0", 0, id="in-callback"), pytest.param(None, 8, id="default")],
+)
+def test_round_trips_with_direct_writes(
+    tmp_path: Path, threads: str | None, expect_pool_threads: int
+) -> None:
+    """Round trips stay exact with TRTLLM_KV_DISK_IO_DIRECT=1.
+
+    Aligned host -> disk writes go through an O_DIRECT descriptor of the same file while reads stay
+    buffered; the subprocess checks that the second descriptor exists.
+    """
+    if expect_pool_threads > 0 and not _supports_stream_wait_value64():
+        pytest.skip("the worker pool needs 64-bit stream memory operations")
+    _run_in_subprocess(tmp_path, threads, expect_pool_threads, direct=True)
 
 
 def _process_io() -> dict[str, int]:
@@ -366,7 +388,11 @@ def _conversations(
 
 def _run_conversations(tmp_path: Path, env_overrides: dict[str, str], disk_quota: int) -> dict:
     env = dict(os.environ)
-    for key in ("TRTLLM_KV_DISK_KEEP_COPY", "TRTLLM_KV_HOST_FREE_WATERMARK"):
+    for key in (
+        "TRTLLM_KV_DISK_KEEP_COPY",
+        "TRTLLM_KV_HOST_FREE_WATERMARK",
+        "TRTLLM_KV_DISK_IO_DIRECT",
+    ):
         env.pop(key, None)
     env.update(env_overrides)
     result = subprocess.run(
@@ -402,6 +428,10 @@ def test_disk_copies_serve_reused_prefixes_and_save_writes(tmp_path: Path) -> No
             id="keep-copy-watermark",
         ),
         pytest.param({"TRTLLM_KV_HOST_FREE_WATERMARK": "0.25"}, id="watermark"),
+        pytest.param(
+            {"TRTLLM_KV_DISK_KEEP_COPY": "1", "TRTLLM_KV_DISK_IO_DIRECT": "1"},
+            id="keep-copy-direct-writes",
+        ),
     ],
 )
 def test_disk_copies_under_disk_pressure(tmp_path: Path, env_overrides: dict[str, str]) -> None:
@@ -422,3 +452,7 @@ if __name__ == "__main__":
     found = _pool_threads()
     expected = int(sys.argv[2])
     assert found == expected, f"{found} '{POOL_THREAD_NAME}' threads, expected {expected}"
+    if len(sys.argv) > 3 and sys.argv[3] == "1":
+        # The O_DIRECT descriptor stays open (cached) next to the closed buffered one.
+        targets = [os.path.realpath(f"/proc/self/fd/{fd}") for fd in os.listdir("/proc/self/fd")]
+        assert any(t.endswith("kv_disk_tier.bin") for t in targets), targets
