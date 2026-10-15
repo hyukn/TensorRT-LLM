@@ -574,6 +574,11 @@ _MOE_PREQUANT_OVERLAP = os.environ.get("TRTLLM_M3_MOE_PREQUANT_OVERLAP", "0") ==
 # the MXFP8 o_proj activation (bit-identical to the o_proj's own mxfp8_quantize), so the o_proj
 # quantize kernel drops out of every sparse layer.
 _ATTN_OUT_MXFP8 = os.environ.get("TRTLLM_M3_ATTN_OUT_MXFP8", "0") == "1"
+# TRTLLM_M3_AR_MXFP8_QKV=1: on decode graph steps the layer-boundary MNNVL AllReduce + residual + RMSNorm also
+# emits the MXFP8 quantization of the norm output (RESIDUAL_RMS_NORM_OUT_QUANT_MXFP8, bit-identical to the
+# qkv_proj's own mxfp8_quantize), and the next layer's fused QKV+index projection takes it, dropping one
+# quantize kernel per layer. Needs the C++ op (libtensorrt_llm.so + libth_common.so with that fusion op).
+_AR_MXFP8_QKV = os.environ.get("TRTLLM_M3_AR_MXFP8_QKV", "0") == "1"
 
 
 def _open_attn_out_mxfp8_request() -> Optional[Mxfp8OutputRequest]:
@@ -2076,6 +2081,37 @@ class MiniMaxM3Attention(Attention):
 
         return output
 
+    def accepts_mxfp8_qkv_input(self) -> bool:
+        """Whether this layer's next eager forward runs its fused QKV+index projection as an MXFP8 GEMM that can
+        take a pre-quantized activation (see stage_mxfp8_qkv_input)."""
+        quant_method = getattr(self.qkv_proj, "quant_method", None)
+        return (
+            self.enable_fused_qkv_index_projection
+            and isinstance(self.attn, MiniMaxM3MsaSparseAttention)
+            and getattr(self.qkv_proj, "lora", None) is None
+            and isinstance(quant_method, MXFP8LinearMethod)
+            and quant_method.accepts_prequantized_input(self.qkv_proj)
+        )
+
+    def stage_mxfp8_qkv_input(
+        self, hidden_states: torch.Tensor, quantized: MxFp8QuantizedTensor
+    ) -> None:
+        """Hand the MXFP8 form of ``hidden_states`` (the exact tensor this layer's forward will receive) to the
+        fused QKV projection; any other input leaves it unused."""
+        self._staged_mxfp8_qkv_input = (hidden_states, quantized)
+
+    def _take_staged_mxfp8_qkv_input(self, hidden_states: torch.Tensor):
+        staged = getattr(self, "_staged_mxfp8_qkv_input", None)
+        self._staged_mxfp8_qkv_input = None
+        if staged is not None and staged[0] is hidden_states:
+            logger.info_once(
+                "MiniMax-M3 fused QKV projection takes the MXFP8 activation from the "
+                "layer-boundary AllReduce (TRTLLM_M3_AR_MXFP8_QKV=1)",
+                key="m3_ar_mxfp8_qkv_input",
+            )
+            return staged[1]
+        return hidden_states
+
     def _attn_out_mxfp8_request(
         self, q: torch.Tensor, attn_metadata: AttentionMetadata
     ) -> Optional[Mxfp8OutputRequest]:
@@ -2367,7 +2403,7 @@ class MiniMaxM3Attention(Attention):
                     output,
                 )
                 return self.o_proj(output, all_reduce_params=all_reduce_params)
-            packed = self.qkv_proj(hidden_states)
+            packed = self.qkv_proj(self._take_staged_mxfp8_qkv_input(hidden_states))
             horizontal = self._fused_fp8_qkv_indexer_norm_rope_kv_insert(
                 packed, position_ids, attn_metadata
             )
@@ -2773,6 +2809,25 @@ class MiniMaxM3DecoderLayer(DecoderLayer):
         if self.next_layer_layernorm is None:
             return hidden_states, residual
         if self.post_feed_forward_fusion:
+            next_attn = self._next_layer_mxfp8_attention(hidden_states)
+            if next_attn is not None:
+                norm, quant, scale, residual = self.allreduce(
+                    hidden_states,
+                    all_reduce_params=AllReduceParams(
+                        fusion_op=AllReduceFusionOp.RESIDUAL_RMS_NORM_OUT_QUANT_MXFP8,
+                        residual=residual,
+                        norm_weight=self.next_layer_layernorm.weight,
+                        eps=self.next_layer_layernorm.variance_epsilon,
+                        trigger_completion_at_end=False,
+                    ),
+                )
+                next_attn.stage_mxfp8_qkv_input(
+                    norm,
+                    MxFp8QuantizedTensor(
+                        fp8_tensor=quant, scaling_factor=scale, is_sf_swizzled=True
+                    ),
+                )
+                return norm, residual
             return self.allreduce(
                 hidden_states,
                 all_reduce_params=AllReduceParams(
@@ -2784,6 +2839,18 @@ class MiniMaxM3DecoderLayer(DecoderLayer):
                 ),
             )
         return self.next_layer_layernorm(hidden_states, residual)
+
+    def _next_layer_mxfp8_attention(self, hidden_states: torch.Tensor):
+        """The next layer's attention if the boundary AllReduce should also quantize for its QKV GEMM, else None."""
+        ref = getattr(self, "next_layer_attn_ref", None)
+        next_attn = ref[0] if ref else None
+        if not _AR_MXFP8_QKV or next_attn is None or hidden_states.dim() != 2:
+            return None
+        if is_torch_compiling() or torch.compiler.is_compiling():
+            return None
+        if self.allreduce is None or getattr(self.allreduce, "mnnvl_allreduce", None) is None:
+            return None
+        return next_attn if next_attn.accepts_mxfp8_qkv_input() else None
 
     def _feed_forward_all_reduce_params(self) -> Optional[AllReduceParams]:
         """AllReduce params handed to the MoE or dense-MLP output projection.
@@ -3115,8 +3182,12 @@ class MiniMaxM3ForCausalLM(SpecDecOneEngineForCausalLM[MiniMaxM3Model, Pretraine
         for idx, layer in enumerate(layers):
             if idx == num_layers - 1:
                 layer.next_layer_layernorm = self.model.norm
+                layer.next_layer_attn_ref = []
             else:
                 layer.next_layer_layernorm = layers[idx + 1].input_layernorm
+                # A plain list, not a submodule attribute: the next layer's attention must not be
+                # registered (and named) twice.
+                layer.next_layer_attn_ref = [layers[idx + 1].self_attn]
 
 
 def _strip_language_model_prefix(
