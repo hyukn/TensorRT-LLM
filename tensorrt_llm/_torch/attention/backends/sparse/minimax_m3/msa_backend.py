@@ -118,6 +118,14 @@ def _worst_case_proxy_max_k_tiles(
     return int(proxy_plan[3]["max_k_tiles"])
 
 
+class MsaFmhaPlanConsumers(NamedTuple):
+    """Which fmha_sm100 plans a step's layers read; see _msa_fmha_plan_consumers."""
+
+    proxy: bool
+    gqa: bool
+    dense: bool
+
+
 class MsaDecodeSpan(NamedTuple):
     """Generation rows served by MiniMax-M3's dedicated decode kernels.
 
@@ -764,6 +772,38 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
         span = self._msa_decode_span
         return span is not None and span.row_first == 0
 
+    def _msa_fmha_plan_consumers(self) -> "MsaFmhaPlanConsumers":
+        """Which of this step's fmha_sm100 plans some layer will actually read.
+
+        * proxy: the indexer's context rows, unless the tcgen05 context scorer
+          (TRTLLM_M3_CTX_INDEX_SCORER) takes them, which it does whenever it is
+          available and the step has context rows starting at row 0;
+        * gqa: the sparse layers' paged GQA, unless every sparse layer stores
+          NVFP4 KV (those run the k2q CSR kernel, which plans nothing here);
+        * dense: the dense layers' paged GQA, unless they run on trtllm-gen
+          (TRTLLM_M3_DENSE_PREFILL_TRTLLM_GEN) with the staging that path reads.
+
+        A plan nobody reads costs host time on every context step, and the GQA
+        one also asserts total_q * heads <= 65536 on its short-row path, which an
+        attention-DP rank (all heads, any batch) can exceed. The flattened page
+        table (msa_kv_indices) is only an input of these plans.
+        """
+        rows = self._msa_proxy_plan_rows()
+        ctx_scored = rows is not None and rows[0] == 0 and ctx_scorer_module() is not None
+        manager = self.kv_cache_manager
+        all_sparse_nvfp4 = getattr(manager, "dtype", None) == DataType.NVFP4 and hasattr(
+            manager, "is_nvfp4_layer"
+        )
+        from .kernels.trtllm_gen_dense_decode import dense_prefill_trtllm_gen_enabled
+
+        dense_on_trtllm_gen = dense_prefill_trtllm_gen_enabled() and self.msa_cu_q_lens is not None
+        has_attn_rows = self._msa_attn_plan_rows() is not None
+        return MsaFmhaPlanConsumers(
+            proxy=rows is not None and not ctx_scored,
+            gqa=has_attn_rows and not all_sparse_nvfp4,
+            dense=has_attn_rows and not dense_on_trtllm_gen,
+        )
+
     def _msa_proxy_plan_rows(self) -> Optional[Tuple[int, int]]:
         """Batch rows this step's fmha_sm100 indexer proxy plan must cover.
 
@@ -980,14 +1020,6 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
                 **plan_kwargs,
             )
 
-        # Proxy plan: MQA (num_kv_heads=1) max-score pass over the index
-        # branch; output_maxscore feeds the indexer's top-k block selection.
-        self._msa_prefill_proxy_plan = plan_for(
-            self._msa_proxy_plan_rows(),
-            num_qo_heads=num_index_heads,
-            num_kv_heads=1,
-            output_maxscore=True,
-        )
         proxy_rows = self._msa_proxy_plan_rows()
         ctx_mod = ctx_scorer_module()
         if ctx_mod is not None and proxy_rows is not None and proxy_rows[0] == 0:
@@ -1002,22 +1034,37 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
                     ctx_mod.ctx_plan_tc(qo_lens_cpu[first:last], kv_rows, num_index_heads),
                     max_k_tiles,
                 )
+        consumers = self._msa_fmha_plan_consumers()
+        # Proxy plan: MQA (num_kv_heads=1) max-score pass over the index
+        # branch; output_maxscore feeds the indexer's top-k block selection.
+        # Not needed when the tcgen05 context scorer takes the same rows.
+        if consumers.proxy:
+            self._msa_prefill_proxy_plan = plan_for(
+                proxy_rows,
+                num_qo_heads=num_index_heads,
+                num_kv_heads=1,
+                output_maxscore=True,
+            )
         attn_rows = self._msa_attn_plan_rows()
         # Sparse layers: kv_block_num=topk limits attention to top-k blocks.
-        self._msa_prefill_gqa_plan = plan_for(
-            attn_rows,
-            num_qo_heads=num_q_heads,
-            num_kv_heads=num_kv_heads,
-            kv_block_num=params.topk,
-            use_fp8_kvcache=use_fp8,
-        )
+        # Only a non-NVFP4 sparse layer reads it; NVFP4 ones run the k2q CSR kernel.
+        if consumers.gqa:
+            self._msa_prefill_gqa_plan = plan_for(
+                attn_rows,
+                num_qo_heads=num_q_heads,
+                num_kv_heads=num_kv_heads,
+                kv_block_num=params.topk,
+                use_fp8_kvcache=use_fp8,
+            )
         # Dense layers: no kv_block_num, so the full page table is attended.
-        self._msa_prefill_dense_plan = plan_for(
-            attn_rows,
-            num_qo_heads=num_q_heads,
-            num_kv_heads=num_kv_heads,
-            use_fp8_kvcache=use_fp8,
-        )
+        # Not needed when they run on trtllm-gen (TRTLLM_M3_DENSE_PREFILL_TRTLLM_GEN).
+        if consumers.dense:
+            self._msa_prefill_dense_plan = plan_for(
+                attn_rows,
+                num_qo_heads=num_q_heads,
+                num_kv_heads=num_kv_heads,
+                use_fp8_kvcache=use_fp8,
+            )
         # Stage the valid-block count to the device once for the whole step
         # (see msa_prefill_n_valid_blocks).
         n_valid_host = per_token_valid_blocks(
@@ -1108,7 +1155,9 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
         # Only fmha_sm100 reads the flattened page table (the decode kernels
         # index msa_block_table directly), so a step with no fmha_sm100 work
         # left skips building and staging it.
-        needs_flat_page_table = not self._msa_runs_no_fmha()
+        needs_flat_page_table = not self._msa_runs_no_fmha() and any(
+            self._msa_fmha_plan_consumers()
+        )
         kv_indices = (
             # Comes from the same host block ids the mapping was built from,
             # so it costs no device work.
