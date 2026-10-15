@@ -57,7 +57,10 @@ struct AllReduceFusionParams
     //! \name Input and Output Data
     //! @{
 
-    void const* input;      //!< Input tensor to be reduced across all ranks
+    void const* input; //!< Input tensor to be reduced across all ranks
+    //! Optional second local partial added to ``input`` before the reduction (same shape and dtype), rounded like
+    //! a separate ``input + inputAdd`` in fp32 then to the input dtype.
+    void const* inputAdd = nullptr;
     void const* residualIn; //!< Residual input tensor for skip connections (used when rmsnormFusion=true)
     void const* gamma;      //!< Gamma parameters for RMS normalization (used when rmsnormFusion=true)
     double epsilon;         //!< Epsilon value for RMS normalization numerical stability (used when rmsnormFusion=true)

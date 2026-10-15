@@ -945,3 +945,83 @@ def test_mnnvl_f32_out_fusion_is_bitwise(mpi_pool_executor, num_tokens) -> None:
         [num_tokens] * tensor_parallel_size,
     )
     assert all(results)
+
+
+def mnnvl_input_add_forward(tensor_parallel_size: int, num_tokens: int) -> bool:
+    """AllReduce(a, input_add=b) == AllReduce(a + b), bitwise, for the plain, RMSNorm and MXFP8 patterns."""
+    rank = tensorrt_llm.mpi_rank()
+    torch.cuda.set_device(rank)
+    try:
+        os.environ["TLLM_TEST_MNNVL"] = "1"
+        hidden = 6144
+        torch.manual_seed(300 + rank)
+        a = (torch.randn(num_tokens, hidden, device="cuda") * 0.5).to(
+            torch.bfloat16)
+        b = (torch.randn(num_tokens, hidden, device="cuda") * 0.25).to(
+            torch.bfloat16)
+        torch.manual_seed(11)
+        residual = torch.randn(num_tokens, hidden,
+                               device="cuda").to(torch.bfloat16)
+        gamma = (torch.rand(hidden, device="cuda") + 0.5).to(torch.bfloat16)
+        MPI.COMM_WORLD.barrier()
+        allreduce = AllReduce(
+            mapping=Mapping(world_size=tensor_parallel_size,
+                            tp_size=tensor_parallel_size,
+                            rank=rank),
+            strategy=AllReduceStrategy.MNNVL,
+            dtype=torch.bfloat16,
+        )
+
+        def run(op, x, add):
+            params = AllReduceParams(fusion_op=op,
+                                     residual=residual.clone(),
+                                     norm_weight=gamma,
+                                     eps=1e-5,
+                                     input_add=add)
+            if op == AllReduceFusionOp.NONE:
+                params = AllReduceParams(input_add=add)
+            out = allreduce(x.clone(), all_reduce_params=params)
+            return out if isinstance(out, (tuple, list)) else (out, )
+
+        # MXFP8 scales: compare the valid rows only (the 128-row padding is not written).
+        blocks = hidden // 32
+        rows = torch.arange(num_tokens, device="cuda")[:, None]
+        cols = torch.arange(blocks, device="cuda")[None, :]
+        sf_off = ((rows // 128) * (((blocks + 3) // 4) * 512) +
+                  (cols // 4) * 512 + (rows % 32) * 16 +
+                  ((rows % 128) // 32) * 4 + (cols % 4)).reshape(-1)
+        mxfp8 = AllReduceFusionOp.RESIDUAL_RMS_NORM_OUT_QUANT_MXFP8
+        for op in (AllReduceFusionOp.NONE, AllReduceFusionOp.RESIDUAL_RMS_NORM,
+                   mxfp8):
+            ref = run(op, a + b, None)
+            fused = run(op, a, b)
+            assert len(ref) == len(fused)
+            for i, (r, f) in enumerate(zip(ref, fused)):
+                r, f = r.view(torch.uint8), f.view(torch.uint8)
+                if op == mxfp8 and i == 2:
+                    r, f = r.reshape(-1)[sf_off], f.reshape(-1)[sf_off]
+                assert torch.equal(r, f), (op, i)
+    except Exception:
+        traceback.print_exc()
+        raise
+    return True
+
+
+@pytest.mark.skipif(
+    platform.machine().lower() != "aarch64" or torch.cuda.device_count() < 4
+    or not MnnvlMemory.supports_mnnvl(),
+    reason="requires four GB200 GPUs with fabric-backed MNNVL",
+)
+@skip_pre_blackwell
+@pytest.mark.parametrize("mpi_pool_executor", [4], indirect=True)
+@pytest.mark.parametrize("num_tokens", [1, 8, 21, 24, 64],
+                         ids=lambda n: f"tokens{n}")
+def test_mnnvl_input_add_is_bitwise(mpi_pool_executor, num_tokens) -> None:
+    """Oneshot (<= 21 tokens at TP4, hidden 6144) and twoshot kernels."""
+    tensor_parallel_size = mpi_pool_executor.num_workers
+    results = mpi_pool_executor.map(
+        mnnvl_input_add_forward,
+        [tensor_parallel_size] * tensor_parallel_size,
+        [num_tokens] * tensor_parallel_size,
+    )
+    assert all(results)

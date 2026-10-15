@@ -12,6 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import copy
 import math
 import os
 import platform
@@ -958,6 +959,12 @@ class MNNVLAllReduce(nn.Module):
         if is_fusion and fusion_op not in MNNVLAllReduce.SUPPORTED_FUSION_OPS:
             return None
 
+        # Only pass input_add when set, so libraries built before the argument
+        # existed keep working for every other call.
+        input_add = getattr(all_reduce_params, "input_add", None)
+        extra_args = {} if input_add is None else {
+            "input_add": input_add.contiguous()
+        }
         outputs = torch.ops.trtllm.mnnvl_fusion_allreduce(
             input,
             all_reduce_params.norm_weight,  # gamma
@@ -968,8 +975,20 @@ class MNNVLAllReduce(nn.Module):
             is_fusion,  # rmsnorm_fusion
             all_reduce_params.scale,  # scale
             int(fusion_op),
+            **extra_args,
         )
         return tuple(outputs) if is_fusion else outputs[0]
+
+
+def _fold_input_add(input: torch.Tensor, all_reduce_params: AllReduceParams):
+    """Add ``all_reduce_params.input_add`` into ``input`` for paths that cannot fuse it.
+
+    Returns the summed input and a shallow copy of the params without
+    ``input_add`` (the caller's object is left untouched).
+    """
+    folded = copy.copy(all_reduce_params)
+    folded.input_add = None
+    return (input + all_reduce_params.input_add).contiguous(), folded
 
 
 class AllReduce(nn.Module):
@@ -1167,6 +1186,8 @@ class AllReduce(nn.Module):
         if self.mapping.tp_size == 1 or (all_reduce_params is not None
                                          and all_reduce_params.enable_allreduce
                                          == False):
+            if getattr(all_reduce_params, "input_add", None) is not None:
+                return input + all_reduce_params.input_add
             return input
 
         input = input.contiguous()  # Underlying op requires contiguous input
@@ -1175,6 +1196,15 @@ class AllReduce(nn.Module):
 
         if all_reduce_params is None:
             all_reduce_params = AllReduceParams()
+
+        # ``input_add`` is a second local partial summed into ``input`` before
+        # the reduction. Only the MNNVL kernel fuses that add; every other path
+        # adds it up front.
+        if getattr(all_reduce_params, "input_add", None) is not None and (
+                not self.mnnvl_allreduce or
+            (self.symm_mem_allreduce
+             and all_reduce_params.fusion_op == AllReduceFusionOp.NONE)):
+            input, all_reduce_params = _fold_input_add(input, all_reduce_params)
 
         # Try Symmetric Memory AllReduce first if available
         # Note: Currently only supports NONE fusion op (plain allreduce)
@@ -1199,6 +1229,9 @@ class AllReduce(nn.Module):
                 input, all_reduce_params=all_reduce_params)
             if mnnvl_output is not None:
                 return mnnvl_output
+            if getattr(all_reduce_params, "input_add", None) is not None:
+                input, all_reduce_params = _fold_input_add(
+                    input, all_reduce_params)
 
         # Fall back to regular AllReduce if specialized methods are not available or not applicable
         # Make sure the strategy is AUTO since allreduceOp does not have the branch for MNNVL/SYMM_MEM

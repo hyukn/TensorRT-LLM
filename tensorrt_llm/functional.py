@@ -149,6 +149,7 @@ class AllReduceParams:
         eps: float = 1e-06,
         enable_allreduce: bool = True,
         trigger_completion_at_end: bool = True,
+        input_add: Optional[Tensor] = None,
     ):
         self.strategy = strategy
         self.fusion_op = fusion_op
@@ -161,6 +162,10 @@ class AllReduceParams:
         # For torch path only, has no effect on TRT path
         self.enable_allreduce = enable_allreduce
         self.trigger_completion_at_end = trigger_completion_at_end
+        # For torch path only: a second local partial of the same shape summed
+        # into the input before the reduction (MNNVL fuses the add, other
+        # strategies add it up front).
+        self.input_add = input_add
         assert fusion_op in (AllReduceFusionOp.NONE.value,
                              AllReduceFusionOp.RMS_NORM.value) or (residual
                                                                    is not None)

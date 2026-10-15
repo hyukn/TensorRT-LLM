@@ -80,6 +80,19 @@ union PackedVec
     }
 };
 
+// value += addend element-wise the way a separate torch ``a + b`` kernel rounds it: widen to fp32, add, round once
+// to T (bf16 / fp16), so a fused pre-reduction add matches the unfused one bit for bit.
+template <typename PackedType, typename T>
+inline __device__ void addLikeTorch(PackedVec<PackedType, T>& value, PackedVec<PackedType, T> const& addend)
+{
+#pragma unroll
+    for (int i = 0; i < sizeof(PackedType) / sizeof(T); i++)
+    {
+        value.elements[i] = cuda_cast<T, float>(
+            __fadd_rn(cuda_cast<float, T>(value.elements[i]), cuda_cast<float, T>(addend.elements[i])));
+    }
+}
+
 template <typename PackedType, typename T>
 inline __device__ PackedType loadPacked(T* ptr)
 {
@@ -347,6 +360,7 @@ struct MnnvlAllReduceKernelParams
     uint32_t* bufferFlags;
     bool waitForResults;
     QuantizationSFLayout layout;
+    T const* shardAddPtr; // optional second local partial, added before the reduction
 };
 
 template <typename PackedType, typename T>
@@ -646,6 +660,12 @@ __global__ void __launch_bounds__(1024) oneshotAllreduceFusionKernel(MnnvlAllRed
     if (inBounds)
     {
         val.packed = loadPacked<PackedType>(&params.shardPtr[threadOffset]);
+        if (params.shardAddPtr != nullptr)
+        {
+            PackedVec<PackedType, T> addend;
+            addend.packed = loadPacked<PackedType>(&params.shardAddPtr[threadOffset]);
+            addLikeTorch(val, addend);
+        }
         sanitizeLamportPayload(val);
 
         reinterpret_cast<PackedType*>(
@@ -903,7 +923,7 @@ void oneshotAllreduceFusionOp(AllReduceFusionParams const& params)
         MnnvlAllReduceKernelParams<T> kernelParams{output, residualOut, input, residualIn, gamma, ucPtrs,
             reinterpret_cast<T*>(params.bufferPtrLocal), mcPtr, params.quantOut, params.scaleOut, params.scaleFactor,
             numTokens, tokenDim, params.nRanks, params.rank, static_cast<float>(params.epsilon), params.bufferFlags,
-            false, params.layout};
+            false, params.layout, reinterpret_cast<T const*>(params.inputAdd)};
 
         switch (params.nRanks)
         {
@@ -969,6 +989,12 @@ __global__ __launch_bounds__(128) void twoshotAllreduceKernel(MnnvlAllReduceKern
     if (inBounds)
     {
         val.packed = loadPacked<PackedType>(&params.shardPtr[threadOffset]);
+        if (params.shardAddPtr != nullptr)
+        {
+            PackedVec<PackedType, T> addend;
+            addend.packed = loadPacked<PackedType>(&params.shardAddPtr[threadOffset]);
+            addLikeTorch(val, addend);
+        }
         sanitizeLamportPayload(val);
 
         // Store vectorized data
@@ -1294,7 +1320,7 @@ void twoshotAllreduceFusionOp(AllReduceFusionParams const& params)
             reinterpret_cast<T const*>(params.residualIn), reinterpret_cast<T const*>(params.gamma), ucPtrs,
             reinterpret_cast<T*>(params.bufferPtrLocal), mcastPtr, params.quantOut, params.scaleOut, params.scaleFactor,
             numTokens, tokenDim, params.nRanks, params.rank, static_cast<float>(params.epsilon), params.bufferFlags,
-            !params.rmsNormFusion, params.layout};
+            !params.rmsNormFusion, params.layout, reinterpret_cast<T const*>(params.inputAdd)};
         switch (params.nRanks)
         {
         case 2: LAUNCH_ALLREDUCE_KERNEL(2, T); return true;

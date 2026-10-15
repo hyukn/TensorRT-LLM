@@ -2078,7 +2078,8 @@ bool hasMnnvlNormOutput(AllReduceFusionOp fusionOp)
 
 std::vector<torch::Tensor> mnnvlFusionAllReduce(torch::Tensor& input, torch::optional<torch::Tensor> const& gamma,
     torch::optional<torch::Tensor> const& residual_in, torch::optional<double> epsilon, torch::Tensor& comm_buffer,
-    torch::Tensor& buffer_flags, bool rmsnorm_fusion, torch::optional<torch::Tensor> const& scale, int64_t fusion_op_)
+    torch::Tensor& buffer_flags, bool rmsnorm_fusion, torch::optional<torch::Tensor> const& scale, int64_t fusion_op_,
+    torch::optional<torch::Tensor> const& input_add)
 {
     auto* mcast_mem = tensorrt_llm::common::findMcastDevMemBuffer(comm_buffer.data_ptr());
     TORCH_CHECK(
@@ -2086,6 +2087,18 @@ std::vector<torch::Tensor> mnnvlFusionAllReduce(torch::Tensor& input, torch::opt
     TORCH_CHECK(mcast_mem->isMapped(), "[mnnvlFusionAllReduce] MNNVL workspace handles are not attached.");
     TORCH_CHECK(input.is_contiguous(), "[mnnvlFusionAllReduce] input must be contiguous");
     TORCH_CHECK(input.dim() >= 2, "[mnnvlFusionAllReduce] input must have at least 2 dimensions");
+    if (input_add.has_value())
+    {
+        // A second local partial (e.g. a MoE's shared-expert output) summed into ``input`` before the reduction,
+        // rounded like a separate ``input + input_add`` (fp32 add, one rounding to the input dtype).
+        TORCH_CHECK(input_add.value().is_contiguous(), "[mnnvlFusionAllReduce] input_add must be contiguous");
+        TORCH_CHECK(
+            input_add.value().sizes() == input.sizes(), "[mnnvlFusionAllReduce] input_add must match input's shape");
+        TORCH_CHECK(input_add.value().scalar_type() == input.scalar_type(),
+            "[mnnvlFusionAllReduce] input_add must match input's dtype");
+        TORCH_CHECK(input.scalar_type() == torch::kFloat16 || input.scalar_type() == torch::kBFloat16,
+            "[mnnvlFusionAllReduce] input_add requires FP16 or BF16 input");
+    }
 
     // Treat input as a flat (numTokens, hiddenDim) buffer for the kernel while preserving the
     // original N-D shape for the returned tensors (via empty_like / input.sizes() below).
@@ -2195,6 +2208,7 @@ std::vector<torch::Tensor> mnnvlFusionAllReduce(torch::Tensor& input, torch::opt
     allreduce_params.multicastPtr = mcast_mem->getMulticastPtr();
     allreduce_params.bufferFlags = reinterpret_cast<uint32_t*>(buffer_flags.mutable_data_ptr());
     allreduce_params.input = input.const_data_ptr();
+    allreduce_params.inputAdd = input_add.has_value() ? input_add.value().const_data_ptr() : nullptr;
     allreduce_params.pattern = pattern;
     allreduce_params.layout = tensorrt_llm::QuantizationSFLayout::SWIZZLED;
 
@@ -2355,7 +2369,7 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
     m.def(
         "mnnvl_fusion_allreduce(Tensor input, Tensor? gamma, Tensor? residual, "
         "float? epsilon, Tensor(a!) comm_buffer, Tensor buffer_flags, bool rmsnorm_fusion, "
-        "Tensor? scale=None, int fusion_op=0) -> "
+        "Tensor? scale=None, int fusion_op=0, Tensor? input_add=None) -> "
         "Tensor[]");
     m.def(
         "allreduce("
