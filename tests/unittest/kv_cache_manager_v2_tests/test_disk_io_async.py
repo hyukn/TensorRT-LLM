@@ -22,8 +22,18 @@ synchronization between the hops, and check every byte. Each hop's buffer is ove
 after it is consumed, so a hop that did not wait for the previous one reads the wrong bytes.
 
 The pool is created once per process, so the thread-count variants run in subprocesses.
+
+The KVCacheManagerV2 tests at the end drive multi-turn conversations through small GPU and host tiers
+so that every conversation's prefix keeps cycling GPU -> host -> disk -> GPU, with
+TRTLLM_KV_DISK_KEEP_COPY (committed pages promoted from disk keep their disk slot, and a later
+demotion reuses it instead of rewriting the page) and TRTLLM_KV_HOST_FREE_WATERMARK (evict ahead to
+disk). Every reused token is checked on the GPU by the fake engine, partial blocks are re-snapshotted
+on every turn (a longer snapshot replaces a page that has a copy), and a tight disk quota forces
+copies to be reclaimed and their slots reused. They run in subprocesses: the settings are read when
+a manager is built, and a failed device-side check poisons the CUDA context.
 """
 
+import json
 import os
 import subprocess
 import sys
@@ -261,7 +271,153 @@ def test_round_trips_per_thread_count(
     _run_in_subprocess(tmp_path, threads, expect_pool_threads)
 
 
+def _process_io() -> dict[str, int]:
+    fields = {}
+    for line in Path("/proc/self/io").read_text().splitlines():
+        key, value = line.split(":")
+        fields[key.strip()] = int(value)
+    return fields
+
+
+def _conversations(
+    directory: str,
+    disk_quota: int,
+    num_conversations: int = 8,
+    num_turns: int = 5,
+    new_tokens_per_turn: int = 100,
+) -> dict[str, int]:
+    """Multi-turn conversations, interleaved, each turn reusing its conversation's whole history.
+
+    100 new tokens per turn with 32-token blocks leaves a partial block every turn, so each turn also
+    replaces a partial snapshot page. 4 layers x (key + value) x 8 KiB = 64 KiB per block; GPU and
+    host hold 32 blocks each while the conversations grow to 128, so prefixes come back from disk.
+    """
+    from tensorrt_llm.runtime.kv_cache_manager_v2 import (
+        AttentionLayerConfig,
+        BufferConfig,
+        CudaStream,
+        DiskCacheTierConfig,
+        GpuCacheTierConfig,
+        HostCacheTierConfig,
+        KVCacheManager,
+        KVCacheManagerConfig,
+        LayerId,
+        TokenId,
+    )
+
+    test_dir = os.path.dirname(os.path.abspath(__file__))
+    sys.path.insert(0, test_dir)
+    from cuda_test_utils import TemporaryCudaStream, init_cuda_once, round_up
+    from fake_engine import FakeEngine, Role, Step
+
+    init_cuda_once()
+    tokens_per_block = 32
+    config = KVCacheManagerConfig(
+        tokens_per_block=tokens_per_block,
+        cache_tiers=[
+            GpuCacheTierConfig(quota=2 << 20),
+            HostCacheTierConfig(quota=2 << 20),
+            DiskCacheTierConfig(quota=disk_quota, path=directory),
+        ],
+        layers=[
+            AttentionLayerConfig(
+                layer_id=LayerId(layer),
+                buffers=[
+                    BufferConfig(role=Role.KEY, size=8192),
+                    BufferConfig(role=Role.VALUE, size=8192),
+                ],
+            )
+            for layer in range(4)
+        ],
+    )
+    engine = FakeEngine(config)
+    manager = KVCacheManager(config)
+    next_token = iter(range(1, 1 << 30))
+    prompts: list[list] = [[] for _ in range(num_conversations)]
+    reused_tokens = 0
+    io_before = _process_io()
+    with TemporaryCudaStream([]) as s:
+        stream = CudaStream(s.handle)
+        for _ in range(num_turns):
+            for prompt in prompts:
+                prompt.extend(TokenId(next(next_token)) for _ in range(new_tokens_per_turn))
+                kv_cache = manager.create_kv_cache(None, prompt)
+                num_reused = kv_cache.num_committed_tokens
+                reused_tokens += num_reused
+                assert kv_cache.resume(stream)
+                assert kv_cache.resize(round_up(len(prompt), tokens_per_block))
+                # Checks every reused token's values on the GPU, then writes the new ones.
+                engine.execute([Step(kv_cache, prompt[num_reused:], prompt[:num_reused])], stream)
+                kv_cache.commit(prompt[num_reused:])
+                kv_cache.close()
+    s.take_finish_event()
+    import cuda.bindings.runtime as cudart
+
+    (err,) = cudart.cudaDeviceSynchronize()
+    assert int(err) == int(cudart.cudaError_t.cudaSuccess), f"device check failed: {err}"
+    io_after = _process_io()
+    manager.shutdown()
+    return {
+        "reused_tokens": reused_tokens,
+        "bytes_written": io_after["wchar"] - io_before["wchar"],
+        "bytes_read": io_after["rchar"] - io_before["rchar"],
+    }
+
+
+def _run_conversations(tmp_path: Path, env_overrides: dict[str, str], disk_quota: int) -> dict:
+    env = dict(os.environ)
+    for key in ("TRTLLM_KV_DISK_KEEP_COPY", "TRTLLM_KV_HOST_FREE_WATERMARK"):
+        env.pop(key, None)
+    env.update(env_overrides)
+    result = subprocess.run(
+        [sys.executable, __file__, "conversations", str(tmp_path), str(disk_quota)],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=900,
+    )
+    assert result.returncode == 0, f"stdout:\n{result.stdout}\nstderr:\n{result.stderr[-4000:]}"
+    return json.loads(result.stdout.strip().splitlines()[-1])
+
+
+def test_disk_copies_serve_reused_prefixes_and_save_writes(tmp_path: Path) -> None:
+    """Kept disk copies give the same reuse, correct bytes, and far fewer disk writes.
+
+    The same conversations run with and without TRTLLM_KV_DISK_KEEP_COPY; every reused token is
+    checked, and demotions that reuse a copy write nothing.
+    """
+    baseline = _run_conversations(tmp_path, {}, disk_quota=64 << 20)
+    kept = _run_conversations(tmp_path, {"TRTLLM_KV_DISK_KEEP_COPY": "1"}, disk_quota=64 << 20)
+    assert baseline["reused_tokens"] > 0
+    assert kept["reused_tokens"] == baseline["reused_tokens"]
+    assert kept["bytes_written"] < 0.6 * baseline["bytes_written"], (baseline, kept)
+
+
+@pytest.mark.parametrize(
+    "env_overrides",
+    [
+        pytest.param({"TRTLLM_KV_DISK_KEEP_COPY": "1"}, id="keep-copy"),
+        pytest.param(
+            {"TRTLLM_KV_DISK_KEEP_COPY": "1", "TRTLLM_KV_HOST_FREE_WATERMARK": "0.25"},
+            id="keep-copy-watermark",
+        ),
+        pytest.param({"TRTLLM_KV_HOST_FREE_WATERMARK": "0.25"}, id="watermark"),
+    ],
+)
+def test_disk_copies_under_disk_pressure(tmp_path: Path, env_overrides: dict[str, str]) -> None:
+    """No reused token is ever served from a stale copy when the disk tier is short.
+
+    With a disk tier smaller than the conversations, copies are reclaimed, their slots rewritten by
+    other pages, and pages dropped.
+    """
+    result = _run_conversations(tmp_path, env_overrides, disk_quota=6 << 20)
+    assert result["reused_tokens"] > 0
+
+
 if __name__ == "__main__":
+    if sys.argv[1] == "conversations":
+        print(json.dumps(_conversations(sys.argv[2], int(sys.argv[3]))))
+        sys.exit(0)
     _round_trips(sys.argv[1])
     found = _pool_threads()
     expected = int(sys.argv[2])

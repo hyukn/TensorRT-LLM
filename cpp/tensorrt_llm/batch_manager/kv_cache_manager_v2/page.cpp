@@ -50,6 +50,8 @@ Page::~Page()
                 "Page destroyed while still held or scheduled for eviction");
             if (hasValidSlot())
             {
+                // A page with a disk copy is always above that disk level, so it holds a slot too.
+                manager->releaseDiskCopy(*this);
                 Slot s;
                 s.setSlotId(slotId());
                 s.readyEvent = std::move(readyEvent);

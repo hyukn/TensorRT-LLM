@@ -29,6 +29,7 @@
 
 #include <deque>
 #include <functional>
+#include <list>
 #include <map>
 #include <memory>
 #include <optional>
@@ -197,6 +198,24 @@ public:
     // nothing, which in practice means slot preparation failed before anything moved.
     int64_t prefetch(
         CacheLevel dstLevel, TypedVec<LifeCycleId, TypedVec<CacheLevel, std::vector<SharedPtr<Page>>>> const& pages);
+
+    // ---- Clean disk copies -------------------------------------------------
+    //
+    // A committed page is immutable, so after it is promoted from a disk level the disk slot it was read from
+    // still holds its bytes. With TRTLLM_KV_DISK_KEEP_COPY=1 (and the lossless default cold-page codec) that slot
+    // is kept as the page's disk copy instead of being freed; demoting the page back to that disk level then
+    // takes the copy over and frees the upper slot without writing the page again. Copies hold disk slots, so
+    // they are reclaimed oldest-first whenever their pool group runs short of free slots, all of them before a
+    // disk pool shrinks, and each one when its page is destroyed.
+
+    // Releases the disk copy kept for page, if any. Called by ~Page.
+    void releaseDiskCopy(Page const& page);
+
+    //! Number of disk copies currently kept (all disk levels and pool groups).
+    [[nodiscard]] size_t numDiskCopies() const noexcept
+    {
+        return mDiskCopies.size();
+    }
 
     // ---- Query helpers -----------------------------------------------------
 
@@ -390,6 +409,15 @@ private:
 
     PoolGroupBase& poolGroup(CacheLevel lvl, PoolGroupIndex pgIdx);
 
+    // Clean disk copies, see releaseDiskCopy().
+    void keepDiskCopy(Page const& page, CacheLevel level, PoolGroupIndex pgIdx, Slot slot);
+    [[nodiscard]] std::optional<Slot> takeDiskCopy(Page const& page, CacheLevel level);
+    SlotCount reclaimDiskCopies(CacheLevel level, PoolGroupIndex pgIdx, SlotCount count);
+    void releaseAllDiskCopies();
+    // Demotes pages that carry a disk copy at dstLevel by swapping the copy in; no data moves.
+    void demoteToDiskCopies(CacheLevel dstLevel, CacheLevel srcLevel, std::vector<SharedPtr<Page>> const& pages,
+        std::vector<Slot>& copies, MigrationRecorder const& migrationRecorder);
+
     LifeCyclePoolGroupMapping const& poolGroupMapping(CacheLevel level) const
     {
         TLLM_CHECK(level >= CacheLevel{0} && level < mSlotDescLists.size());
@@ -453,6 +481,24 @@ private:
     static constexpr size_t kIndexStagingBytes = 256u << 10u;
     // Allocated only when a codec requests device indices; protected through codec completion.
     std::unique_ptr<StagingBufferManager> mIndexStagingManager;
+
+    // Appended last so that every member above keeps its offset.
+    struct DiskCopy
+    {
+        Slot slot;
+        CacheLevel level;
+        PoolGroupIndex pgIdx;
+        std::list<Page const*>::iterator lruNode;
+    };
+
+    bool mKeepDiskCopies{false};
+    // Fraction of each host pool group that eviction into it keeps free by demoting extra pages to disk
+    // ahead of need (TRTLLM_KV_HOST_FREE_WATERMARK, default 0 = off), so that a later step's GPU -> host
+    // evictions find slots whose disk writes already finished.
+    double mHostFreeWatermark{0.0};
+    std::unordered_map<Page const*, DiskCopy> mDiskCopies;
+    // Per (disk level, pool group): pages with a copy, oldest copy first.
+    std::map<std::pair<CacheLevel, PoolGroupIndex>, std::list<Page const*>> mDiskCopyLru;
 };
 
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
