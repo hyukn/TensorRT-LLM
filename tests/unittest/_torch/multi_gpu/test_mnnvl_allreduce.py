@@ -882,3 +882,66 @@ def test_mnnvl_mxfp8_out_fusion_is_bitwise(mpi_pool_executor,
         [num_tokens] * tensor_parallel_size,
     )
     assert all(results)
+
+
+def mnnvl_f32_out_forward(tensor_parallel_size: int, num_tokens: int) -> bool:
+    """RESIDUAL_RMS_NORM_OUT_F32 == RESIDUAL_RMS_NORM + norm.float(), bitwise, on this rank."""
+    rank = tensorrt_llm.mpi_rank()
+    torch.cuda.set_device(rank)
+    try:
+        os.environ["TLLM_TEST_MNNVL"] = "1"
+        hidden = 6144
+        torch.manual_seed(200 + rank)
+        x = (torch.randn(num_tokens, hidden, device="cuda") * 0.5).to(
+            torch.bfloat16)
+        torch.manual_seed(9)
+        residual = torch.randn(num_tokens, hidden,
+                               device="cuda").to(torch.bfloat16)
+        gamma = (torch.rand(hidden, device="cuda") + 0.5).to(torch.bfloat16)
+        MPI.COMM_WORLD.barrier()
+        allreduce = AllReduce(
+            mapping=Mapping(world_size=tensor_parallel_size,
+                            tp_size=tensor_parallel_size,
+                            rank=rank),
+            strategy=AllReduceStrategy.MNNVL,
+            dtype=torch.bfloat16,
+        )
+
+        def run(op):
+            return allreduce(
+                x.clone(),
+                all_reduce_params=AllReduceParams(fusion_op=op,
+                                                  residual=residual.clone(),
+                                                  norm_weight=gamma,
+                                                  eps=1e-5),
+            )
+
+        ref_norm, ref_residual = run(AllReduceFusionOp.RESIDUAL_RMS_NORM)
+        norm, norm_fp32, res = run(AllReduceFusionOp.RESIDUAL_RMS_NORM_OUT_F32)
+        assert torch.equal(norm, ref_norm) and torch.equal(res, ref_residual)
+        assert norm_fp32.dtype == torch.float32 and torch.equal(
+            norm_fp32, ref_norm.float())
+    except Exception:
+        traceback.print_exc()
+        raise
+    return True
+
+
+@pytest.mark.skipif(
+    platform.machine().lower() != "aarch64" or torch.cuda.device_count() < 4
+    or not MnnvlMemory.supports_mnnvl(),
+    reason="requires four GB200 GPUs with fabric-backed MNNVL",
+)
+@skip_pre_blackwell
+@pytest.mark.parametrize("mpi_pool_executor", [4], indirect=True)
+@pytest.mark.parametrize("num_tokens", [1, 8, 21, 24, 64],
+                         ids=lambda n: f"tokens{n}")
+def test_mnnvl_f32_out_fusion_is_bitwise(mpi_pool_executor, num_tokens) -> None:
+    """Oneshot (<= 21 tokens at TP4, hidden 6144) and twoshot + RMSNorm kernels."""
+    tensor_parallel_size = mpi_pool_executor.num_workers
+    results = mpi_pool_executor.map(
+        mnnvl_f32_out_forward,
+        [tensor_parallel_size] * tensor_parallel_size,
+        [num_tokens] * tensor_parallel_size,
+    )
+    assert all(results)

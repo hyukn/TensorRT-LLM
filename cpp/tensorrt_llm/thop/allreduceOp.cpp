@@ -2031,6 +2031,7 @@ MnnvlFusionPattern getMnnvlFusionPattern(AllReduceFusionOp fusionOp)
     case AllReduceFusionOp::RESIDUAL_RMS_NORM_OUT_QUANT_NVFP4: return MnnvlFusionPattern::kARResidualRMSNormOutFP4Quant;
     case AllReduceFusionOp::RESIDUAL_RMS_NORM_OUT_QUANT_MXFP8:
         return MnnvlFusionPattern::kARResidualRMSNormOutMXFP8Quant;
+    case AllReduceFusionOp::RESIDUAL_RMS_NORM_OUT_F32: return MnnvlFusionPattern::kARResidualRMSNormOutF32;
     default:
         TORCH_CHECK(
             false, "[mnnvlFusionAllReduce] Unsupported fusion operation: " + tensorrt_llm::kernels::toString(fusionOp));
@@ -2044,12 +2045,18 @@ bool isMnnvlQuantFusionOp(AllReduceFusionOp fusionOp)
         || fusionOp == AllReduceFusionOp::RESIDUAL_RMS_NORM_OUT_QUANT_FP8
         || fusionOp == AllReduceFusionOp::RESIDUAL_RMS_NORM_QUANT_NVFP4
         || fusionOp == AllReduceFusionOp::RESIDUAL_RMS_NORM_OUT_QUANT_NVFP4
-        || fusionOp == AllReduceFusionOp::RESIDUAL_RMS_NORM_OUT_QUANT_MXFP8;
+        || fusionOp == AllReduceFusionOp::RESIDUAL_RMS_NORM_OUT_QUANT_MXFP8
+        || fusionOp == AllReduceFusionOp::RESIDUAL_RMS_NORM_OUT_F32;
 }
 
 bool isMnnvlMxfp8FusionOp(AllReduceFusionOp fusionOp)
 {
     return fusionOp == AllReduceFusionOp::RESIDUAL_RMS_NORM_OUT_QUANT_MXFP8;
+}
+
+bool isMnnvlF32CopyFusionOp(AllReduceFusionOp fusionOp)
+{
+    return fusionOp == AllReduceFusionOp::RESIDUAL_RMS_NORM_OUT_F32;
 }
 
 bool isMnnvlNvfp4FusionOp(AllReduceFusionOp fusionOp)
@@ -2063,7 +2070,8 @@ bool hasMnnvlNormOutput(AllReduceFusionOp fusionOp)
     return fusionOp == AllReduceFusionOp::RESIDUAL_RMS_NORM
         || fusionOp == AllReduceFusionOp::RESIDUAL_RMS_NORM_OUT_QUANT_FP8
         || fusionOp == AllReduceFusionOp::RESIDUAL_RMS_NORM_OUT_QUANT_NVFP4
-        || fusionOp == AllReduceFusionOp::RESIDUAL_RMS_NORM_OUT_QUANT_MXFP8;
+        || fusionOp == AllReduceFusionOp::RESIDUAL_RMS_NORM_OUT_QUANT_MXFP8
+        || fusionOp == AllReduceFusionOp::RESIDUAL_RMS_NORM_OUT_F32;
 }
 
 } // namespace
@@ -2121,7 +2129,13 @@ std::vector<torch::Tensor> mnnvlFusionAllReduce(torch::Tensor& input, torch::opt
         reduceOut = torch::empty_like(input);
     }
 
-    if (isMnnvlMxfp8FusionOp(fusionOp))
+    if (isMnnvlF32CopyFusionOp(fusionOp))
+    {
+        TORCH_CHECK(input.scalar_type() == torch::kFloat16 || input.scalar_type() == torch::kBFloat16,
+            "[mnnvlFusionAllReduce] the fp32 norm copy requires FP16 or BF16 input");
+        quantOut = at::detail::empty_cuda(input.sizes(), torch::kFloat32, input.device(), std::nullopt);
+    }
+    else if (isMnnvlMxfp8FusionOp(fusionOp))
     {
         // Dynamic block scales: no global scale input. E4M3 output plus UE8M0 scales in the 128x4 swizzled layout,
         // sized like torch.ops.trtllm.mxfp8_quantize(x, true).
@@ -2204,7 +2218,9 @@ std::vector<torch::Tensor> mnnvlFusionAllReduce(torch::Tensor& input, torch::opt
     {
         allreduce_params.quantOut = quantOut.mutable_data_ptr();
         allreduce_params.scaleOut = scaleOut.defined() ? scaleOut.mutable_data_ptr() : nullptr;
-        allreduce_params.scaleFactor = isMnnvlMxfp8FusionOp(fusionOp) ? nullptr : scale.value().data_ptr<float>();
+        allreduce_params.scaleFactor = (isMnnvlMxfp8FusionOp(fusionOp) || isMnnvlF32CopyFusionOp(fusionOp))
+            ? nullptr
+            : scale.value().data_ptr<float>();
     }
 
     allreduce_params.rmsNormFusion = hasRmsNormFusion;
@@ -2232,6 +2248,7 @@ std::vector<torch::Tensor> mnnvlFusionAllReduce(torch::Tensor& input, torch::opt
     case AllReduceFusionOp::RESIDUAL_RMS_NORM_QUANT_NVFP4: return {quantOut, scaleOut, residualOut};
     case AllReduceFusionOp::RESIDUAL_RMS_NORM_OUT_QUANT_NVFP4: return {normOut, quantOut, scaleOut, residualOut};
     case AllReduceFusionOp::RESIDUAL_RMS_NORM_OUT_QUANT_MXFP8: return {normOut, quantOut, scaleOut, residualOut};
+    case AllReduceFusionOp::RESIDUAL_RMS_NORM_OUT_F32: return {normOut, quantOut, residualOut};
     default:
         TORCH_CHECK(
             false, "[mnnvlFusionAllReduce] Unsupported fusion operation: " + tensorrt_llm::kernels::toString(fusionOp));

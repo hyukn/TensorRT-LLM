@@ -71,6 +71,9 @@ enum class AllReduceFusionPattern : int
     // NormOut + MXFP8 (E4M3, one UE8M0 scale per 32 elements, 128x4 swizzled) of the norm output: the activation a
     // following MXFP8 GEMM consumes, bit-identical to quantizing the bf16 norm output separately. MNNVL kernels only.
     kARResidualRMSNormOutMXFP8Quant = 7,
+    // NormOut + an exact fp32 copy of the (rounded) norm output, for an fp32 consumer such as an MoE router GEMM
+    // that would otherwise upcast it in a separate launch. MNNVL kernels only.
+    kARResidualRMSNormOutF32 = 8,
 };
 
 enum class QuantType : int
@@ -79,6 +82,7 @@ enum class QuantType : int
     kFP8 = 1,
     kFP4 = 2,
     kMXFP8 = 3,
+    kF32 = 4,
 };
 
 template <AllReduceFusionPattern Pattern>
@@ -111,6 +115,8 @@ DEFINE_FUSION_PATTERN_TRAITS(
 DEFINE_FUSION_PATTERN_TRAITS(AllReduceFusionPattern::kARRMSNorm, false, false, false, true, true, QuantType::kNone);
 DEFINE_FUSION_PATTERN_TRAITS(
     AllReduceFusionPattern::kARResidualRMSNormOutMXFP8Quant, false, true, true, true, true, QuantType::kMXFP8);
+DEFINE_FUSION_PATTERN_TRAITS(
+    AllReduceFusionPattern::kARResidualRMSNormOutF32, false, true, true, true, true, QuantType::kF32);
 #undef DEFINE_FUSION_PATTERN_TRAITS
 
 template <AllReduceFusionPattern Pattern>

@@ -550,6 +550,19 @@ inline __device__ void quantizeEpilogue(PackedVec<PackedType, T> const& value,
         reinterpret_cast<uint64_t*>(params.quantOutPtr)[packedAccessIdx]
             = cvt_warp_fp16_to_mxfp8<T, kSFVecSize>(packVal, sfOut);
     }
+    else if constexpr (ar_fusion::GetQuantType<Pattern> == ar_fusion::QuantType::kF32)
+    {
+        // Exact widening of the T output this thread holds (every bf16/fp16 value is representable in fp32).
+        static_assert(kELTS_PER_THREAD % 4 == 0, "fp32 copy expects a multiple of four elements per access.");
+        auto* out = reinterpret_cast<float4*>(params.quantOutPtr) + packedAccessIdx * (kELTS_PER_THREAD / 4);
+#pragma unroll
+        for (int i = 0; i < kELTS_PER_THREAD / 4; ++i)
+        {
+            out[i] = make_float4(cuda_cast<float, T>(value.elements[4 * i]),
+                cuda_cast<float, T>(value.elements[4 * i + 1]), cuda_cast<float, T>(value.elements[4 * i + 2]),
+                cuda_cast<float, T>(value.elements[4 * i + 3]));
+        }
+    }
     else if constexpr (ar_fusion::GetQuantType<Pattern> == ar_fusion::QuantType::kFP8)
     {
         float const scale = 1.F / *params.scaleFactorPtr;
@@ -855,6 +868,17 @@ void oneshotAllreduceFusionOp(AllReduceFusionParams const& params)
         else                                                                                                           \
         {                                                                                                              \
             TLLM_CHECK_WITH_INFO(false, "[MNNVL AllReduceOneShot] MXFP8 quantization does not support FP32 input.");   \
+        }                                                                                                              \
+    }                                                                                                                  \
+    else if (params.pattern == ar_fusion::AllReduceFusionPattern::kARResidualRMSNormOutF32)                            \
+    {                                                                                                                  \
+        if constexpr (!std::is_same_v<T, float>)                                                                       \
+        {                                                                                                              \
+            LAUNCH_ALLREDUCE_KERNEL(WORLD_SIZE, T, ar_fusion::AllReduceFusionPattern::kARResidualRMSNormOutF32);       \
+        }                                                                                                              \
+        else                                                                                                           \
+        {                                                                                                              \
+            TLLM_CHECK_WITH_INFO(false, "[MNNVL AllReduceOneShot] The fp32 norm copy needs FP16 or BF16 input.");      \
         }                                                                                                              \
     }                                                                                                                  \
     else if (params.pattern == ar_fusion::AllReduceFusionPattern::kARRMSNorm)                                          \
@@ -1395,6 +1419,18 @@ void twoshotAllreduceFusionOp(AllReduceFusionParams const& params)
         else                                                                                                           \
         {                                                                                                              \
             TLLM_CHECK_WITH_INFO(false, "[MNNVL AllReduceTwoShot] MXFP8 quantization does not support FP32 input.");   \
+        }                                                                                                              \
+    }                                                                                                                  \
+    else if (params.pattern == ar_fusion::AllReduceFusionPattern::kARResidualRMSNormOutF32)                            \
+    {                                                                                                                  \
+        if constexpr (!std::is_same_v<T, float>)                                                                       \
+        {                                                                                                              \
+            RUN_RMSNORM_KERNEL(                                                                                        \
+                T, ar_fusion::AllReduceFusionPattern::kARResidualRMSNormOutF32, USE_CGA, LOADS_PER_THREAD);            \
+        }                                                                                                              \
+        else                                                                                                           \
+        {                                                                                                              \
+            TLLM_CHECK_WITH_INFO(false, "[MNNVL AllReduceTwoShot] The fp32 norm copy needs FP16 or BF16 input.");      \
         }                                                                                                              \
     }                                                                                                                  \
     else if (params.pattern == ar_fusion::AllReduceFusionPattern::kARRMSNorm)                                          \
