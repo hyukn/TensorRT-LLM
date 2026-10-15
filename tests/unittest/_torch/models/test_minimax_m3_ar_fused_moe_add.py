@@ -158,6 +158,19 @@ def test_fused_moe_add_gating(monkeypatch: pytest.MonkeyPatch) -> None:
     assert not _layer(_FakeMoE(h, h, routed_global=True), _FakeAR())._fused_moe_add(h, None)
 
 
+def test_fused_moe_add_stays_in_the_oneshot_regime(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(m3, "_AR_FUSED_MOE_ADD", True)
+    ar = _FakeAR()
+    ar.mapping = SimpleNamespace(tp_size=4)
+    small = torch.zeros(21, 6144, dtype=torch.bfloat16)  # 21 x 6144 x 4 x 2 B <= 1 MiB: oneshot
+    large = torch.zeros(22, 6144, dtype=torch.bfloat16)  # twoshot
+    layer = _layer(_FakeMoE(small, small), ar)
+    assert layer._fused_moe_add(small, None)
+    assert not layer._fused_moe_add(large, None)
+    monkeypatch.setattr(m3, "_AR_FUSED_MOE_ADD_MAX_BYTES", 1 << 30)
+    assert layer._fused_moe_add(large, None)
+
+
 @pytest.mark.parametrize("fused", [False, True])
 def test_forward_moe_hands_the_routed_output_to_the_allreduce(
     monkeypatch: pytest.MonkeyPatch, fused: bool

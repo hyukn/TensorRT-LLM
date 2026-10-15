@@ -590,6 +590,12 @@ _AR_F32_ROUTER = os.environ.get("TRTLLM_M3_AR_F32_ROUTER", "0") == "1"
 # separate add does), dropping the elementwise add launch that joins the two branches. Bitwise. Needs the
 # C++ op (libtensorrt_llm.so + libth_common.so with the input_add argument).
 _AR_FUSED_MOE_ADD = os.environ.get("TRTLLM_M3_AR_FUSED_MOE_ADD", "0") == "1"
+# Upper bound on tokens x hidden x TP x element size for that fold; the default is the MNNVL oneshot threshold
+# (21 tokens at TP4, hidden 6144, bf16). In e2e the fold sped up the oneshot steps (B1-B4) but slowed the twoshot ones
+# (B6-B8) by 3-4 %, for a reason not yet found.
+_AR_FUSED_MOE_ADD_MAX_BYTES = int(
+    os.environ.get("TRTLLM_M3_AR_FUSED_MOE_ADD_MAX_BYTES", str(64 * 1024 * 8 * 2))
+)
 
 
 def _open_attn_out_mxfp8_request() -> Optional[Mxfp8OutputRequest]:
@@ -2981,6 +2987,12 @@ class MiniMaxM3DecoderLayer(DecoderLayer):
         if is_torch_compiling() or torch.compiler.is_compiling():
             return False
         if self.allreduce is None or getattr(self.allreduce, "mnnvl_allreduce", None) is None:
+            return False
+        tp_size = getattr(getattr(self.allreduce, "mapping", None), "tp_size", 1)
+        if (
+            hidden_states.numel() * tp_size * hidden_states.element_size()
+            > _AR_FUSED_MOE_ADD_MAX_BYTES
+        ):
             return False
         moe = self.block_sparse_moe
         return moe.shared_experts is not None and not moe.routed_output_is_global
