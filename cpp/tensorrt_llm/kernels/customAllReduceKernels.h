@@ -196,6 +196,15 @@ void customAllReduce(kernels::AllReduceParams& params, tensorrt_llm::DataType da
 void residualRmsNorm(
     kernels::AllReduceParams& params, tensorrt_llm::DataType dataType, cudaStream_t stream, AllReduceFusionOp fusionOp);
 
+//! Whether residualRmsNormMxfp8 handles this data type and hidden size (fp16 / bf16, one CTA per row of whole warps).
+bool residualRmsNormMxfp8Supported(tensorrt_llm::DataType dataType, int hiddenSize);
+
+//! residualRmsNorm (RESIDUAL_RMS_NORM on params) that also writes the MXFP8 quantization of its norm output:
+//! quantOut E4M3 [numRows, hidden], sfOut UE8M0 1x32 scales in the 128x4 swizzled layout (rows padded to 128),
+//! bit-identical to torch.ops.trtllm.mxfp8_quantize(norm_out, true).
+void residualRmsNormMxfp8(kernels::AllReduceParams& params, tensorrt_llm::DataType dataType, void* quantOut,
+    void* sfOut, int numRows, cudaStream_t stream);
+
 void lamportInitialize(void* buffer, size_t size, tensorrt_llm::DataType dataType, cudaStream_t stream);
 
 namespace reduce_fusion

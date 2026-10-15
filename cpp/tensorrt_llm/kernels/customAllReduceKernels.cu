@@ -23,6 +23,7 @@
 #include "tensorrt_llm/common/dataType.h"
 #include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/common/tllmDataType.h"
+#include "tensorrt_llm/kernels/quantization.cuh"
 #include <cooperative_groups.h>
 #include <cstdint>
 #include <tuple>
@@ -343,6 +344,95 @@ __global__ void rms_norm_kernel(AllReduceParams params)
         *reinterpret_cast<int4*>(&local_final_output_buffer[offset]) = inter_vec.packed;
     }
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900) && (__CUDA_ARCH__ < 1200))
+    cudaTriggerProgrammaticLaunchCompletion();
+#endif
+}
+
+// rms_norm_kernel (one CTA per row, one 16-byte access per thread, no smem staging) plus an MXFP8 quantization of the
+// bf16/fp16 norm output it just wrote: E4M3 [numRows, hidden] and UE8M0 1x32 scales in the 128x4 swizzled layout, the
+// same device code and layout as quantize_with_block_size<FP16_TO_MXFP8> (torch.ops.trtllm.mxfp8_quantize(x, True)),
+// so the quantized output is bit-identical to RESIDUAL_RMS_NORM followed by that quantize. A 32-element scale group
+// is four consecutive threads of one warp. CTAs past numRows only zero the scale rows padded up to 128.
+template <typename T, bool Residual = false, bool Affine = false>
+__global__ void rms_norm_mxfp8_kernel(AllReduceParams params, uint64_t* quant_out, uint32_t* sf_out, int num_rows)
+{
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+    static constexpr int kPackedSize = details::kBytesPerAccess / sizeof(T);
+    static constexpr int kSfVecSize = 32;
+    static constexpr int kThreadsPerSf = kSfVecSize / kPackedSize;
+    static_assert(kPackedSize == CVT_ELTS_PER_THREAD, "MXFP8 quantization expects eight elements per access.");
+    using PackedStruct = typename PackedOn16Bytes<T>::Type;
+
+    int const bid = blockIdx.x;
+    int const tid = threadIdx.x;
+    int const hidden_size = params.fusion_params.hidden_size;
+    int const num_sf_cols = hidden_size / kSfVecSize;
+    int const offset = tid * kPackedSize;
+
+    cudaGridDependencySynchronize();
+
+    if (bid >= num_rows)
+    {
+        // Scale-factor padding rows (the layout pads rows to 128): zero, as the quantize kernel does.
+        auto* sf = cvt_quant_get_sf_out_offset<uint32_t, kThreadsPerSf>(
+            std::nullopt, bid, tid, num_rows, num_sf_cols, sf_out, QuantizationSFLayout::SWIZZLED);
+        if (sf != nullptr)
+        {
+            *sf = 0;
+        }
+        __threadfence();
+        __syncthreads();
+        cudaTriggerProgrammaticLaunchCompletion();
+        return;
+    }
+
+    T const* bias_buffer = reinterpret_cast<T const*>(params.fusion_params.bias_buffer);
+    T const* residual_buffer = reinterpret_cast<T const*>(params.fusion_params.residual_buffer);
+    T const* weight_buffer = reinterpret_cast<T const*>(params.fusion_params.weight_buffer);
+    T* local_final_output_buffer = reinterpret_cast<T*>(params.local_output_buffer_ptr);
+    T* intermediate_buffer = reinterpret_cast<T*>(params.fusion_params.intermediate_buffer);
+
+    int64_t const block_offset = static_cast<int64_t>(bid) * hidden_size;
+    if constexpr (Residual)
+    {
+        residual_buffer += block_offset;
+    }
+    local_final_output_buffer += block_offset;
+    intermediate_buffer += block_offset;
+
+    PackedStruct inter_vec, weight_vec;
+    inter_vec.packed = *reinterpret_cast<int4 const*>(intermediate_buffer + offset);
+    if (bias_buffer != nullptr)
+    {
+        PackedStruct bias_vec;
+        bias_vec.packed = *reinterpret_cast<int4 const*>(bias_buffer + offset);
+        inter_vec.packed = add128b(inter_vec, bias_vec);
+    }
+    if constexpr (Residual)
+    {
+        PackedStruct residual_vec;
+        residual_vec.packed = *reinterpret_cast<int4 const*>(residual_buffer + offset);
+        inter_vec.packed = add128b(inter_vec, residual_vec);
+        *reinterpret_cast<int4*>(intermediate_buffer + offset) = inter_vec.packed;
+    }
+    float acc = accumulate<T>(0.f, inter_vec);
+    acc = block_reduce_sum(acc);
+    float denom = rsqrtf(acc / hidden_size + params.fusion_params.eps);
+    if constexpr (Affine)
+    {
+        weight_vec.packed = *reinterpret_cast<int4 const*>(weight_buffer + offset);
+    }
+    inter_vec.packed = rms_norm<T, Affine>(denom, inter_vec, weight_vec);
+    *reinterpret_cast<int4*>(&local_final_output_buffer[offset]) = inter_vec.packed;
+
+    // Quantize the stored norm output: the same values quantize_with_block_size would read back.
+    PackedVec<T> quant_vec = *reinterpret_cast<PackedVec<T> const*>(&inter_vec.packed);
+    auto* sf = cvt_quant_get_sf_out_offset<uint32_t, kThreadsPerSf>(
+        std::nullopt, bid, tid, num_rows, num_sf_cols, sf_out, QuantizationSFLayout::SWIZZLED);
+    quant_out[block_offset / kPackedSize + tid] = cvt_warp_fp16_to_mxfp8<T, kSfVecSize>(quant_vec, sf);
+
+    __threadfence();
+    __syncthreads();
     cudaTriggerProgrammaticLaunchCompletion();
 #endif
 }
@@ -2003,6 +2093,75 @@ void residualRmsNorm(
     case tensorrt_llm::DataType::kBF16: launchResidualRmsNormKernel<__nv_bfloat16>(params, stream, fusionOp); break;
 #endif
     default: TLLM_THROW("Unsupported dataType for customAllReduce");
+    }
+    sync_check_cuda_error(stream);
+}
+
+bool residualRmsNormMxfp8Supported(tensorrt_llm::DataType dataType, int hiddenSize)
+{
+    // MXFP8 conversion needs SM100+. One 16-byte access per thread in one CTA, whole warps (so a row has a multiple
+    // of four scale columns: no padded scale columns to zero).
+    static int const sm = tensorrt_llm::common::getSMVersion();
+    int const accesses = hiddenSize / 8;
+    return sm >= 100 && (dataType == tensorrt_llm::DataType::kHALF || dataType == tensorrt_llm::DataType::kBF16)
+        && hiddenSize % 32 == 0 && accesses <= reduce_fusion::details::kMaxCtaSize
+        && accesses % reduce_fusion::details::kWarpSize == 0;
+}
+
+template <typename T, bool Residual, bool Affine>
+void launchResidualRmsNormMxfp8Kernel(
+    kernels::AllReduceParams& params, void* quantOut, void* sfOut, int numRows, cudaStream_t stream)
+{
+    int const ctaSize = params.fusion_params.hidden_size / 8;
+    // Rows padded to 128 for the swizzled scale layout; the extra CTAs only zero the padded scales.
+    int const ctaNum = (numRows + 127) / 128 * 128;
+    cudaLaunchConfig_t kernelConfig = {0};
+    kernelConfig.gridDim = ctaNum;
+    kernelConfig.blockDim = ctaSize;
+    kernelConfig.dynamicSmemBytes = 0;
+    kernelConfig.stream = stream;
+    cudaLaunchAttribute attribute[1];
+    attribute[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    attribute[0].val.programmaticStreamSerializationAllowed = tensorrt_llm::common::getEnvEnablePDL() ? 1 : 0;
+    kernelConfig.attrs = attribute;
+    kernelConfig.numAttrs = 1;
+    TLLM_CUDA_CHECK(cudaLaunchKernelEx(&kernelConfig, reduce_fusion::rms_norm_mxfp8_kernel<T, Residual, Affine>, params,
+        reinterpret_cast<uint64_t*>(quantOut), reinterpret_cast<uint32_t*>(sfOut), numRows));
+}
+
+template <typename T>
+void launchResidualRmsNormMxfp8(
+    kernels::AllReduceParams& params, void* quantOut, void* sfOut, int numRows, cudaStream_t stream)
+{
+    bool const residual = params.fusion_params.residual_buffer != nullptr;
+    bool const affine = params.fusion_params.weight_buffer != nullptr;
+    if (residual && affine)
+        launchResidualRmsNormMxfp8Kernel<T, true, true>(params, quantOut, sfOut, numRows, stream);
+    else if (residual)
+        launchResidualRmsNormMxfp8Kernel<T, true, false>(params, quantOut, sfOut, numRows, stream);
+    else if (affine)
+        launchResidualRmsNormMxfp8Kernel<T, false, true>(params, quantOut, sfOut, numRows, stream);
+    else
+        launchResidualRmsNormMxfp8Kernel<T, false, false>(params, quantOut, sfOut, numRows, stream);
+}
+
+void residualRmsNormMxfp8(kernels::AllReduceParams& params, tensorrt_llm::DataType dataType, void* quantOut,
+    void* sfOut, int numRows, cudaStream_t stream)
+{
+    TLLM_CHECK_WITH_INFO(residualRmsNormMxfp8Supported(dataType, params.fusion_params.hidden_size),
+        "residualRmsNormMxfp8: unsupported data type or hidden size %d", params.fusion_params.hidden_size);
+    sync_check_cuda_error(stream);
+    switch (dataType)
+    {
+    case tensorrt_llm::DataType::kHALF:
+        launchResidualRmsNormMxfp8<half>(params, quantOut, sfOut, numRows, stream);
+        break;
+#ifdef ENABLE_BF16
+    case tensorrt_llm::DataType::kBF16:
+        launchResidualRmsNormMxfp8<__nv_bfloat16>(params, quantOut, sfOut, numRows, stream);
+        break;
+#endif
+    default: TLLM_THROW("Unsupported dataType for residualRmsNormMxfp8");
     }
     sync_check_cuda_error(stream);
 }

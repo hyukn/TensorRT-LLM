@@ -848,6 +848,57 @@ private:
         return {};
     }
 
+    // RESIDUAL_RMS_NORM_OUT_QUANT_MXFP8 after a non-fused AllReduce (NCCL, NCCL_SYMMETRIC, UB, ...): residual + RMSNorm
+    // and the MXFP8 quantization of the norm output in one kernel. Returns {norm, E4M3 [M, H], UE8M0 1x32 scales in
+    // the 128x4 swizzled layout, residual}, bit-identical to RESIDUAL_RMS_NORM followed by mxfp8_quantize(norm, true).
+    std::vector<torch::Tensor> fallbackResidualRmsNormMxfp8(torch::Tensor const& input,
+        tensorrt_llm::kernels::AllReduceParams& params, torch::Tensor& norm_out, torch::Tensor& reduce_output,
+        cudaStream_t stream)
+    {
+        int64_t constexpr kSfVecSize = 32;
+        int64_t const hidden_size = input.size(-1);
+        int64_t const num_rows = input.numel() / hidden_size;
+        TORCH_CHECK(input.scalar_type() == torch::kFloat16 || input.scalar_type() == torch::kBFloat16,
+            "MXFP8 quantization requires FP16 or BF16 input");
+        TORCH_CHECK(hidden_size % kSfVecSize == 0, "hidden dimension must be divisible by 32 for MXFP8 quantization");
+        torch::Tensor quant_out
+            = at::detail::empty_cuda(input.sizes(), torch::kFloat8_e4m3fn, input.device(), std::nullopt);
+        torch::Tensor scale_out
+            = at::detail::empty_cuda({tensorrt_llm::computeSwizzledLayoutSFSize(num_rows, hidden_size / kSfVecSize)},
+                SF_DTYPE, input.device(), std::nullopt);
+        if (num_rows > 0 && tensorrt_llm::kernels::residualRmsNormMxfp8Supported(mType, static_cast<int>(hidden_size)))
+        {
+            tensorrt_llm::kernels::residualRmsNormMxfp8(params, mType, quant_out.mutable_data_ptr(),
+                scale_out.mutable_data_ptr(), static_cast<int>(num_rows), stream);
+            return {norm_out, quant_out, scale_out, reduce_output};
+        }
+        // Shapes the fused kernel does not take: the same two kernels as RESIDUAL_RMS_NORM + mxfp8_quantize.
+        tensorrt_llm::kernels::residualRmsNorm(params, mType, stream, AllReduceFusionOp::RESIDUAL_RMS_NORM);
+        if (num_rows > 0)
+        {
+            int const sm_count = tensorrt_llm::common::getMultiProcessorCount();
+            auto* quant_ptr = reinterpret_cast<int64_t*>(quant_out.mutable_data_ptr());
+            auto* scale_ptr = reinterpret_cast<int32_t*>(scale_out.mutable_data_ptr());
+            if (input.scalar_type() == torch::kFloat16)
+            {
+                tensorrt_llm::kernels::invokeMxFP8Quantization(1, static_cast<int>(num_rows),
+                    static_cast<int>(hidden_size), static_cast<int>(hidden_size),
+                    reinterpret_cast<half const*>(norm_out.data_ptr()), quant_ptr, scale_ptr,
+                    tensorrt_llm::QuantizationSFLayout::SWIZZLED, sm_count, stream);
+            }
+            else
+            {
+#ifdef ENABLE_BF16
+                tensorrt_llm::kernels::invokeMxFP8Quantization(1, static_cast<int>(num_rows),
+                    static_cast<int>(hidden_size), static_cast<int>(hidden_size),
+                    reinterpret_cast<__nv_bfloat16 const*>(norm_out.data_ptr()), quant_ptr, scale_ptr,
+                    tensorrt_llm::QuantizationSFLayout::SWIZZLED, sm_count, stream);
+#endif
+            }
+        }
+        return {norm_out, quant_out, scale_out, reduce_output};
+    }
+
     std::vector<torch::Tensor> fallbackRunSubsequentOps(torch::Tensor const& input,
         torch::optional<torch::Tensor> const& residual, torch::optional<torch::Tensor> const& norm_weight,
         torch::optional<torch::Tensor> const& scale, torch::optional<torch::Tensor> const& bias,
@@ -879,6 +930,11 @@ private:
             params.fusion_params.residual_buffer = nullptr;
             tensorrt_llm::kernels::residualRmsNorm(params, mType, stream, AllReduceFusionOp::RESIDUAL_RMS_NORM);
             return {norm_out};
+        }
+
+        if (mOp == AllReduceFusionOp::RESIDUAL_RMS_NORM_OUT_QUANT_MXFP8)
+        {
+            return fallbackResidualRmsNormMxfp8(input, params, norm_out, reduce_output, stream);
         }
 
         // All remaining patterns use residual + rmsnorm.
