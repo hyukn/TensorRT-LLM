@@ -22,7 +22,7 @@ from __future__ import annotations
 import copy
 import dataclasses
 import os
-from typing import Any, Dict, List, Literal, Optional, Tuple
+from typing import Any, Dict, List, Literal, Optional, Tuple, Union
 from typing import Mapping as TMapping
 
 import torch
@@ -585,6 +585,11 @@ _AR_MXFP8_QKV = os.environ.get("TRTLLM_M3_AR_MXFP8_QKV", "0") == "1"
 # The copy is exact, so the router logits are bitwise unchanged. Needs the C++ op
 # (libtensorrt_llm.so + libth_common.so with that fusion op).
 _AR_F32_ROUTER = os.environ.get("TRTLLM_M3_AR_F32_ROUTER", "0") == "1"
+# TRTLLM_M3_AR_FUSED_MOE_ADD=1: the MoE hands its shared and routed outputs unsummed to the layer-boundary
+# MNNVL AllReduce (POST fusion), which adds them before the reduction (fp32 add, one bf16 rounding, as the
+# separate add does), dropping the elementwise add launch that joins the two branches. Bitwise. Needs the
+# C++ op (libtensorrt_llm.so + libth_common.so with the input_add argument).
+_AR_FUSED_MOE_ADD = os.environ.get("TRTLLM_M3_AR_FUSED_MOE_ADD", "0") == "1"
 
 
 def _open_attn_out_mxfp8_request() -> Optional[Mxfp8OutputRequest]:
@@ -906,8 +911,20 @@ class MiniMaxM3MoE(nn.Module):
         attn_metadata: AttentionMetadata,
         final_all_reduce_params: Optional[AllReduceParams] = None,
         lora_params: Optional[dict] = None,
-    ) -> torch.Tensor:
+        return_partials: bool = False,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        """MoE output, or the unsummed ``(shared_output, routed_output)`` pair.
+
+        ``return_partials`` is for a caller that folds the branch add into its
+        own AllReduce (input_add); it requires a shared expert, a still-local
+        routed output and a deferred output AllReduce.
+        """
         all_rank_num_tokens = attn_metadata.all_rank_num_tokens
+        if return_partials:
+            assert self.shared_experts is not None and not self.routed_output_is_global
+            assert (
+                final_all_reduce_params is not None and not final_all_reduce_params.enable_allreduce
+            )
 
         def _compute_routed_output():
             router_logits = self.gate(hidden_states)
@@ -946,6 +963,8 @@ class MiniMaxM3MoE(nn.Module):
                     shared_output, all_reduce_params=final_all_reduce_params
                 )
                 return shared_output.add_(routed_output)
+            if return_partials:
+                return shared_output, routed_output
             # In-place add into ``shared_output`` to avoid allocating a temporary
             # (matches DeepSeekV3 / GLM convention).
             result = shared_output.add_(routed_output)
@@ -2837,6 +2856,7 @@ class MiniMaxM3DecoderLayer(DecoderLayer):
         self,
         hidden_states: torch.Tensor,
         residual: torch.Tensor,
+        input_add: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Apply the next layer's input_layernorm at the layer boundary.
 
@@ -2847,7 +2867,13 @@ class MiniMaxM3DecoderLayer(DecoderLayer):
         standalone unit test that never ran setup_aliases) the
         (hidden_states, residual) pair is returned unchanged so the model can
         apply the final norm itself.
+
+        ``input_add`` is a second local partial (the MoE's routed output) that
+        the fused AllReduce adds to ``hidden_states`` before the reduction.
         """
+        if input_add is not None and not self.post_feed_forward_fusion:
+            hidden_states = hidden_states + input_add
+            input_add = None
         if self.next_layer_layernorm is None:
             return hidden_states, residual
         if self.post_feed_forward_fusion:
@@ -2861,6 +2887,7 @@ class MiniMaxM3DecoderLayer(DecoderLayer):
                         norm_weight=self.next_layer_layernorm.weight,
                         eps=self.next_layer_layernorm.variance_epsilon,
                         trigger_completion_at_end=False,
+                        input_add=input_add,
                     ),
                 )
                 next_attn.stage_mxfp8_qkv_input(
@@ -2878,6 +2905,7 @@ class MiniMaxM3DecoderLayer(DecoderLayer):
                     norm_weight=self.next_layer_layernorm.weight,
                     eps=self.next_layer_layernorm.variance_epsilon,
                     trigger_completion_at_end=False,
+                    input_add=input_add,
                 ),
             )
         return self.next_layer_layernorm(hidden_states, residual)
@@ -2915,17 +2943,47 @@ class MiniMaxM3DecoderLayer(DecoderLayer):
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         hidden_states, residual = self._apply_pre_feed_forward_norm(hidden_states, residual)
 
-        hidden_states = self.block_sparse_moe(
-            hidden_states,
-            attn_metadata,
-            final_all_reduce_params=self._feed_forward_all_reduce_params(),
-            lora_params=lora_params,
-        )
+        if self._fused_moe_add(hidden_states, lora_params):
+            shared_output, routed_output = self.block_sparse_moe(
+                hidden_states,
+                attn_metadata,
+                final_all_reduce_params=self._feed_forward_all_reduce_params(),
+                lora_params=lora_params,
+                return_partials=True,
+            )
+            if (
+                routed_output.shape == shared_output.shape
+                and routed_output.dtype == shared_output.dtype
+            ):
+                return self._apply_next_layer_layernorm(
+                    shared_output, residual, input_add=routed_output
+                )
+            hidden_states = shared_output.add_(routed_output)
+        else:
+            hidden_states = self.block_sparse_moe(
+                hidden_states,
+                attn_metadata,
+                final_all_reduce_params=self._feed_forward_all_reduce_params(),
+                lora_params=lora_params,
+            )
 
         if spec_metadata is not None and spec_metadata.is_layer_capture(self.layer_idx):
             spec_metadata.maybe_capture_hidden_states(self.layer_idx, hidden_states, residual)
         hidden_states, residual = self._apply_next_layer_layernorm(hidden_states, residual)
         return hidden_states, residual
+
+    def _fused_moe_add(self, hidden_states: torch.Tensor, lora_params: Optional[dict]) -> bool:
+        """Whether the MoE's shared+routed add should be folded into the boundary MNNVL AllReduce."""
+        if not _AR_FUSED_MOE_ADD or lora_params is not None or hidden_states.dim() != 2:
+            return False
+        if not self.post_feed_forward_fusion or self.next_layer_layernorm is None:
+            return False
+        if is_torch_compiling() or torch.compiler.is_compiling():
+            return False
+        if self.allreduce is None or getattr(self.allreduce, "mnnvl_allreduce", None) is None:
+            return False
+        moe = self.block_sparse_moe
+        return moe.shared_experts is not None and not moe.routed_output_is_global
 
     def forward_mlp(
         self,
