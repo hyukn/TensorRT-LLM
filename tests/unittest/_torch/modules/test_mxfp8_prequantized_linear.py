@@ -93,3 +93,23 @@ def test_prequantized_rejected_outside_decode_graph_path():
     with flashinfer_mxfp8_decode_graph_capture():
         with pytest.raises(RuntimeError, match="pre-quantized"):
             lin(MxFp8QuantizedTensor(fp8_tensor=act, scaling_factor=act_sf, is_sf_swizzled=False))
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_attn_out_request_lookup_is_traceable(monkeypatch, enabled):
+    """The attention core runs under torch.compile on context paths: the request lookup must not break tracing."""
+    import tensorrt_llm._torch.models.modeling_minimaxm3 as m3
+    from tensorrt_llm._torch.modules.mxfp8_triton import Mxfp8OutputRequest, mxfp8_output_request
+
+    monkeypatch.setattr(m3, "_ATTN_OUT_MXFP8", enabled)
+
+    def core(x):
+        request = m3._open_attn_out_mxfp8_request()
+        return x + (0 if request is None else 1)
+
+    compiled = torch.compile(core, fullgraph=True, backend="eager")
+    x = torch.zeros(4)
+    request = Mxfp8OutputRequest(fp8=torch.empty(0), sf=torch.empty(0))
+    with mxfp8_output_request(request):
+        assert torch.equal(compiled(x), x)  # traced: never sees the request
+        assert torch.equal(core(x), x + (1 if enabled else 0))  # eager: sees it only when enabled

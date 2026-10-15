@@ -1390,7 +1390,7 @@ def _minimax_m3_sparse_attn_decode_triton(
             else {}
         )
         if not _launch_merge_mxfp8(
-            current_mxfp8_output_request(),
+            None if torch.compiler.is_compiling() else current_mxfp8_output_request(),
             o_arg,
             lse_arg,
             output,

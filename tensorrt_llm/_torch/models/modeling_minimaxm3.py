@@ -576,6 +576,18 @@ _MOE_PREQUANT_OVERLAP = os.environ.get("TRTLLM_M3_MOE_PREQUANT_OVERLAP", "0") ==
 _ATTN_OUT_MXFP8 = os.environ.get("TRTLLM_M3_ATTN_OUT_MXFP8", "0") == "1"
 
 
+def _open_attn_out_mxfp8_request() -> Optional[Mxfp8OutputRequest]:
+    """The MXFP8 output request an eager attention forward opened, if any.
+
+    Only consulted with TRTLLM_M3_ATTN_OUT_MXFP8=1 and outside torch.compile: the
+    attention core is traced on the compiled (context) paths, and a ContextVar
+    lookup is not traceable.
+    """
+    if not _ATTN_OUT_MXFP8 or is_torch_compiling() or torch.compiler.is_compiling():
+        return None
+    return current_mxfp8_output_request()
+
+
 def _moe_prequant_backend(experts: nn.Module) -> Optional[nn.Module]:
     """The routed-expert backend whose input quantize can run ahead of the router, or None.
 
@@ -823,7 +835,9 @@ class MiniMaxM3MoE(nn.Module):
         """Whether this forward takes the routed-input pre-quantize path (see _MOE_PREQUANT_OVERLAP)."""
         if not _MOE_PREQUANT_OVERLAP or self.shared_experts is None or lora_params is not None:
             return False
-        if self.aux_stream is None or not do_multi_stream() or is_torch_compiling():
+        if is_torch_compiling() or torch.compiler.is_compiling():
+            return False
+        if self.aux_stream is None or not do_multi_stream():
             return False
         if hidden_states.dim() != 2 or _moe_prequant_backend(self.experts) is None:
             return False
@@ -2072,7 +2086,9 @@ class MiniMaxM3Attention(Attention):
         """
         if not _ATTN_OUT_MXFP8 or not self.is_sparse_attention_layer:
             return None
-        if not isinstance(self.attn, MiniMaxM3MsaSparseAttention) or is_torch_compiling():
+        if not isinstance(self.attn, MiniMaxM3MsaSparseAttention):
+            return None
+        if is_torch_compiling() or torch.compiler.is_compiling():
             return None
         if self.register_to_config and is_in_breakable_cuda_graph():
             return None
@@ -2101,12 +2117,15 @@ class MiniMaxM3Attention(Attention):
     ) -> torch.Tensor:
         """Attention core + o_proj, handing o_proj the MXFP8 activation when the core made it."""
         request = self._attn_out_mxfp8_request(q, attn_metadata)
-        with mxfp8_output_request(request):
+        if request is None:
             o = self._forward_attention_core(q, k, v, idx_q, idx_k, attn_metadata)
-        if request is not None and request.written:
-            o = MxFp8QuantizedTensor(
-                fp8_tensor=request.fp8, scaling_factor=request.sf, is_sf_swizzled=True
-            )
+        else:
+            with mxfp8_output_request(request):
+                o = self._forward_attention_core(q, k, v, idx_q, idx_k, attn_metadata)
+            if request.written:
+                o = MxFp8QuantizedTensor(
+                    fp8_tensor=request.fp8, scaling_factor=request.sf, is_sf_swizzled=True
+                )
         # all_reduce_params lets the decoder defer the o_proj output AllReduce so
         # it can be fused with post_attention_layernorm (RESIDUAL_RMS_NORM).
         # Passing None preserves the standalone o_proj reduction used by the
@@ -2128,7 +2147,7 @@ class MiniMaxM3Attention(Attention):
             (q.shape[0], self.num_heads * self.head_dim),
             dtype=self.attn_activation_dtype,
         )
-        request = current_mxfp8_output_request()
+        request = _open_attn_out_mxfp8_request()
         if request is not None:
             request.out_ptr = output.data_ptr()
         if self.register_to_config and (is_torch_compiling() or is_in_breakable_cuda_graph()):
