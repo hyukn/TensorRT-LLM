@@ -3360,13 +3360,19 @@ _FLASHINFER_MXFP8_DECODE_GRAPH_CAPTURE_ACTIVE = ContextVar(
 
 
 @contextmanager
-def flashinfer_mxfp8_autotune() -> Iterator[None]:
-    """Tune FlashInfer MXFP8 tactics while enabling auto-dispatched calls."""
+def flashinfer_mxfp8_autotune(cache: Optional[str] = None) -> Iterator[None]:
+    """Tune FlashInfer MXFP8 tactics while enabling auto-dispatched calls.
+
+    Args:
+        cache: Optional FlashInfer tactic file. Its configs are loaded on entry
+            (a loaded config is a cache hit, so that shape is not profiled
+            again) and newly profiled configs are saved to it on exit.
+    """
     from flashinfer import autotune
 
     token = _FLASHINFER_MXFP8_AUTOTUNE_ACTIVE.set(True)
     try:
-        with autotune():
+        with (autotune(cache=cache) if cache else autotune()):
             yield
     finally:
         _FLASHINFER_MXFP8_AUTOTUNE_ACTIVE.reset(token)

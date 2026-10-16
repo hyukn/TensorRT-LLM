@@ -363,6 +363,26 @@ def _set_moe_a2a_warmup(in_warmup: bool) -> None:
             f"budget was not switched: {type(e).__name__}: {e}")
 
 
+PIN_GRAPH_TACTICS_ENV = "TLLM_AUTOTUNER_PIN_GRAPH_TACTICS"
+
+
+def graph_tactic_cache_paths(rank: int) -> Tuple[Optional[str], Optional[str]]:
+    """Return the (TRT-LLM, FlashInfer) files that pin the decode-graph tactics.
+
+    The MXFP8 decode-graph backends (quantize and GEMM per token bucket) are
+    picked while the generation CUDA graphs warm up, after the autotuner pass
+    has saved ``TLLM_AUTOTUNER_CACHE_PATH``, and FlashInfer keeps its own MXFP8
+    configs in memory only, so every launch re-profiles these near-tie picks.
+    With ``TLLM_AUTOTUNER_PIN_GRAPH_TACTICS=1`` and a cache path, both are
+    persisted (FlashInfer per rank, next to the TRT-LLM file) and later
+    launches load them instead of profiling. Returns ``(None, None)`` when off.
+    """
+    cache_path = os.environ.get("TLLM_AUTOTUNER_CACHE_PATH")
+    if not cache_path or os.environ.get(PIN_GRAPH_TACTICS_ENV, "0") != "1":
+        return None, None
+    return cache_path, f"{cache_path}.flashinfer.rank{rank}.json"
+
+
 class PyTorchModelEngine(ModelEngine):
 
     def __init__(
@@ -2384,8 +2404,10 @@ class PyTorchModelEngine(ModelEngine):
                                                 synchronize_trtllm_cache=True)
         ran_flashinfer_forward = False
         if enable_flashinfer_mxfp8_autotuner:
+            _, flashinfer_cache = graph_tactic_cache_paths(self.mapping.rank)
             ran_flashinfer_forward = run_autotuner_pass(
-                flashinfer_mxfp8_autotune(), synchronize_trtllm_cache=False)
+                flashinfer_mxfp8_autotune(cache=flashinfer_cache),
+                synchronize_trtllm_cache=False)
 
         if enable_flashinfer_mxfp8_autotuner:
             if ran_flashinfer_forward:
@@ -2715,12 +2737,20 @@ class PyTorchModelEngine(ModelEngine):
                         module, "quant_method", None)), MXFP8LinearMethod)
                     and quant_method.needs_flashinfer_autotune
                 ]
-                flashinfer_autotune_context = (
-                    flashinfer_mxfp8_autotune() if is_warmup_only
-                    and flashinfer_methods else contextlib.nullcontext())
+                tune_graph_tactics = is_warmup_only and bool(flashinfer_methods)
+                trtllm_cache, flashinfer_cache = graph_tactic_cache_paths(
+                    self.mapping.rank)
+                flashinfer_autotune_context = (flashinfer_mxfp8_autotune(
+                    cache=flashinfer_cache) if tune_graph_tactics else
+                                               contextlib.nullcontext())
                 with flashinfer_autotune_context, flashinfer_mxfp8_decode_graph_capture(
                 ):
                     self._capture_generation_cuda_graphs(resource_manager)
+                if tune_graph_tactics and trtllm_cache is not None:
+                    # The per-bucket MXFP8 backends were picked after the
+                    # autotuner pass saved its cache: persist them as well.
+                    AutoTuner.get().profiling_cache.save_cache(
+                        trtllm_cache, self.mapping.rank)
                 self._capture_mixed_encoder_decoder_cuda_graphs(
                     resource_manager)
         # Piecewise graphs have separate capture machinery and do not use the
