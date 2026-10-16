@@ -191,6 +191,26 @@ def get_from_waiting_queue(
     return items
 
 
+def pop_adp_admission_window(waiting_queue: "WaitingQueue", max_req_count: int) -> List:
+    """Pop up to ``max_req_count`` plain requests from the front of the waiting queue.
+
+    For a router that chooses which waiting requests to admit (see
+    ``KVBalancedADPRouter``): stops at the first request that has child
+    requests or an explicit attention-DP rank, which stays queued. The caller
+    prepends whatever it does not admit, in the returned order.
+    """
+    items = []
+    while len(items) < max_req_count and waiting_queue:
+        req_item = waiting_queue.peek_request()
+        scheduling_params = getattr(req_item.request, "py_scheduling_params", None)
+        if req_item.child_req_ids or (
+            scheduling_params is not None and scheduling_params.attention_dp_rank is not None
+        ):
+            break
+        items.append(waiting_queue.pop_request())
+    return items
+
+
 def partition_context_for_helix(
     input_token_ids: List[int], cp_rank: int, cp_size: int, tokens_per_block: int
 ) -> Tuple[List[int], List[int], int, int]:

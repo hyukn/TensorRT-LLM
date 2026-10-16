@@ -110,7 +110,8 @@ from .profiling import PROFILE_START_STOP_ENV_VAR_NAME, PyExecutorProfileManager
 from .profiling import load_iteration_indexes as _load_iteration_indexes
 from .request_utils import (RequestBroadcaster, attach_py_objects_to_requests,
                             derive_attention_dp_per_rank_request_cap,
-                            get_from_waiting_queue, merge_requests)
+                            get_from_waiting_queue, merge_requests,
+                            pop_adp_admission_window)
 from .resource_manager import (NoFreeSlotsError, ResourceManager,
                                ResourceManagerType, request_context)
 from .sampler import (AsyncWorkerMixin, Sampler, SamplerEvent, SampleState,
@@ -6217,6 +6218,14 @@ class PyExecutor:
         new_requests = self._pop_from_waiting_queue(
             waiting_queue, total_num_active_requests,
             all_ranks_num_active_requests)
+        # A router that chooses which waiting requests to admit also sees the
+        # next few (identical on every rank); the ones it skips go back to the
+        # front of the queue below.
+        admission_window = (getattr(self.adp_router, "admission_window", 0)
+                            if self.enable_attention_dp else 0)
+        window_requests = (pop_adp_admission_window(waiting_queue,
+                                                    admission_window)
+                           if admission_window > 0 and new_requests else [])
 
         # 4. Update performance metrics (before DP scheduling to clear all start_times)
         if self.enable_iter_perf_stats and self.dist.rank == 0:
@@ -6231,10 +6240,17 @@ class PyExecutor:
             if self.adp_router.needs_prefix_matches and new_requests:
                 self.adp_router.gather_prefix_matches(new_requests)
 
-            all_ranks_new_requests, self.expected_num_active_requests = \
-                self.adp_router.route_requests(
-                    all_rank_states, new_requests,
-                    self.max_num_active_requests)
+            if window_requests:
+                (all_ranks_new_requests, self.expected_num_active_requests,
+                 not_admitted) = self.adp_router.route_requests_with_window(
+                     all_rank_states, new_requests, window_requests,
+                     self.max_num_active_requests)
+                waiting_queue.prepend_requests(not_admitted)
+            else:
+                all_ranks_new_requests, self.expected_num_active_requests = \
+                    self.adp_router.route_requests(
+                        all_rank_states, new_requests,
+                        self.max_num_active_requests)
             new_requests_cur_rank = all_ranks_new_requests[self.dist.tp_rank]
 
             all_new_flat = [

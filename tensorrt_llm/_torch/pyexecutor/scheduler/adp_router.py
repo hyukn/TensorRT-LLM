@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import heapq
 import math
+import os
 import random
 from abc import ABC, abstractmethod
 from collections import OrderedDict, namedtuple
@@ -262,6 +263,14 @@ class ADPRouter(ABC):
                 account_for_in_transfer=attention_dp_config.kv_cache_routing_account_for_in_transfer,
             )
 
+        kv_balance_window = int(os.environ.get("TRTLLM_ADP_KV_BALANCE_WINDOW", "0"))
+        if kv_balance_window > 0:
+            return KVBalancedADPRouter(
+                dist=dist,
+                has_seq_slot_headroom=has_seq_slot_headroom,
+                admission_window=kv_balance_window,
+                max_skips=int(os.environ.get("TRTLLM_ADP_KV_BALANCE_MAX_SKIPS", "4")),
+            )
         return DefaultADPRouter(dist=dist, has_seq_slot_headroom=has_seq_slot_headroom)
 
     @abstractmethod
@@ -526,6 +535,120 @@ class DefaultADPRouter(ADPRouter):
             all_ranks_new_requests[rank].extend(reqs)
 
         return all_ranks_new_requests
+
+
+class KVBalancedADPRouter(DefaultADPRouter):
+    """DefaultADPRouter that also chooses *which* waiting requests to admit.
+
+    A saturated attention-DP server frees only one or two slots per
+    iteration, so the default router has no choice: whichever rank freed a
+    slot takes the next FCFS request, and the ranks' context-token loads (and
+    with them the attention time, which the slowest rank imposes on every
+    MoE dispatch) drift apart. This router also looks at the next
+    ``admission_window`` waiting requests and fills each free slot, lightest
+    rank first, with the candidate whose prompt length best brings that rank
+    to the expected mean load. It admits as many requests as the FCFS pop
+    would have, so throughput is unchanged; a request passed over
+    ``max_skips`` times is admitted at the next free slot, which bounds the
+    reordering. The result is deterministic in its inputs, which are
+    identical on every rank (allgathered states, identical waiting queue).
+    """
+
+    def __init__(
+        self,
+        dist: Distributed,
+        has_seq_slot_headroom: bool = False,
+        admission_window: int = 8,
+        max_skips: int = 4,
+    ):
+        super().__init__(dist=dist, has_seq_slot_headroom=has_seq_slot_headroom)
+        if admission_window < 1 or max_skips < 1:
+            raise ValueError("admission_window and max_skips must be positive")
+        self.admission_window = admission_window
+        self.max_skips = max_skips
+        # Request id -> times it was among the FCFS picks but not admitted.
+        self._skips: Dict[int, int] = {}
+
+    def route_requests_with_window(
+        self,
+        all_rank_states: list[RankState],
+        new_requests: list[RequestQueueItem],
+        window_requests: list[RequestQueueItem],
+        max_num_active_requests: int,
+    ) -> Tuple[Dict[int, List[RequestQueueItem]], int, List[RequestQueueItem]]:
+        """Route ``len(new_requests)`` requests chosen from ``new_requests + window_requests``.
+
+        Args:
+            all_rank_states: State of all ranks (from allgather).
+            new_requests: The FCFS pop for the free capacity.
+            window_requests: The next waiting requests (no explicit DP rank, no children).
+            max_num_active_requests: Maximum active requests per rank.
+
+        Returns:
+            (rank -> assigned requests, expected active requests per rank, the
+            candidates not admitted, in queue order, for the waiting queue's front).
+        """
+        tp_size = len(all_rank_states)
+        assigned: Dict[int, List[RequestQueueItem]] = {s.rank: [] for s in all_rank_states}
+        counts = [s.num_active_requests for s in all_rank_states]
+        tokens = [s.num_active_tokens for s in all_rank_states]
+
+        def get_relax_value(req_item):
+            scheduling_params = getattr(req_item.request, "py_scheduling_params", None)
+            if scheduling_params is None or scheduling_params.attention_dp_rank is None:
+                return True
+            val = scheduling_params.attention_dp_relax
+            return True if val is None else val
+
+        remaining = self._assign_explicit_dp_ranks(
+            sorted(new_requests, key=get_relax_value),
+            assigned,
+            counts,
+            max_num_active_requests,
+        )
+        expected = self._expected_num_active_requests(
+            counts, len(remaining), tp_size, hard_cap=max_num_active_requests
+        )
+        free = [max(expected - c, 0) for c in counts]
+        num_admit = min(len(remaining), sum(free))
+
+        candidates = [(_num_input_tokens(item.request), item) for item in remaining]
+        candidates += [(_num_input_tokens(item.request), item) for item in window_requests]
+        fcfs_ids = [item.id for _, item in candidates[:num_admit]]
+        target = (sum(tokens) + sum(n for n, _ in candidates[:num_admit])) / tp_size
+
+        for _ in range(num_admit):
+            rank = min(
+                (r for r in range(tp_size) if free[r] > 0),
+                key=lambda r: (tokens[r], counts[r], r),
+            )
+            forced = [
+                i
+                for i, (_, item) in enumerate(candidates)
+                if self._skips.get(item.id, 0) >= self.max_skips
+            ]
+            if forced:
+                pick = forced[0]
+            else:
+                want = (target - tokens[rank]) / free[rank]
+                pick = min(range(len(candidates)), key=lambda i: (abs(candidates[i][0] - want), i))
+            num_tokens, item = candidates.pop(pick)
+            assigned[all_rank_states[rank].rank].append(item)
+            tokens[rank] += num_tokens
+            counts[rank] += 1
+            free[rank] -= 1
+
+        leftover = [item for _, item in candidates]
+        admitted_ids = {item.id for reqs in assigned.values() for item in reqs}
+        skips = {}
+        for item_id in fcfs_ids:
+            if item_id not in admitted_ids:
+                skips[item_id] = self._skips.get(item_id, 0) + 1
+        for item in leftover:
+            if item.id not in skips and item.id in self._skips:
+                skips[item.id] = self._skips[item.id]
+        self._skips = skips
+        return assigned, expected, leftover
 
 
 class KVCacheAwareADPRouter(ADPRouter):
