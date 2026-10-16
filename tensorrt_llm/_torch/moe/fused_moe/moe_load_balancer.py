@@ -1019,6 +1019,9 @@ moe_model_arch_list = [
     'GlmMoeDsaForCausalLM',
     'GptOssForCausalLM',
     'KimiK25ForConditionalGeneration',
+    # MiniMax-M3: the checkpoints declare the ConditionalGeneration arch.
+    'MiniMaxM3SparseForCausalLM',
+    'MiniMaxM3SparseForConditionalGeneration',
     'MixtralForCausalLM',
     'Llama4ForConditionalGeneration',
     'NemotronHForCausalLM',
