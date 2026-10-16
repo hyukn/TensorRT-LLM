@@ -354,3 +354,119 @@ def test_dispatch_falls_back_to_old_kernel_bitwise():
     case = _make_nvfp4_inputs([300, 1500], num_kv_heads=1, group=16, decode_query_len=4, seed=3)
     out = _run_v2(case, force=None)  # B=2: below the v2 threshold
     assert torch.equal(out, _run_nvfp4(case))
+
+
+# ---------------------------------------------------------------------------
+# Stream-K schedule (sparse_decode_v2_sk): a prep kernel builds every group's union, then a fixed
+# number of persistent CTAs walk equal contiguous shares of all groups' pages, merging a group's
+# segments in order. Per-page math is the split-K kernel's, so results agree within split-merge
+# rounding; small grids force groups to span several CTAs (and CTAs several groups).
+
+
+def _sk_cfg(dql, group, grid=None, wpt=4, groups=None):
+    ntiles = (dql * group + 15) // 16
+    cfg = dict(sk=1, ntiles=ntiles, wpt=wpt, stages=6, nsplit=1)
+    if grid is not None:
+        # The kernel needs groups <= 2 x grid (unless all pages fit one CTA's list).
+        if groups is not None and groups * 64 > 384:
+            grid = max(grid, (groups + 1) // 2)
+        cfg["grid"] = grid
+    return cfg
+
+
+@pytest.mark.parametrize("grid", [None, 1, 3, 7, 40])
+@pytest.mark.parametrize(
+    ("num_kv_heads", "group", "dql"), [(1, 16, 4), (4, 16, 4), (2, 8, 2), (1, 16, 1)]
+)
+@pytest.mark.parametrize("seqs", list(SEQS.values()), ids=list(SEQS.keys()))
+def test_sk_matches_v2_and_reference(num_kv_heads, group, dql, seqs, grid):
+    seq_lens = [max(s, dql) for s in seqs]
+    case = _make_nvfp4_inputs(
+        seq_lens, num_kv_heads=num_kv_heads, group=group, decode_query_len=dql, seed=41
+    )
+    case.q = case.q.to(torch.float8_e4m3fn)
+    ref_v2 = _run_v2(case)
+    out = _run_v2(case, _config=_sk_cfg(dql, group, grid, groups=len(seq_lens) * num_kv_heads))
+    assert torch.isfinite(out).all()
+    torch.testing.assert_close(out.float(), ref_v2.float(), rtol=1e-2, atol=1e-2)
+    torch.testing.assert_close(out.float(), _reference(case), rtol=3e-2, atol=3e-2)
+
+
+@pytest.mark.parametrize("grid", [None, 5, 64])
+@pytest.mark.parametrize("shared", [16, 10, 0])
+def test_sk_eagle_overlap_many_groups(shared, grid):
+    """Attention-DP shape: 4 KV heads, 4 query tokens, many requests with overlapping selections."""
+    seq_lens = [3000 + 517 * i for i in range(30)]
+    case = _make_nvfp4_inputs(seq_lens, num_kv_heads=4, group=16, decode_query_len=4, seed=43)
+    _eagle_overlap_topk(case, shared=shared, seed=shared + 1)
+    case.q = case.q.to(torch.float8_e4m3fn)
+    ref_v2 = _run_v2(case)
+    out = _run_v2(case, _config=_sk_cfg(4, 16, grid, groups=120))
+    torch.testing.assert_close(out.float(), ref_v2.float(), rtol=1e-2, atol=1e-2)
+    torch.testing.assert_close(out.float(), _reference(case), rtol=3e-2, atol=3e-2)
+
+
+@pytest.mark.parametrize("dql", [1, 4])
+def test_sk_zero_length_rows_are_zero_not_nan(dql):
+    seq_lens = [1024, 0, 512, 0]
+    case = _make_nvfp4_inputs(seq_lens, num_kv_heads=1, group=16, decode_query_len=dql, seed=21)
+    out = _run_v2(case, _config=_sk_cfg(dql, 16, 3))
+    assert torch.isfinite(out).all()
+    for r in (1, 3):
+        assert torch.equal(
+            out[r * dql : (r + 1) * dql], torch.zeros_like(out[r * dql : (r + 1) * dql])
+        )
+    torch.testing.assert_close(out.float(), _reference(case), rtol=3e-2, atol=3e-2)
+
+
+def test_sk_is_deterministic_and_graph_replayable():
+    case = _make_nvfp4_inputs(
+        [5000, 2049, 129, 7000, 300], num_kv_heads=4, group=16, decode_query_len=4
+    )
+    _eagle_overlap_topk(case, shared=10, seed=3)
+    cfg = _sk_cfg(4, 16, 9, groups=20)
+    first = _run_v2(case, _config=cfg)
+    out = torch.empty_like(first)
+
+    def run():
+        minimax_m3_sparse_attn_decode_v2(
+            case.q,
+            case.k_paged,
+            case.v_paged,
+            case.topk_idx,
+            case.block_table,
+            case.seq_lens,
+            sm_scale=SM_SCALE,
+            output=out,
+            decode_query_len=4,
+            _force="v2",
+            _config=cfg,
+            **case.scales,
+        )
+
+    run()
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run()
+    for _ in range(3):
+        out.zero_()
+        graph.replay()
+        torch.cuda.synchronize()
+        assert torch.equal(out, first)
+
+
+@pytest.mark.parametrize("mode", ["1", "2"])
+def test_sk_env_switch(monkeypatch, mode):
+    """Mode 2 always takes the stream-K path, mode 1 only from 0.6 x SMs groups on."""
+    case = _make_nvfp4_inputs(
+        [4097, 1025, 3000], num_kv_heads=4, group=16, decode_query_len=4, seed=7
+    )
+    monkeypatch.delenv("TRTLLM_M3_SPARSE_DECODE_V2_SK", raising=False)
+    base = _run_v2(case)
+    monkeypatch.setenv("TRTLLM_M3_SPARSE_DECODE_V2_SK", mode)
+    out = _run_v2(case)
+    if mode == "1":
+        assert torch.equal(out, base)  # 12 groups: still the one-shot kernel
+    else:
+        torch.testing.assert_close(out.float(), base.float(), rtol=1e-2, atol=1e-2)

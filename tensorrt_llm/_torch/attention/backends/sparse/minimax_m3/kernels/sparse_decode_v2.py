@@ -36,6 +36,21 @@ _STAGE_BYTES = 18432
 _UMMA_MAX_STAGES = 6  # 6 x 18 KB ring + 96 KB of UMMA operands fits the 227 KB of shared memory
 _MAX_SMEM = 200 * 1024
 _MAX_SPLIT = 16  # cluster merge needs <= 16 (non-portable cluster); keeps the merge cheap too
+_MAX_CAND = 64
+_SK_MAX_GROUPS = 1024
+# TRTLLM_M3_SPARSE_DECODE_V2_SK: run the mma.sync configuration under the stream-K schedule
+# (sparse_decode_v2_sk: a per-group union prep kernel, then one persistent CTA per SM walking equal
+# shares of all groups' union pages; same per-page math, a group's segments merge in order).
+#   1: where the one-CTA-per-group grid leaves SMs idle that splitting cannot fill without a wave
+#      tail (at least _SK_MIN_GROUP_FRACTION x SMs groups; GB300, 4 KV heads, 4 query tokens:
+#      26 requests 60.8 -> 57.3 us, 22 requests about even with the 3-way split, 19 slower);
+#   2: whenever eligible (tests, gates).
+_SK_ENV = "TRTLLM_M3_SPARSE_DECODE_V2_SK"
+_SK_MIN_GROUP_FRACTION = 0.6
+
+
+def _sk_mode() -> int:
+    return int(os.environ.get(_SK_ENV, "0") or 0)
 
 
 def _load_ext():
@@ -63,7 +78,12 @@ def _load_ext():
                 "-gencode=arch=compute_100a,code=sm_100a",
                 "-gencode=arch=compute_103a,code=sm_103a",
             ]
-            + (["-Xptxas=-v"] if os.environ.get("SDV2_PTXAS_VERBOSE") else []),
+            + (["-Xptxas=-v"] if os.environ.get("SDV2_PTXAS_VERBOSE") else [])
+            + [
+                f"-D{name}={int(os.environ[name])}"
+                for name in ("SDV2_PREFETCH_CANDS", "SDV2_SK_PAGE_BASE", "SDV2_SK_PER_TILE")
+                if os.environ.get(name)
+            ],
             build_directory=build_dir,
             verbose=bool(os.environ.get("SDV2_VERBOSE")),
         )
@@ -319,6 +339,20 @@ def minimax_m3_sparse_attn_decode_v2(
     if cfg is not None and cfg.get("umma"):
         cap = _UMMA_MAX_STAGES if int(cfg["umma"]) == 1 else 2
         cfg = dict(cfg, ntiles=4, stages=max(1, min(int(cfg["stages"]), cap)))
+    sk_mode = _sk_mode() if cfg is not None else 0
+    if (
+        sk_mode
+        and _config is None
+        and num_topk_chunks is None
+        and not cfg.get("umma")
+        and int(cfg["wpt"]) in (2, 4)
+    ):
+        groups = num_reqs * int(k_paged.shape[1])
+        sms = _sm_count(q.device)
+        if groups <= min(_SK_MAX_GROUPS, 2 * sms) and (
+            sk_mode == 2 or groups >= _SK_MIN_GROUP_FRACTION * sms
+        ):
+            cfg = dict(cfg, sk=1, nsplit=1, stages=6)
     if cfg is None:
         if _force == "v2":
             raise RuntimeError("v2 forced but the call is not eligible")
@@ -343,6 +377,26 @@ def minimax_m3_sparse_attn_decode_v2(
 
     ext = _load_ext()
     num_kv_heads = int(k_paged.shape[1])
+    if cfg.get("sk"):
+        _launch_sk(
+            ext,
+            cfg,
+            q,
+            k_paged,
+            v_paged,
+            k_block_scale,
+            v_block_scale,
+            k_global_scale,
+            v_global_scale,
+            topk_idx,
+            block_table,
+            seq_lens,
+            output,
+            decode_query_len,
+            sm_scale,
+            _debug,
+        )
+        return
     nsplit = int(cfg["nsplit"])
     ntiles = 4 if cfg.get("umma") else int(cfg["ntiles"])  # UMMA: one M=64 tile
     groups = num_reqs * num_kv_heads
@@ -386,6 +440,75 @@ def minimax_m3_sparse_attn_decode_v2(
         float(sm_scale) * math.log2(math.e),
         pdl,
         cluster_merge,
+    )
+
+
+def _launch_sk(
+    ext,
+    cfg,
+    q,
+    k_paged,
+    v_paged,
+    k_block_scale,
+    v_block_scale,
+    k_global_scale,
+    v_global_scale,
+    topk_idx,
+    block_table,
+    seq_lens,
+    output,
+    decode_query_len,
+    sm_scale,
+    debug=None,
+) -> None:
+    """Stream-K launch: `grid` (default: one per SM) persistent CTAs; scratch from the buffer arena."""
+    num_reqs = int(seq_lens.shape[0])
+    groups = num_reqs * int(k_paged.shape[1])
+    ntiles = int(cfg["ntiles"])
+    rows_pad = ntiles * 16
+    grid = int(cfg.get("grid") or _sm_count(q.device))
+    slots = grid + groups
+    part_o = _scratch(
+        (slots * rows_pad * HEAD_DIM,), torch.float16, "m3_sparse_decode_v2_sk_part_o"
+    )
+    part_ml = _scratch((slots * rows_pad * 2,), torch.float32, "m3_sparse_decode_v2_sk_part_ml")
+    per = groups * _MAX_CAND
+    unions = _scratch((4 * per + 2 * groups,), torch.int32, "m3_sparse_decode_v2_sk_unions")
+    u_blk, u_page, u_mask, u_wcum = (unions[i * per : (i + 1) * per] for i in range(4))
+    u_cnt = unions[4 * per : 4 * per + groups]
+    u_wsum = unions[4 * per + groups : 4 * per + 2 * groups]
+    pdl = os.environ.get("TRTLLM_ENABLE_PDL", "1") == "1"
+    ext.sparse_decode_v2_sk(
+        q,
+        k_paged.view(torch.uint8),
+        v_paged.view(torch.uint8),
+        k_block_scale.view(torch.uint8),
+        v_block_scale.view(torch.uint8),
+        k_global_scale,
+        v_global_scale,
+        topk_idx,
+        block_table,
+        seq_lens,
+        output,
+        part_o,
+        part_ml,
+        _counters(q.device),
+        u_blk,
+        u_page,
+        u_mask,
+        u_cnt,
+        u_wcum,
+        u_wsum,
+        debug
+        if debug is not None
+        else _EMPTY_DBG.setdefault(q.device, torch.empty(0, dtype=torch.int64, device=q.device)),
+        int(decode_query_len),
+        ntiles,
+        int(cfg["wpt"]),
+        int(cfg["stages"]),
+        grid,
+        float(sm_scale) * math.log2(math.e),
+        pdl,
     )
 
 
