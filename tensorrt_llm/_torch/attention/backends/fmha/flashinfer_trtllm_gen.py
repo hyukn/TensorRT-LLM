@@ -38,7 +38,9 @@ Example:
         fmha.forward(q, k, v, metadata, forward_args)
 """
 
+import contextlib
 import math
+import os
 from functools import lru_cache
 from typing import TYPE_CHECKING, List, Optional, Tuple
 
@@ -218,6 +220,30 @@ if IS_FLASHINFER_AVAILABLE:
 
 
 _MULTI_CTAS_KV_COUNTER_ALIGNMENT = 8
+
+# TRTLLM_GEN_DECODE_KV_SPLIT_OVERSUB=k: size the generation kernel's multi-CTA KV split for k x the SM count.
+# flashinfer's launcher gives every sequence floor(SMs / (Q tiles x KV heads x batch)) KV CTAs (one wave) and, once
+# that drops to 1, switches to a persistent kernel that walks each sequence's whole KV in one CTA. On a 152-SM GB300
+# with 4 KV heads that happens at 20 sequences: the Eagle3 draft attention of an attention-DP rank goes from ~0.4-0.9
+# ms to 1-2.7 ms per launch when the batch crosses 19 -> 20. With k > 1 the split stays > 1 (and grows with k), and
+# the hardware scheduler backfills SMs freed by short sequences. Same output within the split-reduction rounding.
+# Generation (decode) calls only. Default 1 (unchanged).
+_GEN_DECODE_KV_SPLIT_OVERSUB = max(
+    1, int(os.environ.get("TRTLLM_GEN_DECODE_KV_SPLIT_OVERSUB", "1"))
+)
+
+
+@contextlib.contextmanager
+def _oversubscribed_decode_split(sm_count: int):
+    """Make flashinfer's trtllm-gen decode launcher size its KV split for ``sm_count`` SMs for one call."""
+    import flashinfer.decode as fi_decode
+
+    original = fi_decode.get_device_sm_count
+    fi_decode.get_device_sm_count = lambda device: sm_count
+    try:
+        yield
+    finally:
+        fi_decode.get_device_sm_count = original
 
 
 def _get_multi_ctas_kv_counter_size(
@@ -783,6 +809,12 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
             device_index = torch.cuda.current_device()
         return get_multi_processor_count_for_device(device_index)
 
+    def _decode_split_sm_count(self) -> int:
+        """The SM count the generation launcher sizes its KV split for (the device's, times the oversubscription)."""
+        if self._multi_processor_count is None:
+            raise RuntimeError("The trtllm-gen SM count is not initialized.")
+        return self._multi_processor_count * _GEN_DECODE_KV_SPLIT_OVERSUB
+
     def _use_fp8_context_fmha(
         self,
         output: torch.Tensor,
@@ -814,11 +846,12 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
             self._multi_processor_count = self._get_multi_processor_count(q.device)
 
         # One counter per head per decoder sequence; beam search expands each
-        # request into ``beam_width`` sequences.
+        # request into ``beam_width`` sequences. Sized for the (possibly
+        # oversubscribed) SM count the generation launcher splits the KV for.
         required_counter_size = _get_multi_ctas_kv_counter_size(
             attn.num_heads,
             metadata.max_num_sequences or metadata.max_num_requests,
-            self._multi_processor_count,
+            self._decode_split_sm_count(),
         )
         counter_buffer = self._multi_ctas_kv_counter_buffer
         if (
@@ -1169,33 +1202,40 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
         )
         gen_bmm2_scale = bmm2_scale if fp8_context_fmha and bmm2_scale is not None else 1.0
 
-        flashinfer.decode.trtllm_batch_decode_with_kv_cache(
-            query=q_processed,
-            kv_cache=(kv_pool, kv_pool),
-            workspace_buffer=fmha_workspace,
-            block_tables=block_tables,
-            seq_lens=params.sequence_lengths,
-            max_seq_len=max_kv_len,
-            bmm1_scale=gen_bmm1_scale,
-            bmm2_scale=gen_bmm2_scale,
-            window_left=window_left,
-            out=params.output,
-            sinks=fwd.attention_sinks,
-            kv_layout=self._layout,
-            enable_pdl=self._enable_pdl,
-            backend="trtllm-gen",
-            q_len_per_req=q_len_per_req,
-            max_q_len=decode_max_q_len,
-            cum_seq_lens_q=decode_cu_seqlens,
-            kv_cache_sf=(kv_scale_pool, kv_scale_pool) if kv_scale_pool is not None else None,
-            uses_shared_paged_kv_idx=self.USE_SHARED_PAGED_KV_IDX,
-            bmm1_scale_log2=(
-                _get_bmm1_scale_log2(gen_bmm1_scale)
-                if isinstance(gen_bmm1_scale, torch.Tensor)
-                else None
-            ),
-            multi_ctas_kv_counter_buffer=self._get_multi_ctas_kv_counter_buffer(),
+        # The launcher reads the SM count at call time; oversubscribe it for this call only.
+        split = (
+            _oversubscribed_decode_split(self._decode_split_sm_count())
+            if _GEN_DECODE_KV_SPLIT_OVERSUB > 1
+            else contextlib.nullcontext()
         )
+        with split:
+            flashinfer.decode.trtllm_batch_decode_with_kv_cache(
+                query=q_processed,
+                kv_cache=(kv_pool, kv_pool),
+                workspace_buffer=fmha_workspace,
+                block_tables=block_tables,
+                seq_lens=params.sequence_lengths,
+                max_seq_len=max_kv_len,
+                bmm1_scale=gen_bmm1_scale,
+                bmm2_scale=gen_bmm2_scale,
+                window_left=window_left,
+                out=params.output,
+                sinks=fwd.attention_sinks,
+                kv_layout=self._layout,
+                enable_pdl=self._enable_pdl,
+                backend="trtllm-gen",
+                q_len_per_req=q_len_per_req,
+                max_q_len=decode_max_q_len,
+                cum_seq_lens_q=decode_cu_seqlens,
+                kv_cache_sf=(kv_scale_pool, kv_scale_pool) if kv_scale_pool is not None else None,
+                uses_shared_paged_kv_idx=self.USE_SHARED_PAGED_KV_IDX,
+                bmm1_scale_log2=(
+                    _get_bmm1_scale_log2(gen_bmm1_scale)
+                    if isinstance(gen_bmm1_scale, torch.Tensor)
+                    else None
+                ),
+                multi_ctas_kv_counter_buffer=self._get_multi_ctas_kv_counter_buffer(),
+            )
 
     def run_mla_generation(
         self,
