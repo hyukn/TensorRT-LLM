@@ -574,10 +574,12 @@ _MOE_PREQUANT_OVERLAP = os.environ.get("TRTLLM_M3_MOE_PREQUANT_OVERLAP", "0") ==
 # the MXFP8 o_proj activation (bit-identical to the o_proj's own mxfp8_quantize), so the o_proj
 # quantize kernel drops out of every sparse layer.
 _ATTN_OUT_MXFP8 = os.environ.get("TRTLLM_M3_ATTN_OUT_MXFP8", "0") == "1"
-# TRTLLM_M3_AR_MXFP8_QKV=1: on decode graph steps the layer-boundary MNNVL AllReduce + residual + RMSNorm also
-# emits the MXFP8 quantization of the norm output (RESIDUAL_RMS_NORM_OUT_QUANT_MXFP8, bit-identical to the
-# qkv_proj's own mxfp8_quantize), and the next layer's fused QKV+index projection takes it, dropping one
-# quantize kernel per layer. Needs the C++ op (libtensorrt_llm.so + libth_common.so with that fusion op).
+# TRTLLM_M3_AR_MXFP8_QKV=1: on eager steps (decode graphs; context steps above the prefill-graph ceiling) the
+# layer-boundary AllReduce + residual + RMSNorm also emits the MXFP8 quantization of the norm output
+# (RESIDUAL_RMS_NORM_OUT_QUANT_MXFP8, bit-identical to the qkv_proj's own mxfp8_quantize), and the next layer's
+# fused QKV+index projection takes it, dropping one quantize kernel per layer. MNNVL AllReduce, or the NCCL /
+# NCCL_SYMMETRIC strategies (residual + RMSNorm + quantize as one kernel after the collective). Needs the C++ op
+# (libtensorrt_llm.so + libth_common.so with that fusion op on the strategy's path).
 _AR_MXFP8_QKV = os.environ.get("TRTLLM_M3_AR_MXFP8_QKV", "0") == "1"
 # TRTLLM_M3_AR_F32_ROUTER=1: the post-attention MNNVL AllReduce + residual + RMSNorm (PRE fusion)
 # also writes an fp32 copy of the norm output (RESIDUAL_RMS_NORM_OUT_F32), and the MoE router GEMM
@@ -596,6 +598,21 @@ _AR_FUSED_MOE_ADD = os.environ.get("TRTLLM_M3_AR_FUSED_MOE_ADD", "0") == "1"
 _AR_FUSED_MOE_ADD_MAX_BYTES = int(
     os.environ.get("TRTLLM_M3_AR_FUSED_MOE_ADD_MAX_BYTES", str(64 * 1024 * 8 * 2))
 )
+# TRTLLM_M3_AR_MXFP8_SHARED=1: like TRTLLM_M3_AR_MXFP8_QKV, for the AllReduce + residual + post_attention_layernorm
+# between attention and the MoE: it also emits the MXFP8 quantization of the norm output, and the shared expert's
+# gate_up GEMM takes it (the router and the routed experts keep reading the bf16 norm). Eager steps, same strategies
+# and C++ op as TRTLLM_M3_AR_MXFP8_QKV; where TRTLLM_M3_AR_F32_ROUTER also applies (MNNVL), that one wins.
+_AR_MXFP8_SHARED = os.environ.get("TRTLLM_M3_AR_MXFP8_SHARED", "0") == "1"
+
+
+def _allreduce_emits_mxfp8(allreduce: nn.Module) -> bool:
+    """Whether this AllReduce module runs RESIDUAL_RMS_NORM_OUT_QUANT_MXFP8 (MNNVL, or the non-fused NCCL paths)."""
+    if getattr(allreduce, "mnnvl_allreduce", None) is not None:
+        return True
+    return getattr(allreduce, "strategy", None) in (
+        AllReduceStrategy.NCCL,
+        AllReduceStrategy.NCCL_SYMMETRIC,
+    )
 
 
 def _open_attn_out_mxfp8_request() -> Optional[Mxfp8OutputRequest]:
@@ -911,6 +928,41 @@ class MiniMaxM3MoE(nn.Module):
         event_shared.wait()
         return routed_output, shared_output
 
+    def accepts_mxfp8_shared_input(self) -> bool:
+        """Whether the shared expert's next eager forward runs its gate_up projection as an MXFP8 GEMM that can
+        take a pre-quantized activation (see stage_mxfp8_shared_input)."""
+        mlp = self.shared_experts
+        if mlp is None or getattr(mlp, "split_gate_up", False):
+            return False
+        proj = getattr(mlp, "gate_up_proj", None)
+        quant_method = getattr(proj, "quant_method", None)
+        if getattr(proj, "lora", None) is not None or not isinstance(
+            quant_method, MXFP8LinearMethod
+        ):
+            return False
+        if mlp._can_fuse_gate_up_swiglu_fp4out() or mlp._can_fuse_gate_up_swiglu():
+            return False
+        return quant_method.accepts_prequantized_input(proj)
+
+    def stage_mxfp8_shared_input(
+        self, hidden_states: torch.Tensor, quantized: MxFp8QuantizedTensor
+    ) -> None:
+        """Hand the MXFP8 form of ``hidden_states`` (the exact tensor this MoE's forward will receive) to the shared
+        expert's gate_up projection; any other input leaves it unused."""
+        self._staged_mxfp8_shared_input = (hidden_states, quantized)
+
+    def _take_staged_mxfp8_shared_input(self, hidden_states: torch.Tensor):
+        staged = getattr(self, "_staged_mxfp8_shared_input", None)
+        self._staged_mxfp8_shared_input = None
+        if staged is not None and staged[0] is hidden_states:
+            logger.info_once(
+                "MiniMax-M3 shared expert takes the MXFP8 activation from the "
+                "post-attention AllReduce (TRTLLM_M3_AR_MXFP8_SHARED=1)",
+                key="m3_ar_mxfp8_shared_input",
+            )
+            return staged[1]
+        return hidden_states
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -931,6 +983,11 @@ class MiniMaxM3MoE(nn.Module):
             assert (
                 final_all_reduce_params is not None and not final_all_reduce_params.enable_allreduce
             )
+        # The shared expert's gate_up GEMM may take the MXFP8 activation staged by the AllReduce before this
+        # MoE (LoRA reads the bf16 activation, so it keeps it).
+        shared_input = self._take_staged_mxfp8_shared_input(hidden_states)
+        if lora_params is not None:
+            shared_input = hidden_states
 
         def _compute_routed_output():
             router_logits = self.gate(hidden_states)
@@ -943,7 +1000,7 @@ class MiniMaxM3MoE(nn.Module):
             )
 
         def _compute_shared_output():
-            return self.shared_experts(hidden_states, lora_params=lora_params)
+            return self.shared_experts(shared_input, lora_params=lora_params)
 
         if self.shared_experts is None:
             routed_output = _compute_routed_output()
@@ -2177,7 +2234,8 @@ class MiniMaxM3Attention(Attention):
             quant_method, MXFP8LinearMethod
         ):
             return None
-        if not quant_method.accepts_prequantized_input(self.o_proj):
+        # Decode-graph GEMM path only (accepts_prequantized_input also covers eager native GEMMs).
+        if not quant_method.on_decode_graph_path():
             return None
         if self.attn_activation_dtype != torch.bfloat16:
             return None
@@ -2835,6 +2893,25 @@ class MiniMaxM3DecoderLayer(DecoderLayer):
                 )
                 gate.stage_fp32_input(norm, norm_fp32)
                 return norm, residual
+            moe = self._mxfp8_shared_expert_moe(hidden_states)
+            if moe is not None:
+                norm, quant, scale, residual = self.allreduce(
+                    hidden_states,
+                    all_reduce_params=AllReduceParams(
+                        fusion_op=AllReduceFusionOp.RESIDUAL_RMS_NORM_OUT_QUANT_MXFP8,
+                        residual=residual,
+                        norm_weight=self.post_attention_layernorm.weight,
+                        eps=self.post_attention_layernorm.variance_epsilon,
+                        trigger_completion_at_end=False,
+                    ),
+                )
+                moe.stage_mxfp8_shared_input(
+                    norm,
+                    MxFp8QuantizedTensor(
+                        fp8_tensor=quant, scaling_factor=scale, is_sf_swizzled=True
+                    ),
+                )
+                return norm, residual
             return self.allreduce(
                 hidden_states,
                 all_reduce_params=AllReduceParams(
@@ -2857,6 +2934,17 @@ class MiniMaxM3DecoderLayer(DecoderLayer):
             return None
         gate = getattr(self.block_sparse_moe, "gate", None)
         return gate if isinstance(gate, MiniMaxM3Gate) else None
+
+    def _mxfp8_shared_expert_moe(self, hidden_states: torch.Tensor):
+        """This layer's MoE if the AllReduce before it should also quantize for the shared expert, else None."""
+        moe = getattr(self, "block_sparse_moe", None)
+        if not _AR_MXFP8_SHARED or moe is None or hidden_states.dim() != 2:
+            return None
+        if is_torch_compiling() or torch.compiler.is_compiling():
+            return None
+        if self.allreduce is None or not _allreduce_emits_mxfp8(self.allreduce):
+            return None
+        return moe if moe.accepts_mxfp8_shared_input() else None
 
     def _apply_next_layer_layernorm(
         self,
@@ -2924,7 +3012,7 @@ class MiniMaxM3DecoderLayer(DecoderLayer):
             return None
         if is_torch_compiling() or torch.compiler.is_compiling():
             return None
-        if self.allreduce is None or getattr(self.allreduce, "mnnvl_allreduce", None) is None:
+        if self.allreduce is None or not _allreduce_emits_mxfp8(self.allreduce):
             return None
         return next_attn if next_attn.accepts_mxfp8_qkv_input() else None
 

@@ -21,8 +21,13 @@ import torch
 from torch import nn
 
 import tensorrt_llm._torch.models.modeling_minimaxm3 as m3
-from tensorrt_llm._torch.models.modeling_minimaxm3 import MiniMaxM3Attention, MiniMaxM3DecoderLayer
+from tensorrt_llm._torch.models.modeling_minimaxm3 import (
+    MiniMaxM3Attention,
+    MiniMaxM3DecoderLayer,
+    MiniMaxM3MoE,
+)
 from tensorrt_llm._torch.utils import MxFp8QuantizedTensor
+from tensorrt_llm.functional import AllReduceStrategy
 
 pytestmark = pytest.mark.cpu_only
 
@@ -47,11 +52,13 @@ def test_staged_input_is_taken_only_for_the_same_tensor() -> None:
     assert attn._take_staged_mxfp8_qkv_input(hidden) is hidden  # and the stale entry was dropped
 
 
-def _layer(next_attn, mnnvl=True) -> MiniMaxM3DecoderLayer:
+def _layer(next_attn, mnnvl=True, strategy=AllReduceStrategy.AUTO) -> MiniMaxM3DecoderLayer:
     layer = MiniMaxM3DecoderLayer.__new__(MiniMaxM3DecoderLayer)
     nn.Module.__init__(layer)
     layer.next_layer_attn_ref = [next_attn] if next_attn is not None else []
-    layer.allreduce = SimpleNamespace(mnnvl_allreduce=object() if mnnvl else None)
+    layer.allreduce = SimpleNamespace(
+        mnnvl_allreduce=object() if mnnvl else None, strategy=strategy
+    )
     return layer
 
 
@@ -74,3 +81,68 @@ def test_next_layer_mxfp8_attention_gating(monkeypatch: pytest.MonkeyPatch) -> N
     assert _layer(accepting, mnnvl=False)._next_layer_mxfp8_attention(hidden) is None
     assert _layer(_NextAttn(False))._next_layer_mxfp8_attention(hidden) is None
     assert _layer(accepting)._next_layer_mxfp8_attention(hidden.unsqueeze(0)) is None
+    # Without MNNVL: the non-fused NCCL paths emit the MXFP8 output too (context servers use NCCL); the
+    # one-shot / two-shot kernels AUTO may pick do not.
+    for strategy in (AllReduceStrategy.NCCL, AllReduceStrategy.NCCL_SYMMETRIC):
+        layer = _layer(accepting, mnnvl=False, strategy=strategy)
+        assert layer._next_layer_mxfp8_attention(hidden) is accepting
+    for strategy in (AllReduceStrategy.AUTO, AllReduceStrategy.UB, AllReduceStrategy.ONESHOT):
+        assert (
+            _layer(accepting, mnnvl=False, strategy=strategy)._next_layer_mxfp8_attention(hidden)
+            is None
+        )
+
+
+def test_moe_staged_shared_input_is_taken_only_for_the_same_tensor() -> None:
+    moe = MiniMaxM3MoE.__new__(MiniMaxM3MoE)
+    nn.Module.__init__(moe)
+    hidden = torch.zeros(4, 8)
+    quantized = MxFp8QuantizedTensor(fp8_tensor=torch.zeros(4, 8), scaling_factor=torch.zeros(4))
+    moe.stage_mxfp8_shared_input(hidden, quantized)
+    assert moe._take_staged_mxfp8_shared_input(hidden) is quantized
+    assert moe._take_staged_mxfp8_shared_input(hidden) is hidden  # consumed
+    moe.stage_mxfp8_shared_input(hidden, quantized)
+    assert moe._take_staged_mxfp8_shared_input(hidden.clone()) is not quantized
+    assert moe._take_staged_mxfp8_shared_input(hidden) is hidden  # the stale entry was dropped
+
+
+class _Moe:
+    def __init__(self, accepts: bool) -> None:
+        self.accepts = accepts
+
+    def accepts_mxfp8_shared_input(self) -> bool:
+        return self.accepts
+
+
+def _moe_layer(moe, mnnvl=False, strategy=AllReduceStrategy.NCCL) -> MiniMaxM3DecoderLayer:
+    layer = _layer(None, mnnvl=mnnvl, strategy=strategy)
+    layer.block_sparse_moe = moe
+    return layer
+
+
+def test_shared_expert_mxfp8_gating(monkeypatch: pytest.MonkeyPatch) -> None:
+    hidden = torch.zeros(4, 8)
+    accepting = _Moe(True)
+    monkeypatch.setattr(m3, "_AR_MXFP8_SHARED", False)
+    assert _moe_layer(accepting)._mxfp8_shared_expert_moe(hidden) is None
+    monkeypatch.setattr(m3, "_AR_MXFP8_SHARED", True)
+    assert _moe_layer(accepting)._mxfp8_shared_expert_moe(hidden) is accepting
+    assert (
+        _moe_layer(accepting, strategy=AllReduceStrategy.NCCL_SYMMETRIC)._mxfp8_shared_expert_moe(
+            hidden
+        )
+        is accepting
+    )
+    assert (
+        _moe_layer(accepting, mnnvl=True, strategy=AllReduceStrategy.AUTO)._mxfp8_shared_expert_moe(
+            hidden
+        )
+        is accepting
+    )
+    assert (
+        _moe_layer(accepting, strategy=AllReduceStrategy.AUTO)._mxfp8_shared_expert_moe(hidden)
+        is None
+    )
+    assert _moe_layer(None)._mxfp8_shared_expert_moe(hidden) is None  # dense layers (no MoE)
+    assert _moe_layer(_Moe(False))._mxfp8_shared_expert_moe(hidden) is None
+    assert _moe_layer(accepting)._mxfp8_shared_expert_moe(hidden.unsqueeze(0)) is None

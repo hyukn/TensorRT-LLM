@@ -3549,35 +3549,91 @@ class MXFP8LinearMethod(LinearMethodBase):
         else:
             module.register_parameter("bias", None)
 
-    def accepts_prequantized_input(self, module: Linear) -> bool:
-        """Whether ``apply`` would take the decode-graph quantize + GEMM path right now.
-
-        On that path the activation quantize is ``torch.ops.trtllm.mxfp8_quantize(x, True)``
-        (or its bitwise-equal FlashInfer tactic), so a producer may hand over that result
-        as an ``MxFp8QuantizedTensor`` (swizzled scales) instead of the bf16 activation.
-        """
+    def on_decode_graph_path(self) -> bool:
+        """``apply`` runs the decode-graph quantize + GEMM (mxfp8_quantize_gemm_autotuned)."""
         return (self.use_cutlass and self.tune_decode_graph_backends
                 and not is_torch_compiling()
                 and _FLASHINFER_MXFP8_DECODE_GRAPH_CAPTURE_ACTIVE.get())
+
+    def on_eager_quantize_path(self) -> bool:
+        """``apply`` runs ``mxfp8_quantize(x, True)`` and then a GEMM on its result (``_quantized_gemm``).
+
+        Outside torch.compile and the decode-graph path, e.g. eager context steps above the
+        prefill-graph ceiling.
+        """
+        return (self.use_cutlass and not is_torch_compiling()
+                and not self.on_decode_graph_path())
+
+    def accepts_prequantized_input(self, module: Linear) -> bool:
+        """Whether ``apply`` would quantize its activation with ``mxfp8_quantize(x, True)`` right now.
+
+        That holds on the decode-graph quantize + GEMM path (or its bitwise-equal FlashInfer
+        tactic) and on the eager quantize + GEMM path, so a producer may hand over that result
+        as an ``MxFp8QuantizedTensor`` (swizzled scales) instead of the bf16 activation; the
+        GEMM that follows is the one the bf16 input would have run.
+        """
+        return self.on_decode_graph_path() or self.on_eager_quantize_path()
+
+    def _quantized_gemm(self, module: Linear, act_e4m3: torch.Tensor,
+                        act_sf: torch.Tensor) -> torch.Tensor:
+        """The GEMM that follows ``mxfp8_quantize(x, True)`` off the decode-graph path:
+        FlashInfer when selected, else the native CUTLASS block-scaled e4m3 x e4m3 GEMM."""
+        use_flashinfer = self.backend == "flashinfer" or (
+            self.backend == "auto" and not is_torch_compiling() and
+            (_FLASHINFER_MXFP8_AUTOTUNE_ACTIVE.get() or
+             (self._flashinfer_autotuned
+              and _FLASHINFER_MXFP8_DECODE_GRAPH_CAPTURE_ACTIVE.get())))
+        if use_flashinfer:
+            flashinfer_mxfp8 = self._flashinfer_mxfp8
+            assert flashinfer_mxfp8 is not None
+            return flashinfer_mxfp8(
+                act_e4m3,
+                act_sf,
+                module.weight,
+                module.weight_scale,
+                module.dtype,
+            )
+        # globalScale is the alpha multiplier; pure MXFP8xMXFP8 uses 1.0.
+        global_scale = torch.ones([1],
+                                  dtype=torch.float32,
+                                  device=act_e4m3.device)
+        gemm = (torch.ops.trtllm.mxfp8_mxfp8_gemm_autotuned
+                if self.needs_native_autotune else
+                torch.ops.trtllm.mxfp8_mxfp8_gemm)
+        return gemm(
+            act_e4m3,
+            act_sf,
+            module.weight,
+            module.weight_scale,
+            global_scale,
+            module.dtype,
+        )
 
     def apply(self, module: Linear, input: torch.Tensor,
               bias: Optional[torch.Tensor]):
         """Apply MXFP8 linear projection with eager or capture-safe dispatch."""
         if isinstance(input, MxFp8QuantizedTensor):
             # Pre-quantized by the producer (see accepts_prequantized_input).
-            if not (input.is_sf_swizzled
-                    and self.accepts_prequantized_input(module)):
+            if not input.is_sf_swizzled:
+                raise RuntimeError(
+                    "MXFP8 Linear got a pre-quantized activation with linear scales"
+                )
+            if self.on_decode_graph_path():
+                output = mxfp8_gemm_autotuned(
+                    input.fp8_tensor,
+                    input.scaling_factor,
+                    module.weight,
+                    module.weight_scale,
+                    module.dtype,
+                    tune=_FLASHINFER_MXFP8_AUTOTUNE_ACTIVE.get(),
+                )
+            elif self.on_eager_quantize_path():
+                output = self._quantized_gemm(module, input.fp8_tensor,
+                                              input.scaling_factor)
+            else:
                 raise RuntimeError(
                     "MXFP8 Linear got a pre-quantized activation outside the "
-                    "decode-graph FlashInfer path or with linear scales")
-            output = mxfp8_gemm_autotuned(
-                input.fp8_tensor,
-                input.scaling_factor,
-                module.weight,
-                module.weight_scale,
-                module.dtype,
-                tune=_FLASHINFER_MXFP8_AUTOTUNE_ACTIVE.get(),
-            )
+                    "decode-graph and eager quantize + GEMM paths")
             if bias is not None:
                 output = output + bias
             return output
@@ -3601,38 +3657,7 @@ class MXFP8LinearMethod(LinearMethodBase):
                 # Dynamic MXFP8 activation quantization (swizzled SF layout),
                 # then the CUTLASS block-scaled e4m3xe4m3 GEMM.
                 act_e4m3, act_sf = torch.ops.trtllm.mxfp8_quantize(input, True)
-                use_flashinfer = self.backend == "flashinfer" or (
-                    self.backend == "auto" and not is_torch_compiling() and
-                    (_FLASHINFER_MXFP8_AUTOTUNE_ACTIVE.get() or
-                     (self._flashinfer_autotuned
-                      and _FLASHINFER_MXFP8_DECODE_GRAPH_CAPTURE_ACTIVE.get())))
-                if use_flashinfer:
-                    flashinfer_mxfp8 = self._flashinfer_mxfp8
-                    assert flashinfer_mxfp8 is not None
-                    output = flashinfer_mxfp8(
-                        act_e4m3,
-                        act_sf,
-                        module.weight,
-                        module.weight_scale,
-                        module.dtype,
-                    )
-                else:
-                    # globalScale is the alpha multiplier; pure MXFP8xMXFP8
-                    # uses 1.0.
-                    global_scale = torch.ones([1],
-                                              dtype=torch.float32,
-                                              device=input.device)
-                    gemm = (torch.ops.trtllm.mxfp8_mxfp8_gemm_autotuned
-                            if self.needs_native_autotune else
-                            torch.ops.trtllm.mxfp8_mxfp8_gemm)
-                    output = gemm(
-                        act_e4m3,
-                        act_sf,
-                        module.weight,
-                        module.weight_scale,
-                        global_scale,
-                        module.dtype,
-                    )
+                output = self._quantized_gemm(module, act_e4m3, act_sf)
             if bias is not None:
                 output = output + bias
         else:

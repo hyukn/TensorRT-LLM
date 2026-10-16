@@ -14,6 +14,8 @@
 # limitations under the License.
 """An MXFP8 Linear fed a pre-quantized activation runs the GEMM its quantize + GEMM path would."""
 
+import contextlib
+
 import pytest
 import torch
 
@@ -55,6 +57,23 @@ def _tuned_linear(out_f: int, in_f: int) -> Linear:
     return lin
 
 
+def _native_linear(out_f: int, in_f: int) -> Linear:
+    torch.manual_seed(0)
+    weight = torch.randn(out_f, in_f, dtype=torch.bfloat16)
+    weight_e4m3, weight_scale = quant_bf16_to_mxfp8(weight, 32)
+    lin = Linear(
+        in_features=in_f,
+        out_features=out_f,
+        bias=False,
+        dtype=torch.bfloat16,
+        quant_config=QuantConfig(quant_algo=QuantAlgo.MXFP8, group_size=32),
+    ).cuda()
+    lin.load_weights([{"weight": weight_e4m3, "weight_scale_inv": weight_scale}])
+    assert isinstance(lin.quant_method, MXFP8LinearMethod)
+    assert lin.quant_method.backend == "trtllm"
+    return lin
+
+
 @pytest.mark.parametrize("num_tokens", [4, 24, 64])
 @pytest.mark.parametrize("out_f, in_f", [(6144, 2048), (512, 768)])
 def test_prequantized_matches_quantize_then_gemm(monkeypatch, num_tokens, out_f, in_f):
@@ -63,7 +82,7 @@ def test_prequantized_matches_quantize_then_gemm(monkeypatch, num_tokens, out_f,
     x = torch.randn(num_tokens, in_f, dtype=torch.bfloat16, device="cuda")
     with flashinfer_mxfp8_autotune(), flashinfer_mxfp8_decode_graph_capture():
         lin(x)  # warmup-only pass: tunes this bucket's quantize and GEMM tactics
-    assert lin.quant_method.accepts_prequantized_input(lin) is False  # outside capture
+    assert not lin.quant_method.on_decode_graph_path()  # outside capture
 
     act, act_sf = torch.ops.trtllm.mxfp8_quantize(x, True)
     pre = MxFp8QuantizedTensor(fp8_tensor=act, scaling_factor=act_sf, is_sf_swizzled=True)
@@ -84,15 +103,35 @@ def test_prequantized_matches_quantize_then_gemm(monkeypatch, num_tokens, out_f,
     assert torch.equal(outs[0], outs[1])
 
 
-def test_prequantized_rejected_outside_decode_graph_path():
+@pytest.mark.parametrize("num_tokens", [4, 130, 2048])
+@pytest.mark.parametrize("backend", ["trtllm", "auto", "flashinfer"])
+def test_prequantized_eager_matches_quantize_then_gemm(monkeypatch, num_tokens, backend):
+    """Eager steps (e.g. context steps above the prefill-graph ceiling) quantize with mxfp8_quantize(x, True)
+    and run the selected GEMM; a pre-quantized activation must run that same GEMM, bit for bit."""
+    monkeypatch.delenv("TRTLLM_MXFP8_GEMM_BACKEND", raising=False)
+    lin = _native_linear(6144, 2048) if backend == "trtllm" else _tuned_linear(6144, 2048)
+    method = lin.quant_method
+    method.backend = backend
+    assert not method.on_decode_graph_path()
+    assert method.on_eager_quantize_path() and method.accepts_prequantized_input(lin)
+    x = torch.randn(num_tokens, 2048, dtype=torch.bfloat16, device="cuda")
+    act, act_sf = torch.ops.trtllm.mxfp8_quantize(x, True)
+    pre = MxFp8QuantizedTensor(fp8_tensor=act, scaling_factor=act_sf, is_sf_swizzled=True)
+    assert torch.equal(lin(pre), lin(x))
+
+
+def test_prequantized_linear_scales_rejected():
     lin = _tuned_linear(256, 512)
     x = torch.randn(4, 512, dtype=torch.bfloat16, device="cuda")
-    act, act_sf = torch.ops.trtllm.mxfp8_quantize(x, True)
-    with pytest.raises(RuntimeError, match="pre-quantized"):
-        lin(MxFp8QuantizedTensor(fp8_tensor=act, scaling_factor=act_sf, is_sf_swizzled=True))
-    with flashinfer_mxfp8_decode_graph_capture():
-        with pytest.raises(RuntimeError, match="pre-quantized"):
-            lin(MxFp8QuantizedTensor(fp8_tensor=act, scaling_factor=act_sf, is_sf_swizzled=False))
+    act, act_sf = torch.ops.trtllm.mxfp8_quantize(x, False)
+    for capture in (False, True):
+        with flashinfer_mxfp8_decode_graph_capture() if capture else contextlib.nullcontext():
+            with pytest.raises(RuntimeError, match="pre-quantized"):
+                lin(
+                    MxFp8QuantizedTensor(
+                        fp8_tensor=act, scaling_factor=act_sf, is_sf_swizzled=False
+                    )
+                )
 
 
 @pytest.mark.parametrize("enabled", [False, True])
