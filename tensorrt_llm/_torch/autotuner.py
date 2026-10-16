@@ -937,6 +937,14 @@ class AutoTuner:
         self.repeat = repeat
         self.warmup = warmup
         self.stream_delay_micro_secs = stream_delay_micro_secs
+        # The CUDA-graph replay is queued behind a GPU delay kernel so that
+        # host latency stays out of the timed window. Host stalls longer than
+        # the delay (busy threads during warmup) land in the measurement and
+        # swamp microsecond kernels, making near-tie picks random per rank and
+        # launch; TLLM_AUTOTUNER_CUDA_GRAPH_DELAY_US lengthens the delay.
+        graph_delay_us = os.getenv("TLLM_AUTOTUNER_CUDA_GRAPH_DELAY_US")
+        if graph_delay_us:
+            self._CUDA_GRAPH_DELAY_MICRO_SECS = int(graph_delay_us)
         self.profiling_cache = AutoTunerProfilingCache()
         self._primed_cached_tactics: set[tuple[str, str, str, str]] = set()
         self.is_tuning_mode = False
