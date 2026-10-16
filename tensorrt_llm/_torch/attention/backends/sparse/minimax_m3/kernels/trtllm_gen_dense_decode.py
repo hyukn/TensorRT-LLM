@@ -20,7 +20,9 @@ point the generic path calls.
 
 from __future__ import annotations
 
+import contextlib
 import functools
+import os
 from typing import NamedTuple, Optional, Tuple
 
 import torch
@@ -28,6 +30,36 @@ import torch
 from tensorrt_llm._torch.memory_buffer_utils import get_memory_buffers
 
 from .msa_utils import check_decode_span_shape
+
+# TRTLLM_M3_DENSE_DECODE_KV_SPLIT_OVERSUB=k: size the trtllm-gen generation kernel's multi-CTA KV split for k x the
+# SM count. The launcher gives every sequence the same number of KV CTAs, floor(SMs / (batch x KV-head groups)),
+# sized for one wave, and each CTA walks its own sequence's 1/split of the KV, so a launch lasts as long as the
+# LONGEST sequence's slice: at 19 requests x 4 KV heads (attention DP) the split is 1 and a single CTA reads a whole
+# 300K-token sequence while half the SMs idle. With k > 1 the split grows k-fold and the hardware scheduler
+# backfills SMs freed by short sequences, so the cost tends to the sum of the KV lengths. Default 1 (unchanged).
+_KV_SPLIT_OVERSUB = max(1, int(os.environ.get("TRTLLM_M3_DENSE_DECODE_KV_SPLIT_OVERSUB", "1")))
+
+
+def _split_sm_count(device_index: int) -> int:
+    """The SM count the dense decode launcher sizes its KV split for (the device's, times the oversubscription)."""
+    return torch.cuda.get_device_properties(device_index).multi_processor_count * _KV_SPLIT_OVERSUB
+
+
+@contextlib.contextmanager
+def _oversubscribed_split(device_index: int):
+    """Make flashinfer's trtllm-gen decode launcher see _split_sm_count SMs for the duration of one call."""
+    if _KV_SPLIT_OVERSUB == 1:
+        yield
+        return
+    import flashinfer.decode as fi_decode
+
+    original = fi_decode.get_device_sm_count
+    sm_count = _split_sm_count(device_index)
+    fi_decode.get_device_sm_count = lambda device: sm_count
+    try:
+        yield
+    finally:
+        fi_decode.get_device_sm_count = original
 
 
 @functools.lru_cache(maxsize=None)
@@ -43,8 +75,9 @@ def _counter_size(num_heads: int, max_num_requests: int, device_index: int) -> i
         _get_multi_ctas_kv_counter_size,
     )
 
-    multi_processor_count = torch.cuda.get_device_properties(device_index).multi_processor_count
-    return int(_get_multi_ctas_kv_counter_size(num_heads, max_num_requests, multi_processor_count))
+    return int(
+        _get_multi_ctas_kv_counter_size(num_heads, max_num_requests, _split_sm_count(device_index))
+    )
 
 
 def _device_index(device: torch.device) -> int:
@@ -302,6 +335,37 @@ def minimax_m3_trtllm_gen_dense_decode(
     if staged_subpage_table is None or staged_subpages_per_slot != subpages_per_slot:
         staged_subpage_table = subpage_block_table(block_table, subpages_per_slot, reserve)
 
+    with _oversubscribed_split(_device_index(q.device)):
+        _trtllm_gen_decode(
+            flashinfer,
+            q,
+            kv_pool,
+            workspace,
+            staged_subpage_table,
+            seq_lens,
+            max_seq_len,
+            sm_scale,
+            output,
+            enable_pdl,
+            decode_query_len,
+            counters,
+        )
+
+
+def _trtllm_gen_decode(
+    flashinfer,
+    q,
+    kv_pool,
+    workspace,
+    staged_subpage_table,
+    seq_lens,
+    max_seq_len,
+    sm_scale,
+    output,
+    enable_pdl,
+    decode_query_len,
+    counters,
+) -> None:
     flashinfer.decode.trtllm_batch_decode_with_kv_cache(
         query=q,
         # The tuple form takes the K and V page views separately, which is what

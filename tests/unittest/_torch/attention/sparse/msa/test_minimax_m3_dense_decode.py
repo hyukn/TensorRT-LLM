@@ -390,3 +390,43 @@ def test_accepts_the_m3_geometry():
     pytest.importorskip("flashinfer")
     pool = torch.zeros((1, 1, PAGE_SIZE, HEAD_DIM), device="cuda", dtype=torch.bfloat16)
     assert dense_decode_unsupported_reason(_StubManager(pool, 2), HEAD_DIM) is None
+
+
+@pytest.mark.skipif(not _is_sm100f(), reason="trtllm-gen decode kernels are SM100/SM103 only")
+@pytest.mark.parametrize("oversub", [2, 4, 8])
+@pytest.mark.parametrize(
+    "num_heads,num_kv_heads", [(64, 4), (16, 1)], ids=["adp_gqa16x4", "tp4_gqa16x1"]
+)
+def test_oversubscribed_kv_split_matches(oversub, num_heads, num_kv_heads, monkeypatch):
+    """TRTLLM_M3_DENSE_DECODE_KV_SPLIT_OVERSUB only re-partitions the KV walk across CTAs: same output (within the
+    split-reduction rounding) as the default split, over a batch with one long and several short sequences."""
+    import tensorrt_llm._torch.attention.backends.sparse.minimax_m3.kernels.trtllm_gen_dense_decode as dense
+
+    seq_lens = [PAGE_SIZE * 40 + 3] + [PAGE_SIZE * 3 + 7] * 7
+    q, pool, block_table, seq_lens_t = _make_pool_inputs(
+        seq_lens, num_heads, num_kv_heads, 4, 2, torch.float8_e4m3fn, seed=5
+    )
+    monkeypatch.setattr(dense, "_KV_SPLIT_OVERSUB", 1)
+    dense._counter_size.cache_clear()
+    ref = _run_dense(q, pool, 2, block_table, seq_lens_t, 4)
+    monkeypatch.setattr(dense, "_KV_SPLIT_OVERSUB", oversub)
+    dense._counter_size.cache_clear()
+    out = _run_dense(q, pool, 2, block_table, seq_lens_t, 4)
+    dense._counter_size.cache_clear()
+    torch.testing.assert_close(out.float(), ref.float(), rtol=2e-2, atol=2e-2)
+    import flashinfer.decode as fi_decode
+
+    assert (
+        fi_decode.get_device_sm_count(q.device)
+        == torch.cuda.get_device_properties(q.device).multi_processor_count
+    )  # restored after the call
+
+
+def test_oversubscription_scales_the_counter_block(monkeypatch):
+    import tensorrt_llm._torch.attention.backends.sparse.minimax_m3.kernels.trtllm_gen_dense_decode as dense
+
+    if not torch.cuda.is_available():
+        pytest.skip("needs a device for the SM count")
+    sms = torch.cuda.get_device_properties(0).multi_processor_count
+    monkeypatch.setattr(dense, "_KV_SPLIT_OVERSUB", 4)
+    assert dense._split_sm_count(0) == 4 * sms
