@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import contextlib
+import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, List, Optional, Set
 
@@ -23,6 +24,7 @@ from ..pyexecutor.kv_cache.mamba_cache_manager import MambaHybridCacheManager
 from ..pyexecutor.llm_request import LlmRequest
 from ..pyexecutor.resource_manager import BaseResourceManager, SlotManager
 from ..pyexecutor.scheduler import ScheduledRequests
+from ..utils import is_torch_compiling
 from .interface import (INVALID_PROMPT_LOOKAHEAD_TOKEN, SpecMetadata,
                         SpecWorkerBase, tp_vocab_shard_greedy_enabled)
 from .mtp import _select_mtp_position_ids
@@ -441,6 +443,53 @@ class Eagle3OneModelSpecMetadata(SpecMetadata):
                 break
 
 
+# TRTLLM_EAGLE3_CTX_DRAFT_LAST_QUERY=1: on pure context batches the first draft step attends from the last token
+# of each request only. The draft layer's KV for a position depends only on that position's input (the target's
+# captured hidden states and the next token), never on attention outputs, and only the last position's output is
+# ever read (for the first draft token), so the step runs (a) over every chunk token with local-window attention
+# (a causal window of TRTLLM_EAGLE3_CTX_DRAFT_WINDOW keys) just to write the draft KV, then (b) over the last token
+# of each request as a one-token step against the full draft KV. The target model is untouched, so outputs are
+# unchanged; the first-step attention of the drafts drops from new x cached to new x chunk + requests x cached.
+_CTX_DRAFT_LAST_QUERY = os.environ.get("TRTLLM_EAGLE3_CTX_DRAFT_LAST_QUERY",
+                                       "0") == "1"
+_CTX_DRAFT_WINDOW = int(os.environ.get("TRTLLM_EAGLE3_CTX_DRAFT_WINDOW", "256"))
+# Taken only when the step's draft attention work, sum over requests of new x (cached + new) query-key pairs, is
+# above this (the one-token pass and its metadata update cost a few ms of host time; the full first step costs
+# ~7e-9 ms per pair on GB300).
+_CTX_DRAFT_MIN_QK = float(
+    os.environ.get("TRTLLM_EAGLE3_CTX_DRAFT_MIN_QK", "3e9"))
+
+
+def _draft_attention_backends(draft_model: nn.Module) -> list:
+    """The attention backends of the draft model's attention modules."""
+    backends = []
+    for module in draft_model.modules():
+        backend = getattr(module, "attn", None)
+        if backend is not None and hasattr(backend, "attention_chunk_size"):
+            backends.append(backend)
+    return backends
+
+
+@contextlib.contextmanager
+def _local_draft_attention(backends: list, window: int):
+    """Temporarily narrow the draft's context attention to a causal window of ``window`` keys.
+
+    Only the attention kernel's window changes (``context_window_left_override``, honoured by the trtllm-gen
+    context FMHA); the QKV preprocessing that writes the KV cache is the same as for full attention.
+    """
+    saved = [
+        getattr(backend, "context_window_left_override", None)
+        for backend in backends
+    ]
+    try:
+        for backend in backends:
+            backend.context_window_left_override = window - 1
+        yield
+    finally:
+        for backend, value in zip(backends, saved):
+            backend.context_window_left_override = value
+
+
 class Eagle3OneModelWorker(SpecWorkerBase):
     """Unified one-model worker for Eagle3 and MTP Eagle speculative decoding.
 
@@ -843,15 +892,28 @@ class Eagle3OneModelWorker(SpecWorkerBase):
                 # refresh once more after rebinding so the first draft forward
                 # writes the separate DSA indexer cache at the same positions.
                 attn_metadata.on_update_kv_lens()
+            last_query_ctx = self._use_ctx_draft_last_query(
+                draft_model, attn_metadata, num_contexts, num_gens,
+                uses_mtp_index_share)
             for i in range(runtime_draft_len):
                 if uses_mtp_index_share:
                     attn_metadata.set_skip_topk(i > 0)
-                # Run draft model (mode-specific via helper). The helper
-                # passes ``all_rank_num_tokens`` as a kwarg so the draft model
-                # handles save/restore internally (Eagle3DraftModel.forward
-                # uses try/finally); attn_metadata is left untouched here.
-                hidden_states, hidden_states_to_save = self._run_draft_forward(
-                    draft_model, inputs, spec_metadata, i)
+                if i == 0 and last_query_ctx:
+                    # One row per request comes back (see _ctx_draft_first_step);
+                    # ``inputs`` becomes that step's per-request inputs.
+                    hidden_states, hidden_states_to_save, inputs = (
+                        self._ctx_draft_first_step(draft_model, inputs,
+                                                   spec_metadata, attn_metadata,
+                                                   last_tokens_idx,
+                                                   num_contexts, batch_size))
+                else:
+                    # Run draft model (mode-specific via helper). The helper
+                    # passes ``all_rank_num_tokens`` as a kwarg so the draft
+                    # model handles save/restore internally
+                    # (Eagle3DraftModel.forward uses try/finally); attn_metadata
+                    # is left untouched here.
+                    hidden_states, hidden_states_to_save = self._run_draft_forward(
+                        draft_model, inputs, spec_metadata, i)
 
                 # Compute gather_ids: on the first draft step each generation
                 # request may have accepted multiple tokens, so we index into
@@ -861,7 +923,9 @@ class Eagle3OneModelWorker(SpecWorkerBase):
                 # selection is the prefix slice [0, batch_size); each
                 # ``[gather_ids]`` site below takes a slice as readily as an
                 # index tensor.
-                if i == 0:
+                if i == 0 and last_query_ctx:
+                    gather_ids = slice(0, batch_size)
+                elif i == 0:
                     start_ids_gen = (
                         spec_metadata.batch_indices_cuda[:num_gens] *
                         (runtime_draft_len + 1)).long()
@@ -1047,7 +1111,11 @@ class Eagle3OneModelWorker(SpecWorkerBase):
                     }
 
                 # Update attn_metadata for the next iteration.
-                if i == 0:
+                if i == 0 and last_query_ctx:
+                    # Already in the one-token layout (_ctx_draft_first_step); the next token is a new position.
+                    attn_metadata.kv_lens_cuda[:num_contexts] += 1
+                    attn_metadata.update_for_spec_dec()
+                elif i == 0:
                     attn_metadata._seq_lens[:batch_size].fill_(1)
                     attn_metadata._seq_lens_cuda[:batch_size].fill_(1)
                     attn_metadata.on_update()
@@ -1092,6 +1160,77 @@ class Eagle3OneModelWorker(SpecWorkerBase):
             next_draft_tokens[num_contexts:] = gen_draft_tokens
 
         return next_draft_tokens
+
+    def _use_ctx_draft_last_query(self, draft_model, attn_metadata,
+                                  num_contexts: int, num_gens: int,
+                                  uses_mtp_index_share: bool) -> bool:
+        """Whether the first draft step takes the context last-query path (TRTLLM_EAGLE3_CTX_DRAFT_LAST_QUERY)."""
+        if not _CTX_DRAFT_LAST_QUERY or num_contexts == 0 or num_gens != 0:
+            return False
+        # Eager steps only (context steps above the prefill-graph ceiling, where the draft's new x cached work is);
+        # compiled / captured steps keep the traced path.
+        if is_torch_compiling() or torch.compiler.is_compiling():
+            return False
+        if self.is_mtp_eagle or uses_mtp_index_share or self.guided_decoder is not None:
+            return False
+        if self.sa_enhancer is not None:
+            return False
+        backends = _draft_attention_backends(draft_model)
+        if not backends or any(backend.attention_chunk_size is not None
+                               for backend in backends):
+            return False
+        # Host-side lengths: new tokens and KV length (cached + new) per context request.
+        seq_lens = getattr(attn_metadata, "seq_lens", None)
+        kv_lens = getattr(attn_metadata, "kv_lens", None)
+        if seq_lens is None or kv_lens is None:
+            return False
+        work = (seq_lens[:num_contexts].to(torch.int64) *
+                kv_lens[:num_contexts].to(torch.int64)).sum()
+        return int(work) >= _CTX_DRAFT_MIN_QK
+
+    def _ctx_draft_first_step(self, draft_model, inputs, spec_metadata,
+                              attn_metadata, last_tokens_idx, num_contexts: int,
+                              batch_size: int):
+        """First draft step of a pure context batch, attending from each request's last token only.
+
+        (a) Every chunk token runs the draft layer with local-window attention: this writes the draft KV of all
+            positions exactly as the full step would (the KV depends only on each position's own input).
+        (b) The last token of each request runs again as a one-token step over the full draft KV (its KV slot is
+            rewritten with the same values), giving the hidden state the first draft token is sampled from.
+        Returns (hidden_states, hidden_states_to_save, step inputs), one row per request, with ``attn_metadata``
+        already in one-token layout at the same KV lengths.
+        """
+        with _local_draft_attention(_draft_attention_backends(draft_model),
+                                    _CTX_DRAFT_WINDOW):
+            self._run_draft_forward(draft_model, inputs, spec_metadata, 0)
+
+        rows = last_tokens_idx[:num_contexts]
+        step_inputs = {
+            "input_ids": inputs["input_ids"][rows],
+            "position_ids": _select_mtp_position_ids(inputs["position_ids"],
+                                                     rows),
+            "hidden_states": inputs["hidden_states"][rows],
+            "attn_metadata": attn_metadata,
+            "spec_metadata": spec_metadata,
+        }
+        # One token per request at the current KV lengths (the generation layout the loop switches to after the
+        # first step, without advancing kv_lens: the token is the chunk's last one, already counted).
+        attn_metadata._seq_lens[:batch_size].fill_(1)
+        attn_metadata._seq_lens_cuda[:batch_size].fill_(1)
+        attn_metadata.on_update()
+        has_kv_cache = attn_metadata.kv_cache_manager is not None
+        if has_kv_cache and hasattr(attn_metadata, "host_request_types"):
+            attn_metadata.host_request_types[:num_contexts].fill_(1)
+        if has_kv_cache:
+            attn_metadata.num_contexts = 0
+            self._prepare_flash_mla_generation_layout(attn_metadata,
+                                                      num_contexts, batch_size)
+        if hasattr(attn_metadata, "kv_lens_cuda"):
+            attn_metadata.update_for_spec_dec()
+        attn_metadata.use_spec_decoding = False
+        hidden_states, hidden_states_to_save = self._run_draft_forward(
+            draft_model, step_inputs, spec_metadata, 1)
+        return hidden_states, hidden_states_to_save, step_inputs
 
     def _get_step_all_rank_num_tokens(self, spec_metadata, step_idx: int):
         """Pick the right ``all_rank_num_tokens`` for this draft iteration.

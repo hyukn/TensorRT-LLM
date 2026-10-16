@@ -1003,6 +1003,11 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
             if params.is_cross
             else AttentionMaskType(fwd.mask_type) == AttentionMaskType.causal
         )
+        # A caller that only needs this call's KV writes (not its attention output) may narrow the context
+        # attention to a causal local window; the KV preprocessing above is unaffected.
+        window_left_override = getattr(attn, "context_window_left_override", None)
+        if window_left_override is not None and causal:
+            window_left = window_left_override
         flashinfer.prefill.trtllm_batch_context_with_kv_cache(
             query=q_processed,
             kv_cache=(kv_pool, kv_pool),
