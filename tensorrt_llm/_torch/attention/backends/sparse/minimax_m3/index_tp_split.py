@@ -39,6 +39,19 @@ after the preceding kernel (and its remote stores) has completed.
 Enable with TRTLLM_M3_INDEX_TP_SPLIT=1; the split runs on pure-decode steps with at least
 TRTLLM_M3_INDEX_TP_SPLIT_MIN_BATCH requests (default 12). Below that, two barriers cost more
 than the saved index-K reads.
+
+Local index-Q (TRTLLM_M3_INDEX_TP_SPLIT_LOCAL_Q=1, with the split enabled): every rank computes
+all index-Q heads itself (the model replicates the index-Q projection in its fused QKV+index
+GEMM instead of sharding it by KV group), so step 1 and barrier A disappear and each split call
+is scorer + barrier B. The scorer reads the same Q bytes the gather would have delivered: the
+projection input is identical on every rank (the output of the layer-boundary AllReduce) and
+each Q column is the same dot product, so the scores stay bitwise those of the unsplit scorer.
+Without barrier A, what keeps layer l+1's remote score stores out of a peer's buffer while its
+block selection for layer l still reads it is the layer's tensor-parallel AllReduce in between:
+a rank's layer-l attention AllReduce completes only once every peer has contributed its o_proj
+output, which the peer computes from the attention output of its layer-l block selection; the
+replicas' in-place reads of a primary's buffer are covered the same way. The split must
+therefore only run under attention TP, as it does (never under attention DP).
 """
 
 from __future__ import annotations
@@ -54,6 +67,7 @@ from tensorrt_llm.logger import logger
 
 ENV_ENABLE = "TRTLLM_M3_INDEX_TP_SPLIT"
 ENV_MIN_BATCH = "TRTLLM_M3_INDEX_TP_SPLIT_MIN_BATCH"
+ENV_LOCAL_Q = "TRTLLM_M3_INDEX_TP_SPLIT_LOCAL_Q"
 DEFAULT_MIN_BATCH = 12
 # Flag slots per barrier: one per peer plus one dummy target for the masked self lane.
 _FLAG_SLOTS = 64
@@ -67,6 +81,15 @@ def tp_split_min_batch() -> Optional[int]:
     if os.environ.get(ENV_ENABLE, "0") != "1":
         return None
     return int(os.environ.get(ENV_MIN_BATCH, str(DEFAULT_MIN_BATCH)))
+
+
+def tp_split_local_q_requested() -> bool:
+    """Whether every rank should compute all index-Q heads (see the module docstring).
+
+    Only meaningful with the split enabled; the model still checks the TP mapping and peer
+    access before it replicates the index-Q projection.
+    """
+    return tp_split_min_batch() is not None and os.environ.get(ENV_LOCAL_Q, "0") == "1"
 
 
 _PEER_ACCESS: Dict[Tuple[int, int, int], bool] = {}
@@ -392,11 +415,24 @@ def tp_split_score(
     decode_query_len: int,
     local_heads: int,
     k_tiles: int,
+    q_all_heads: bool = False,
 ) -> torch.Tensor:
-    """Run steps 1-3 and return this rank's [local_heads, k_tiles, tokens] max-score buffer."""
+    """Run steps 1-3 and return this rank's [local_heads, k_tiles, tokens] max-score buffer.
+
+    ``q_all_heads``: ``idx_q_local`` already holds every index head ([tokens, total heads, dim],
+    any 16-element-aligned strides; local index-Q, see the module docstring), so step 1 and
+    barrier A are skipped.
+    """
     tokens = int(idx_q_local.shape[0])
     total_heads = local_heads * ws.groups
-    q_all = ws.gather_q(idx_q_local.reshape(tokens, -1), total_heads)
+    if q_all_heads:
+        if idx_q_local.dim() != 3 or int(idx_q_local.shape[1]) != total_heads:
+            raise ValueError(
+                f"local index-Q must be [tokens, {total_heads}, dim], got {tuple(idx_q_local.shape)}"
+            )
+        q_all = idx_q_local
+    else:
+        q_all = ws.gather_q(idx_q_local.reshape(tokens, -1), total_heads)
     outs = ws.score_views(local_heads, k_tiles, tokens)
     outs = outs + [outs[0]] * (4 - len(outs))
     batch = int(seq_lens_cuda.shape[0])
@@ -423,6 +459,7 @@ __all__ = [
     "IndexTpSplitWorkspace",
     "tp_split_peer_access",
     "split_k_for_batch",
+    "tp_split_local_q_requested",
     "tp_split_min_batch",
     "tp_split_score",
 ]

@@ -46,6 +46,7 @@ from .common import (
     MiniMaxM3SparseConfig,
     MiniMaxM3SparseMetadataParams,
     build_paged_kv_slot_mapping,
+    index_head_range,
     write_kv_slots,
 )
 from .index_tp_split import (
@@ -1545,7 +1546,9 @@ class MiniMaxM3MsaSparseAttention(TrtllmAttention):
         span = metadata.msa_decode_span
         # Preserve split column views without allowing an implicit copy. The
         # scorer and cache writer below both honor their source strides.
-        idx_q_view = idx_q.view(num_tokens, config.num_index_heads, config.sparse_index_dim)
+        # With local index-Q (index_tp_split) idx_q carries every index head:
+        # idx_q_all is that full view and idx_q_view this rank's own heads.
+        idx_q_all, idx_q_view = self._index_q_views(idx_q, num_tokens, metadata)
         idx_k_cache = metadata.msa_idx_k_cache(self.layer_idx)
         configured_for_fp8 = self.indexer_kv_dtype == "fp8"
         expected_cache_dtype = torch.float8_e4m3fn if configured_for_fp8 else torch.bfloat16
@@ -1619,8 +1622,16 @@ class MiniMaxM3MsaSparseAttention(TrtllmAttention):
                 block_table=block_table,
                 seq_lens_cuda=seq_lens_cuda,
                 decode_query_len=decode_query_len,
+                idx_q_all=idx_q_all[gen_first:] if idx_q_all is not None else None,
             )
-        if proxy_plan is None and span is not None and span.row_first == 0:
+        pure_decode = proxy_plan is None and span is not None and span.row_first == 0
+        if idx_q_all is not None and not pure_decode:
+            # The own heads are a strided slice of the local index-Q. The CuTe DSL decode
+            # scorer takes it as is; give the context-row scorers (fmha_sm100 proxy, tcgen05
+            # context scorer) the compact rows they were written for. Steps with context rows
+            # are never graph-captured, so the copy stays out of the decode graphs.
+            idx_q_view = idx_q_view.contiguous()
+        if pure_decode:
             if split_scores is not None:
                 return self.indexer._select(split_scores, metadata.msa_n_valid_blocks[:num_tokens])
             # No proxy plan to read max_k_tiles from for the contiguous score
@@ -1680,6 +1691,36 @@ class MiniMaxM3MsaSparseAttention(TrtllmAttention):
             ctx_score_args=ctx_score_args,
         )
 
+    def _index_q_views(
+        self, idx_q: torch.Tensor, num_tokens: int, metadata
+    ) -> Tuple[Optional[torch.Tensor], torch.Tensor]:
+        """Return (all index heads or None, this rank's own heads) as [tokens, heads, dim] views.
+
+        The model emits only this rank's heads, except with local index-Q (the TP index split's
+        TRTLLM_M3_INDEX_TP_SPLIT_LOCAL_Q), where it emits every index head and the own heads are
+        the KV-group slice index_head_range assigns to the rank.
+        """
+        config = self.m3_config
+        dim = int(config.sparse_index_dim)
+        local = int(config.num_index_heads)
+        emitted = int(idx_q.shape[-1]) // dim if idx_q.dim() == 2 else int(idx_q.shape[1])
+        if emitted == local:
+            return None, idx_q.view(num_tokens, local, dim)
+        total = int(self.sparse_params.num_index_heads)
+        global_kv = self.sparse_params.global_num_kv_heads
+        if emitted != total or global_kv is None:
+            raise ValueError(
+                f"MiniMax-M3 index-Q carries {emitted} heads; expected this rank's {local} or, "
+                f"with local index-Q, all {total} (with the global KV head count known)."
+            )
+        q_all = idx_q.view(num_tokens, total, dim)
+        start, end = index_head_range(total, int(global_kv), metadata.mapping)
+        if end - start != local:
+            raise ValueError(
+                f"MiniMax-M3 local index-Q: rank owns heads [{start}, {end}), expected {local}."
+            )
+        return q_all, q_all[:, start:end]
+
     def _maybe_tp_split_scores(
         self,
         metadata,
@@ -1689,6 +1730,7 @@ class MiniMaxM3MsaSparseAttention(TrtllmAttention):
         block_table: torch.Tensor,
         seq_lens_cuda: torch.Tensor,
         decode_query_len: int,
+        idx_q_all: Optional[torch.Tensor] = None,
     ) -> Optional[torch.Tensor]:
         """Score a step's generation span split across the TP group (see index_tp_split).
 
@@ -1696,6 +1738,8 @@ class MiniMaxM3MsaSparseAttention(TrtllmAttention):
         rank's [local_heads, worst_k_tiles, span tokens] max-score buffer, bitwise what the
         unsplit scorer writes, or None when the split does not apply. Every input to the decision
         is identical on all TP ranks, so they all take the same path and issue the same barriers.
+        `idx_q_all` (local index-Q) holds every index head of the span's tokens; the index-Q
+        gather and its barrier are then skipped.
         """
         min_batch = tp_split_min_batch()
         if min_batch is None:
@@ -1731,23 +1775,28 @@ class MiniMaxM3MsaSparseAttention(TrtllmAttention):
             return None
         k_tiles = int(metadata.msa_worst_case_max_k_tiles)
         max_tokens = int(metadata._msa_max_decode_tokens())
+        local_q = idx_q_all is not None
         ws = IndexTpSplitWorkspace.get(
             mapping,
             local_heads=local_heads,
             k_tiles=k_tiles,
-            q_row_bytes=local_heads * int(idx_q_view.shape[2]) * idx_q_view.element_size(),
+            # Local index-Q needs no gather slots.
+            q_row_bytes=0
+            if local_q
+            else local_heads * int(idx_q_view.shape[2]) * idx_q_view.element_size(),
             max_tokens=max_tokens,
             replicas=replicas,
         )
         return tp_split_score(
             ws,
-            idx_q_view,
+            idx_q_all if local_q else idx_q_view,
             idx_k_cache,
             block_table=block_table,
             seq_lens_cuda=seq_lens_cuda,
             decode_query_len=int(decode_query_len),
             local_heads=local_heads,
             k_tiles=k_tiles,
+            q_all_heads=local_q,
         )
 
     def sparse_attn_predict(

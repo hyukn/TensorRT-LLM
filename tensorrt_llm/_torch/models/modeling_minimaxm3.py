@@ -51,6 +51,10 @@ from ..attention.backends.sparse.minimax_m3 import (
     _write_main_kv_slots_to_pool,
 )
 from ..attention.backends.sparse.minimax_m3.common import index_head_range
+from ..attention.backends.sparse.minimax_m3.index_tp_split import (
+    tp_split_local_q_requested,
+    tp_split_peer_access,
+)
 from ..attention.backends.sparse.params import SparseBackendForwardArgs
 from ..distributed import AllReduce, AllReduceFusionOp, AllReduceParams, MiniMaxAllReduceRMS
 from ..modules.decoder_layer import DecoderLayer
@@ -101,6 +105,28 @@ def _moe_routed_output_is_global(experts: nn.Module) -> bool:
     return getattr(backend, "scheduler_kind", None) == MoESchedulerKind.FUSED_COMM
 
 
+def _replicate_index_q_for_tp_split(mapping: Optional[Mapping]) -> bool:
+    """Whether the fused QKV+index projection should emit every index-Q head on this rank.
+
+    Local index-Q for the TP index split (TRTLLM_M3_INDEX_TP_SPLIT=1 and
+    TRTLLM_M3_INDEX_TP_SPLIT_LOCAL_Q=1, see index_tp_split): the split then scores without the
+    index-Q gather and its barrier. Only under attention TP with peer access across the TP
+    group, i.e. wherever the split itself can run; every rank of the group decides alike.
+    """
+    if not tp_split_local_q_requested():
+        return False
+    if mapping is None or mapping.enable_attention_dp or int(mapping.tp_size) <= 1:
+        return False
+    if not tp_split_peer_access(mapping):
+        return False
+    logger.info_once(
+        "MiniMax-M3 index TP split: local index-Q (every rank projects all index-Q heads; "
+        "TRTLLM_M3_INDEX_TP_SPLIT_LOCAL_Q=1)",
+        key="m3_index_tp_split_local_q",
+    )
+    return True
+
+
 class MiniMaxM3QKVIndexerLinear(Linear):
     """Five-way MiniMax-M3 projection with vLLM-compatible TP sharding.
 
@@ -109,6 +135,10 @@ class MiniMaxM3QKVIndexerLinear(Linear):
     replication when TP exceeds the KV-head count), and the single index-K
     head is replicated. The underlying :class:`Linear` remains the standard
     quantized implementation; only checkpoint packing is model-specific.
+
+    ``replicate_index_q`` (local index-Q for the TP index split, see
+    ``index_tp_split``): every rank emits all index-Q heads instead of its KV
+    group's. The other columns are unchanged.
     """
 
     _SHARD_NAMES = ("q", "k", "v", "index_q", "index_k")
@@ -131,6 +161,7 @@ class MiniMaxM3QKVIndexerLinear(Linear):
         use_custom_cublas_mm: bool,
         use_cute_dsl_bf16_gemm: bool,
         use_cute_dsl_blockscaling_mm: bool,
+        replicate_index_q: bool = False,
     ) -> None:
         if total_num_index_heads != total_num_kv_heads:
             raise ValueError(
@@ -167,12 +198,15 @@ class MiniMaxM3QKVIndexerLinear(Linear):
         self.index_head_dim = int(index_head_dim)
         self.local_num_heads = total_num_heads // tp_size
         self.local_num_kv_heads = local_num_kv_heads
-        self.local_num_index_heads = local_num_kv_heads
+        self.replicate_index_q = bool(replicate_index_q)
+        self.local_num_index_heads = (
+            self.total_num_index_heads if self.replicate_index_q else local_num_kv_heads
+        )
         self.local_output_sizes = (
             self.local_num_heads * head_dim,
             local_num_kv_heads * head_dim,
             local_num_kv_heads * head_dim,
-            local_num_kv_heads * index_head_dim,
+            self.local_num_index_heads * index_head_dim,
             index_head_dim,
         )
         local_out_features = sum(self.local_output_sizes)
@@ -199,7 +233,9 @@ class MiniMaxM3QKVIndexerLinear(Linear):
         """Return effective (world size, rank) for one checkpoint shard."""
         if shard_name == "q":
             return self.tp_size, self.tp_rank
-        if shard_name == "index_k":
+        if shard_name == "index_k" or (
+            shard_name == "index_q" and getattr(self, "replicate_index_q", False)
+        ):
             return 1, 0
 
         total_heads = (
@@ -1366,6 +1402,8 @@ class MiniMaxM3Attention(Attention):
 
         self.is_sparse_attention_layer = bool(is_sparse_attention_layer)
         self.disable_index_value = bool(disable_index_value)
+        # Local index-Q for the TP index split (set with the fused projection below).
+        self.replicate_index_q = False
         sparse_runtime_cfg = getattr(model_config, "sparse_attention_config", None)
         self.enable_fused_qkv_index_projection = bool(
             self.is_sparse_attention_layer
@@ -1385,6 +1423,7 @@ class MiniMaxM3Attention(Attention):
 
             if self.enable_fused_qkv_index_projection:
                 old_qkv_proj = self.qkv_proj
+                self.replicate_index_q = _replicate_index_q_for_tp_split(old_qkv_proj.mapping)
                 self.qkv_proj = MiniMaxM3QKVIndexerLinear(
                     hidden_size=config.hidden_size,
                     head_dim=self.head_dim,
@@ -1401,7 +1440,10 @@ class MiniMaxM3Attention(Attention):
                     use_custom_cublas_mm=old_qkv_proj.use_custom_cublas_mm,
                     use_cute_dsl_bf16_gemm=old_qkv_proj.use_cute_dsl_bf16_gemm,
                     use_cute_dsl_blockscaling_mm=old_qkv_proj.use_cute_dsl_blockscaling_mm,
+                    replicate_index_q=self.replicate_index_q,
                 )
+                # Index-Q heads this rank emits: its KV group's, or all of them with local
+                # index-Q (the MSA backend then scores its own heads as a slice of them).
                 self.sparse_num_index_heads = self.qkv_proj.local_num_index_heads
             else:
                 # Use the same KV-group ownership as the five-way projection.
@@ -1705,7 +1747,11 @@ class MiniMaxM3Attention(Attention):
             or position_ids is None
             or self.head_dim != 128
             or self.sparse_index_dim != 128
-            or self.sparse_num_index_heads != self.num_key_value_heads
+            # Local index-Q emits every index head (a multiple of the rank's KV heads).
+            or (
+                self.sparse_num_index_heads != self.num_key_value_heads
+                and not self.replicate_index_q
+            )
             or not self.use_gemma_norm
             or self.pos_embd_params is None
             or not self.pos_embd_params.is_neox

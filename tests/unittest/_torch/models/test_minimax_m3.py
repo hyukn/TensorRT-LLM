@@ -1660,6 +1660,148 @@ def test_minimax_m3_five_way_projection_shards_index_rows(monkeypatch, tp_size: 
 
 
 @pytest.mark.cpu_only
+@pytest.mark.parametrize("tp_size", [2, 4, 8])
+def test_minimax_m3_five_way_projection_local_index_q(monkeypatch, tp_size: int) -> None:
+    """replicate_index_q (local index-Q for the TP index split): every rank packs all index-Q
+    rows; the Q / K / V / index-K rows are exactly those of the sharded projection."""
+
+    def init_linear(self, in_features, out_features, **kwargs) -> None:
+        nn.Module.__init__(self)
+        self.tp_size = kwargs["mapping"].tp_size
+        self.tp_rank = kwargs["mapping"].tp_rank
+        self.tp_mode = kwargs["tensor_parallel_mode"]
+        self.weights_loading_config = kwargs["weights_loading_config"]
+        self.out_features = out_features // self.tp_size
+
+    monkeypatch.setattr(modeling_minimaxm3.Linear, "__init__", init_linear)
+    load_weight_shard = modeling_minimaxm3.load_weight_shard
+
+    def load_cpu_shard(weight, world_size, rank, mode, *, device):
+        return load_weight_shard(weight, world_size, rank, mode, device=torch.device("cpu"))
+
+    monkeypatch.setattr(modeling_minimaxm3, "load_weight_shard", load_cpu_shard)
+
+    def build(tp_rank: int, replicate: bool):
+        return MiniMaxM3QKVIndexerLinear(
+            hidden_size=2,
+            head_dim=128,
+            total_num_heads=64,
+            total_num_kv_heads=4,
+            total_num_index_heads=4,
+            index_head_dim=128,
+            dtype=torch.bfloat16,
+            mapping=SimpleNamespace(tp_size=tp_size, tp_rank=tp_rank),
+            quant_config=None,
+            skip_create_weights_in_init=True,
+            force_dynamic_quantization=False,
+            disable_deep_gemm=False,
+            use_custom_cublas_mm=False,
+            use_cute_dsl_bf16_gemm=False,
+            use_cute_dsl_blockscaling_mm=False,
+            replicate_index_q=replicate,
+        )
+
+    shards = {
+        name: {
+            "weight": torch.arange(heads * 128 * 2).reshape(heads * 128, 2) + 1000 * i,
+            "weight_scale": torch.arange(heads * 128).reshape(heads * 128, 1) + 7 * i,
+        }
+        for i, (name, heads) in enumerate(
+            zip(MiniMaxM3QKVIndexerLinear._SHARD_NAMES, (64, 4, 4, 4, 1), strict=True)
+        )
+    }
+    for tp_rank in range(tp_size):
+        sharded, local = build(tp_rank, False), build(tp_rank, True)
+        assert local.replicate_index_q and not sharded.replicate_index_q
+        assert local.local_num_index_heads == 4
+        assert local.local_output_sizes[:3] == sharded.local_output_sizes[:3]
+        assert local.local_output_sizes[3] == 4 * 128
+        assert local.local_output_sizes[4] == sharded.local_output_sizes[4] == 128
+        assert local.out_features == sum(local.local_output_sizes)
+        assert local._shard_geometry("index_q") == (1, 0)
+        for name in ("q", "k", "v", "index_k"):
+            assert local._shard_geometry(name) == sharded._shard_geometry(name)
+        packs = {}
+        for key, proj in (("sharded", sharded), ("local", local)):
+            loaded = []
+            proj.load_weights = loaded.extend
+            proj.load_five_way_weights(shards)
+            packs[key] = {
+                k: loaded[0][k].split(proj.local_output_sizes) for k in ("weight", "weight_scale")
+            }
+        for k in ("weight", "weight_scale"):
+            for i in (0, 1, 2, 4):
+                torch.testing.assert_close(packs["local"][k][i], packs["sharded"][k][i])
+            torch.testing.assert_close(packs["local"][k][3], shards["index_q"][k])
+            # The rank's own KV-group rows sit at their global head offset.
+            start, end = index_head_range(
+                4, 4, SimpleNamespace(tp_size=tp_size, tp_rank=tp_rank, enable_attention_dp=False)
+            )
+            torch.testing.assert_close(
+                packs["local"][k][3][start * 128 : end * 128], packs["sharded"][k][3]
+            )
+
+
+@pytest.mark.cpu_only
+def test_minimax_m3_local_index_q_gate(monkeypatch) -> None:
+    """Local index-Q needs both env vars, attention TP and peer access across the TP group."""
+    from tensorrt_llm._torch.attention.backends.sparse.minimax_m3 import index_tp_split
+
+    gate = modeling_minimaxm3._replicate_index_q_for_tp_split
+    tp4 = SimpleNamespace(tp_size=4, tp_rank=1, enable_attention_dp=False)
+    monkeypatch.setattr(modeling_minimaxm3, "tp_split_peer_access", lambda mapping: True)
+    monkeypatch.delenv(index_tp_split.ENV_ENABLE, raising=False)
+    monkeypatch.delenv(index_tp_split.ENV_LOCAL_Q, raising=False)
+    assert not gate(tp4)
+    monkeypatch.setenv(index_tp_split.ENV_LOCAL_Q, "1")
+    assert not gate(tp4)  # the split itself is off
+    monkeypatch.setenv(index_tp_split.ENV_ENABLE, "1")
+    assert gate(tp4)
+    assert not gate(SimpleNamespace(tp_size=1, tp_rank=0, enable_attention_dp=False))
+    assert not gate(SimpleNamespace(tp_size=1, tp_rank=0, enable_attention_dp=True))
+    assert not gate(None)
+    monkeypatch.setattr(modeling_minimaxm3, "tp_split_peer_access", lambda mapping: False)
+    assert not gate(tp4)  # TP group spanning nodes: the split cannot run, keep sharded Q
+    monkeypatch.setattr(modeling_minimaxm3, "tp_split_peer_access", lambda mapping: True)
+    monkeypatch.setenv(index_tp_split.ENV_LOCAL_Q, "0")
+    assert not gate(tp4)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("tp_size", [1, 2, 4, 8])
+def test_minimax_m3_msa_index_q_views_local_q(tp_size: int) -> None:
+    """The MSA backend scores a rank's own index heads: all emitted heads under KV-group
+    sharding, the KV group's slice of them with local index-Q."""
+    total, dim, tokens = 4, 128, 6
+    local = total // min(tp_size, 4)
+    for tp_rank in range(tp_size):
+        mapping = Mapping(world_size=tp_size, rank=tp_rank, tp_size=tp_size, gpus_per_node=8)
+        backend = SimpleNamespace(
+            m3_config=SimpleNamespace(sparse_index_dim=dim, num_index_heads=local),
+            sparse_params=SimpleNamespace(num_index_heads=total, global_num_kv_heads=4),
+        )
+        metadata = SimpleNamespace(mapping=mapping)
+        views = MiniMaxM3MsaSparseAttention._index_q_views
+        sharded = torch.randn(tokens, local * dim)
+        q_all, own = views(backend, sharded, tokens, metadata)
+        assert q_all is None and own.shape == (tokens, local, dim)
+        assert own.data_ptr() == sharded.data_ptr()
+        if local == total:
+            continue
+        # Local index-Q: a column slice of the fused output, as the producer hands it over.
+        backing = torch.randn(tokens, (total + 3) * dim)
+        full = backing[:, dim : (total + 1) * dim]
+        q_all, own = views(backend, full, tokens, metadata)
+        start, end = index_head_range(total, 4, mapping)
+        assert q_all.shape == (tokens, total, dim) and q_all.data_ptr() == full.data_ptr()
+        assert own.shape == (tokens, local, dim)
+        assert torch.equal(own, full.view(tokens, total, dim)[:, start:end])
+        assert own.data_ptr() == full.data_ptr() + start * dim * full.element_size()
+        with pytest.raises(ValueError, match="index-Q carries"):
+            views(backend, torch.randn(tokens, (local + 1) * dim), tokens, metadata)
+
+
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("tp_size", [1, 2, 4, 8])
 @pytest.mark.parametrize("attention_dp", [False, True])
 @pytest.mark.parametrize("num_index_heads", [4, 8])
