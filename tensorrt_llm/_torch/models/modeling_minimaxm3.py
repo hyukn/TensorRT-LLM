@@ -615,6 +615,27 @@ def _allreduce_emits_mxfp8(allreduce: nn.Module) -> bool:
     )
 
 
+# TRTLLM_M3_LM_HEAD_FP8=1: the target lm_head projects with an E4M3 copy of its weight (one scale per vocab row,
+# per-token activation scale; LMHead.enable_fp8_rowwise_projection, the Eagle3 draft head's G3 path). Halves the
+# memory-bound vocab-shard read per step. Changes the logits, so it is GSM8K-gated. Tensor-parallel heads only (under
+# attention DP the head's vocab-parallel path slices the bf16 weight directly).
+_LM_HEAD_FP8 = os.environ.get("TRTLLM_M3_LM_HEAD_FP8", "0") == "1"
+
+
+def _maybe_enable_fp8_lm_head(model: nn.Module) -> bool:
+    """(Re)build the target lm_head's FP8 copy after a weight load when TRTLLM_M3_LM_HEAD_FP8=1."""
+    lm_head = getattr(model, "lm_head", None)
+    if not _LM_HEAD_FP8 or lm_head is None or not hasattr(lm_head, "enable_fp8_rowwise_projection"):
+        return False
+    if lm_head.mapping.enable_attention_dp or lm_head.has_any_quant or lm_head.weight.dim() != 2:
+        return False
+    lm_head.enable_fp8_rowwise_projection()
+    logger.info_once(
+        "MiniMax-M3: target lm_head projects with an FP8 rowwise copy", key="m3_lm_head_fp8"
+    )
+    return True
+
+
 def _open_attn_out_mxfp8_request() -> Optional[Mxfp8OutputRequest]:
     """The MXFP8 output request an eager attention forward opened, if any.
 
@@ -3359,6 +3380,7 @@ class MiniMaxM3ForCausalLM(SpecDecOneEngineForCausalLM[MiniMaxM3Model, Pretraine
             params_map=merged_params_map,
             allow_partial_loading=allow_partial_loading,
         )
+        _maybe_enable_fp8_lm_head(self)
         # CUDA graphs retain the aligned MSA buffers created at warmup. Refresh
         # their contents after refit; a new allocation would leave replay stale.
         for layer in self.model.layers:
