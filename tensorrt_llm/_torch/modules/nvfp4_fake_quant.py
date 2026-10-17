@@ -30,10 +30,11 @@ i.e. the format the NVFP4 MoE weights use. Computed in fp32 and returned in ``x`
   5: reference perturbation, no 4-bit anywhere: the MXFP8 weight as stored (exact in bf16) with bf16 activations
      (W8A16), i.e. today's GEMM minus its MXFP8 activation rounding.
 
-``TRTLLM_FAKEQUANT_DENSE_NVFP4_ROLES`` (optional, comma list of ``ROLES``) restricts the fake quant to those
-projections; the rest run today's MXFP8 GEMM. ``qkv`` is the Q / K / V rows of the attention input projection and
-``index`` its fused index-Q / index-K rows, ``o`` the attention output projection, ``shared`` the MoE layers' shared
-expert, ``dense`` the dense layers' MLP. Roles come from the module names (``tag_linear_roles``, MiniMax-M3 layout).
+``TRTLLM_FAKEQUANT_DENSE_NVFP4_ROLES`` (optional, ``ROLES`` separated by ``,`` or ``+``) restricts the fake quant
+to those projections; the rest run today's MXFP8 GEMM. ``qkv`` is the Q / K / V rows of the attention input
+projection and ``index`` its fused index-Q / index-K rows, ``o`` the attention output projection, ``shared`` the MoE
+layers' shared expert, ``dense`` the dense layers' MLP. Roles come from the module names (``tag_linear_roles``,
+MiniMax-M3 layout).
 """
 
 import contextlib
@@ -70,7 +71,9 @@ def fake_quant_suspended():
 
 
 def selected_roles() -> frozenset:
-    value = os.environ.get("TRTLLM_FAKEQUANT_DENSE_NVFP4_ROLES", "")
+    value = os.environ.get("TRTLLM_FAKEQUANT_DENSE_NVFP4_ROLES", "").replace(
+        "+", ","
+    )  # "a,b" or "a+b"
     roles = frozenset(r.strip() for r in value.split(",") if r.strip()) or frozenset(ROLES)
     unknown = roles - frozenset(ROLES)
     if unknown:

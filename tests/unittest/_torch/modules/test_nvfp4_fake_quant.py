@@ -361,6 +361,12 @@ def test_roles_tagging_and_row_selection(monkeypatch):
     assert fake_quant_rows(l0.mlp.proj) == []
     monkeypatch.setenv("TRTLLM_FAKEQUANT_DENSE_NVFP4_ROLES", "qkv,index")
     assert fake_quant_rows(qkv) is None
+    monkeypatch.setenv("TRTLLM_FAKEQUANT_DENSE_NVFP4_ROLES", "qkv+index+o")  # '+' separates too
+    assert (
+        fake_quant_rows(qkv) is None
+        and fake_quant_rows(o) is None
+        and fake_quant_rows(shared) == []
+    )
     del qkv.local_output_sizes  # a dense-attention layer's plain fused QKV: no index rows
     monkeypatch.setenv("TRTLLM_FAKEQUANT_DENSE_NVFP4_ROLES", "index")
     assert fake_quant_rows(qkv) == []
