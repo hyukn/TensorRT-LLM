@@ -42,6 +42,7 @@ exchange runs:
 
 from __future__ import annotations
 
+import os
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, Union
 
@@ -68,6 +69,12 @@ __all__ = [
 
 if TYPE_CHECKING:
     from .configurable_moe import ConfigurableMoE
+
+# TRTLLM_MOE_A2A_FINALIZE_STAGING=1: with NVLinkOneSided, the low-precision (FP8) combine and the MoE output in the
+# all-to-all workspace, a backend whose finalize supports it writes the FP8 wire rows in place and advances the round
+# counter, and the combine skips its prepare pass (one kernel and one pass over the payload fewer per MoE layer).
+# Byte-identical payload (same bf16 rounding and FP8 conversion).
+_A2A_FINALIZE_STAGING = os.environ.get("TRTLLM_MOE_A2A_FINALIZE_STAGING", "0") == "1"
 
 # Points of the external-comm flow at which a caller can have an event recorded on the current
 # stream (``moe.stage_events = {stage: event}``), e.g. to start independent work on another stream
@@ -1024,10 +1031,16 @@ class ExternalCommMoEScheduler(MoEScheduler):
             output_dtype=output_dtype,
             do_finalize=do_finalize,
         )
+        a2a_staging_flag = None
         if isinstance(moe.comm, NVLinkOneSided):
             # combine() still reads the flag off the strategy; the plan stays
             # the single place that decides its value.
             moe.comm.payload_in_workspace = payload_in_workspace
+            if self._use_a2a_finalize_staging(
+                payload_in_workspace, all_rank_num_tokens, do_finalize
+            ):
+                a2a_staging_flag = moe.comm.get_round_counter_tensor()
+            moe.comm.payload_prestaged = a2a_staging_flag is not None
         recv_expert_count = None
         deep_ep_expert_capacity = None
         if use_deep_ep_direct_metadata:
@@ -1043,7 +1056,30 @@ class ExternalCommMoEScheduler(MoEScheduler):
             recv_expert_count=recv_expert_count,
             deep_ep_expert_capacity=deep_ep_expert_capacity,
             use_deep_ep_direct_metadata=use_deep_ep_direct_metadata,
+            a2a_staging_flag=a2a_staging_flag,
         )
+
+    def _use_a2a_finalize_staging(
+        self,
+        payload_in_workspace: bool,
+        all_rank_num_tokens: Optional[List[int]],
+        do_finalize: bool,
+    ) -> bool:
+        """Whether this forward's finalize stages the low-precision combine payload.
+
+        See TRTLLM_MOE_A2A_FINALIZE_STAGING.
+        """
+        moe = self.moe
+        if not _A2A_FINALIZE_STAGING or not payload_in_workspace or not do_finalize:
+            return False
+        if not getattr(moe.comm, "use_low_precision_combine", False):
+            return False
+        supports = getattr(moe.backend, "supports_a2a_finalize_staging", None)
+        if supports is None or not supports():
+            return False
+        if all_rank_num_tokens is None or moe.comm.use_cft_for_combine(max(all_rank_num_tokens)):
+            return False
+        return True
 
 
 # ============================================================================

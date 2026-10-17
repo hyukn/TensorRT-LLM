@@ -46,7 +46,8 @@ std::vector<torch::Tensor> run_fp4_block_scale_moe_runner(torch::optional<torch:
     std::optional<double> const routed_scaling_factor, int64_t const tile_tokens_dim, int64_t const routing_method_type,
     bool const do_finalize, btg::Dtype const dtype, MoeRunnerType& moe_runner, int64_t const moeConfigIndex,
     torch::optional<torch::Tensor> const& topk_weights, torch::optional<torch::Tensor> const& topk_ids,
-    torch::optional<torch::Tensor> const& out_tensor = torch::nullopt)
+    torch::optional<torch::Tensor> const& out_tensor = torch::nullopt,
+    torch::optional<torch::Tensor> const& a2a_flag_val = torch::nullopt)
 {
     TORCH_CHECK(dtype == btg::Dtype::E4m3 || dtype == btg::Dtype::E2m1, "dtype can only be e4m3 or e2m1.");
     TORCH_CHECK(tensorrt_llm::common::isSM100Family(), "Only SM100f is supported by FP4 block scale MOE");
@@ -482,6 +483,21 @@ std::vector<torch::Tensor> run_fp4_block_scale_moe_runner(torch::optional<torch:
     workspace.gemm2_output_scale = nullptr;
     args.output = output.data_ptr();
     args.output_scale = nullptr;
+    if (a2a_flag_val.has_value())
+    {
+        // MoE all-to-all low-precision combine staging: the finalize writes each bf16-rounded row as FP8 E4M3 in place
+        // at the start of its row slot of out_tensor (the combine payload region of the workspace) and advances the
+        // all-to-all round counter, so moe_a2a_combine(payload_prestaged=True) skips its prepare pass.
+        TORCH_CHECK(do_finalize && out_tensor.has_value(), "a2a_flag_val requires do_finalize and out_tensor.");
+        TORCH_CHECK(out_tensor->stride(1) == 1, "a2a_flag_val requires out_tensor rows to be contiguous.");
+        TORCH_CHECK(a2a_flag_val->is_cuda() && a2a_flag_val->numel() == 1
+                && (a2a_flag_val->scalar_type() == at::ScalarType::Int
+                    || a2a_flag_val->scalar_type() == at::ScalarType::UInt32),
+            "a2a_flag_val must be a one-element int32 / uint32 CUDA tensor.");
+        args.output_fp8 = output.data_ptr();
+        args.output_fp8_row_stride_bytes = output.stride(0) * output.element_size();
+        args.a2a_flag_val = reinterpret_cast<uint32_t*>(a2a_flag_val->data_ptr());
+    }
     args.output1_scales_scalar = output1_scales_scalar.data_ptr<float>();
     args.output1_scales_gate_scalar = output1_scales_gate_scalar.data_ptr<float>();
     args.output2_scales_scalar = output2_scales_scalar.data_ptr<float>();
@@ -591,6 +607,56 @@ public:
         std::vector<int64_t> moeConfigIndex, torch::optional<torch::Tensor> const& topk_weights,
         torch::optional<torch::Tensor> const& topk_ids, torch::optional<torch::Tensor> const& output = torch::nullopt)
     {
+        return runImpl(routing_logits, routing_bias, hidden_states, hidden_states_scale, gemm1_weights,
+            gemm1_weights_scale, gemm1_bias, gemm1_alpha, gemm1_beta, gemm1_clamp_limit, gemm2_weights,
+            gemm2_weights_scale, gemm2_bias, output1_scales_scalar, output1_scales_gate_scalar, output2_scales_scalar,
+            num_experts, top_k, n_group, topk_group, intermediate_size, local_expert_offset, local_num_experts,
+            routed_scaling_factor, routing_method_type, do_finalize, std::move(moeConfigIndex), topk_weights, topk_ids,
+            output, torch::nullopt);
+    }
+
+    // run() with the finalize staging its output for the MoE all-to-all low-precision combine (see a2a_flag_val in
+    // run_fp4_block_scale_moe_runner); `output` must be the combine payload view of the all-to-all workspace.
+    [[nodiscard]] std::vector<torch::Tensor> runStaged(torch::optional<torch::Tensor> const& routing_logits,
+        torch::optional<torch::Tensor> const& routing_bias, torch::Tensor const& hidden_states,
+        torch::Tensor const& hidden_states_scale, torch::Tensor const& gemm1_weights,
+        torch::Tensor const& gemm1_weights_scale, std::optional<torch::Tensor> const& gemm1_bias,
+        std::optional<torch::Tensor> const& gemm1_alpha, std::optional<torch::Tensor> const& gemm1_beta,
+        std::optional<torch::Tensor> const& gemm1_clamp_limit, torch::Tensor const& gemm2_weights,
+        torch::Tensor const& gemm2_weights_scale, std::optional<torch::Tensor> const& gemm2_bias,
+        torch::Tensor const& output1_scales_scalar, torch::Tensor const& output1_scales_gate_scalar,
+        torch::Tensor const& output2_scales_scalar, int64_t const num_experts, int64_t const top_k,
+        std::optional<int64_t> const n_group, std::optional<int64_t> const topk_group, int64_t const intermediate_size,
+        int64_t const local_expert_offset, int64_t const local_num_experts,
+        std::optional<double> const routed_scaling_factor, int64_t const routing_method_type, bool const do_finalize,
+        std::vector<int64_t> moeConfigIndex, torch::optional<torch::Tensor> const& topk_weights,
+        torch::optional<torch::Tensor> const& topk_ids, torch::Tensor const& output, torch::Tensor const& a2a_flag_val)
+    {
+        return runImpl(routing_logits, routing_bias, hidden_states, hidden_states_scale, gemm1_weights,
+            gemm1_weights_scale, gemm1_bias, gemm1_alpha, gemm1_beta, gemm1_clamp_limit, gemm2_weights,
+            gemm2_weights_scale, gemm2_bias, output1_scales_scalar, output1_scales_gate_scalar, output2_scales_scalar,
+            num_experts, top_k, n_group, topk_group, intermediate_size, local_expert_offset, local_num_experts,
+            routed_scaling_factor, routing_method_type, do_finalize, std::move(moeConfigIndex), topk_weights, topk_ids,
+            output, a2a_flag_val);
+    }
+
+private:
+    std::vector<torch::Tensor> runImpl(torch::optional<torch::Tensor> const& routing_logits,
+        torch::optional<torch::Tensor> const& routing_bias, torch::Tensor const& hidden_states,
+        torch::Tensor const& hidden_states_scale, torch::Tensor const& gemm1_weights,
+        torch::Tensor const& gemm1_weights_scale, std::optional<torch::Tensor> const& gemm1_bias,
+        std::optional<torch::Tensor> const& gemm1_alpha, std::optional<torch::Tensor> const& gemm1_beta,
+        std::optional<torch::Tensor> const& gemm1_clamp_limit, torch::Tensor const& gemm2_weights,
+        torch::Tensor const& gemm2_weights_scale, std::optional<torch::Tensor> const& gemm2_bias,
+        torch::Tensor const& output1_scales_scalar, torch::Tensor const& output1_scales_gate_scalar,
+        torch::Tensor const& output2_scales_scalar, int64_t const num_experts, int64_t const top_k,
+        std::optional<int64_t> const n_group, std::optional<int64_t> const topk_group, int64_t const intermediate_size,
+        int64_t const local_expert_offset, int64_t const local_num_experts,
+        std::optional<double> const routed_scaling_factor, int64_t const routing_method_type, bool const do_finalize,
+        std::vector<int64_t> moeConfigIndex, torch::optional<torch::Tensor> const& topk_weights,
+        torch::optional<torch::Tensor> const& topk_ids, torch::optional<torch::Tensor> const& output,
+        torch::optional<torch::Tensor> const& a2a_flag_val)
+    {
         int64_t tileN = moeConfigIndex[0];
         int64_t config = moeConfigIndex[1];
         bool const useFineGrained = tensorrt_llm::common::getEnvUseFineGrainedSync();
@@ -639,10 +705,9 @@ public:
             gemm2_weights_scale, gemm2_bias, output1_scales_scalar, output1_scales_gate_scalar, output2_scales_scalar,
             num_experts, top_k, n_group, topk_group, intermediate_size, local_expert_offset, local_num_experts,
             routed_scaling_factor, tileN, routing_method_type, do_finalize, mDtypeElt, *runner, configToRun,
-            topk_weights, topk_ids, output);
+            topk_weights, topk_ids, output, a2a_flag_val);
     }
 
-private:
     std::vector<int32_t> const mSupportedTileN;
     int64_t mActType;
     // Keyed on (tileN, useFineGrained); a null value means "no cubin for that combination".
@@ -760,7 +825,8 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
     m.class_<tensorrt_llm::torch_ext::FP4BlockScaleMoeRunner>("FP4BlockScaleMoERunner")
         .def(torch::init<int64_t>())
         .def("get_valid_configs", &tensorrt_llm::torch_ext::FP4BlockScaleMoeRunner::getValidConfigs)
-        .def("run_moe", &tensorrt_llm::torch_ext::FP4BlockScaleMoeRunner::run);
+        .def("run_moe", &tensorrt_llm::torch_ext::FP4BlockScaleMoeRunner::run)
+        .def("run_moe_staged", &tensorrt_llm::torch_ext::FP4BlockScaleMoeRunner::runStaged);
     m.class_<tensorrt_llm::torch_ext::FP8FP4BlockScaleMoeRunner>("FP8FP4BlockScaleMoERunner")
         .def(torch::init<int64_t>())
         .def("get_valid_configs", &tensorrt_llm::torch_ext::FP8FP4BlockScaleMoeRunner::getValidConfigs)

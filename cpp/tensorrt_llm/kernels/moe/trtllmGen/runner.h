@@ -349,6 +349,11 @@ struct MoERunnerArgs
     // Output:
     void* output = nullptr;
     float* output_scale = nullptr;
+    // Optional MoE all-to-all low-precision combine staging (see moe::dev::finalize::Data::outFp8Ptr): the finalize
+    // writes FP8 rows here (row stride in bytes) instead of `output` and advances *a2a_flag_val.
+    void* output_fp8 = nullptr;
+    int64_t output_fp8_row_stride_bytes = 0;
+    uint32_t* a2a_flag_val = nullptr;
 
     // finalize
     bool do_finalize{true};

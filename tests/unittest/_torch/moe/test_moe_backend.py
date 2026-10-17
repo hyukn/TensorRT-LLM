@@ -55,6 +55,7 @@ from tensorrt_llm._torch.moe.fused_moe import (
     DeepSeekV3MoeRoutingMethod,
     RenormalizeMoeRoutingMethod,
 )
+from tensorrt_llm._torch.moe.fused_moe import moe_scheduler as moe_scheduler_module
 from tensorrt_llm._torch.moe.fused_moe.activation import (
     DEFAULT_MOE_ACTIVATION,
     MoEActivation,
@@ -801,6 +802,82 @@ def test_a_backend_that_does_finalize_still_gets_the_workspace_payload():
     )
     assert moe_output is sentinel
     assert payload_in_workspace is True
+
+
+def _staging_scheduler(*, low_precision=True, backend_supports=True, cft=False):
+    """One-sided scheduler whose comm / backend can stage the FP8 combine payload in the finalize."""
+    sentinel = torch.zeros(8, _HOOK_HIDDEN)
+    scheduler, comm = _onesided_scheduler(workspace_tensor=sentinel)
+    comm.use_low_precision_combine = low_precision
+    comm.use_cft_for_combine.return_value = cft
+    counter = torch.zeros(1, dtype=torch.int32)
+    comm.get_round_counter_tensor.return_value = counter
+    comm.payload_prestaged = None  # set by every plan
+    scheduler.moe.backend.supports_a2a_finalize_staging.return_value = backend_supports
+    scheduler.moe.enable_alltoall = True
+    return scheduler, comm, counter
+
+
+@pytest.mark.parametrize("enabled", [False, True], ids=["env-off", "env-on"])
+def test_the_finalize_stages_the_fp8_combine_payload_only_when_every_condition_holds(
+    monkeypatch, enabled
+):
+    """TRTLLM_MOE_A2A_FINALIZE_STAGING: the plan carries the round counter and the comm skips the prepare pass."""
+    monkeypatch.setattr(moe_scheduler_module, "_A2A_FINALIZE_STAGING", enabled)
+    scheduler, comm, counter = _staging_scheduler()
+    plan = scheduler._build_comm_plan([4, 4], torch.bfloat16, True)
+    assert plan.payload_in_workspace is True
+    if enabled:
+        assert plan.a2a_staging_flag is counter
+        assert comm.payload_prestaged is True
+    else:
+        assert plan.a2a_staging_flag is None
+        assert comm.payload_prestaged is False
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [dict(low_precision=False), dict(backend_supports=False), dict(cft=True)],
+    ids=["bf16-combine", "backend-cannot-stage", "cft-combine"],
+)
+def test_the_fp8_staging_needs_a_low_precision_fence_combine_and_a_capable_backend(
+    monkeypatch, kwargs
+):
+    monkeypatch.setattr(moe_scheduler_module, "_A2A_FINALIZE_STAGING", True)
+    scheduler, comm, _ = _staging_scheduler(**kwargs)
+    plan = scheduler._build_comm_plan([4, 4], torch.bfloat16, True)
+    assert plan.a2a_staging_flag is None
+    assert comm.payload_prestaged is False
+
+
+def test_the_fp8_staging_needs_a_finalized_payload_in_the_workspace(monkeypatch):
+    """do_finalize=False hands back the unfinalized triple: nothing is in the workspace to stage."""
+    monkeypatch.setattr(moe_scheduler_module, "_A2A_FINALIZE_STAGING", True)
+    scheduler, comm, _ = _staging_scheduler()
+    plan = scheduler._build_comm_plan([4, 4], torch.bfloat16, False)
+    assert plan.payload_in_workspace is False
+    assert plan.a2a_staging_flag is None
+    assert comm.payload_prestaged is False
+
+
+def test_only_the_native_nvfp4_trtllm_gen_leaf_can_stage():
+    from tensorrt_llm._torch.moe.fused_moe.trtllm_gen.base import TrtllmGenFusedMoEBase
+    from tensorrt_llm._torch.moe.fused_moe.trtllm_gen.fp4_block_scale import TRTLLMGenNvfp4Base
+
+    class _Nvfp4(TRTLLMGenNvfp4Base):
+        pass
+
+    class _Other(TrtllmGenFusedMoEBase):
+        pass
+
+    for cls in (_Nvfp4, _Other):
+        cls.__abstractmethods__ = frozenset()  # capability checks only; never initialized or run
+    native = _Nvfp4.__new__(_Nvfp4)
+    native.use_flashinfer = False
+    assert native.supports_a2a_finalize_staging()
+    native.use_flashinfer = True
+    assert not native.supports_a2a_finalize_staging()
+    assert not _Other.__new__(_Other).supports_a2a_finalize_staging()
 
 
 def _ensure_single_proc_dist_for_megamoe(backend_type: MoeBackendType, rank: int) -> None:
@@ -3642,6 +3719,97 @@ def test_moe_backend_trtllm_nvfp4_fine_grained(num_tokens: int):
             )
 
             ref_fused_moe.check_accuracy(output, ref_output)
+
+
+@pytest.mark.parametrize("num_tokens", [1, 37, 1024], ids=["scalar-1", "scalar-37", "vector-1024"])
+def test_trtllm_gen_nvfp4_finalize_stages_the_fp8_combine_payload(num_tokens: int):
+    """MoECommPlan.a2a_staging_flag: the finalize writes each row of the bf16 output as FP8 E4M3 (RN, satfinite) at
+    the start of its row slot and advances the all-to-all round counter, so the combine needs no prepare pass. The
+    bytes must be the FP8 of the unstaged bf16 output; the rest of each slot is left alone. 1 / 37 tokens take the
+    scalar finalize, 1024 the vectorized one."""
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is required")
+    if get_sm_version() not in (100, 103):
+        pytest.skip(f"TRTLLM-Gen NVFP4 MoE needs SM100 / SM103, got SM{get_sm_version()}")
+    dtype = torch.bfloat16
+    num_experts, top_k, hidden_size, intermediate_size = 128, 4, 512, 512
+    mapping = Mapping()
+    mapping.rank = mpi_rank()
+    with torch.device(f"cuda:{mapping.rank}"):
+        torch.manual_seed(0)
+        AutoTuner.get().setup_distributed_state(mapping)
+        routing_method = RenormalizeMoeRoutingMethod(top_k=top_k)
+        x = torch.randn((num_tokens, hidden_size), dtype=dtype, device="cuda")
+        router_logits = torch.randn((num_tokens, num_experts), dtype=dtype, device="cuda")
+        quantize_util_cls, quant_config, quant_kwargs = get_test_quant_params(
+            QuantAlgo.NVFP4, x, MoeBackendType.TRTLLM
+        )
+        quantize_util = quantize_util_cls(
+            num_experts=num_experts,
+            dtype=dtype,
+            intermediate_size=intermediate_size,
+            hidden_size=hidden_size,
+            quant_config=quant_config,
+            bias=False,
+            swiglu_gptoss_style=False,
+            swiglu_alpha=None,
+            swiglu_beta=None,
+            swiglu_limit=None,
+            activation_type=ActivationType.Swiglu,
+        )
+        weights = quantize_util.create_weights(**quant_kwargs)
+        backend = create_test_backend(
+            backend_type=MoeBackendType.TRTLLM,
+            routing_method=routing_method,
+            num_experts=num_experts,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            dtype=dtype,
+            quant_config=quant_config,
+            mapping=mapping,
+            activation_type=ActivationType.Swiglu,
+        )
+        backend.load_weights([weights])
+        backend.post_load_weights()
+        backend.cuda()
+        if not backend.supports_a2a_finalize_staging():
+            pytest.skip("this TRTLLM-Gen provider cannot stage the combine payload")
+
+        with torch.inference_mode():
+            token_selected_experts, token_final_scales = routing_method.apply(router_logits)
+            x_quantized, x_sf = backend.quantize_input(x, post_quant_comm=False)
+
+            def run(out, flag):
+                plan = MoECommPlan(
+                    input_sf_swizzled=True,
+                    enable_alltoall=False,
+                    moe_output=out,
+                    payload_in_workspace=True,
+                    a2a_staging_flag=flag,
+                )
+                backend.run_moe(
+                    MoERunContext(
+                        x=x_quantized,
+                        x_sf=x_sf,
+                        token_selected_experts=token_selected_experts.to(torch.int32),
+                        token_final_scales=token_final_scales.to(torch.bfloat16),
+                        comm_plan=plan,
+                    )
+                )
+
+            reference = torch.empty((num_tokens, hidden_size), dtype=dtype, device="cuda")
+            run(reference, None)
+            staged = torch.full((num_tokens, hidden_size), -7.0, dtype=dtype, device="cuda")
+            flag = torch.tensor([41], dtype=torch.int32, device="cuda")
+            run(staged, flag)
+            torch.cuda.synchronize()
+
+        assert flag.item() == 42
+        expected = reference.float().clamp(-448.0, 448.0).to(torch.float8_e4m3fn).view(torch.uint8)
+        staged_bytes = staged.view(torch.uint8)
+        assert torch.equal(staged_bytes[:, :hidden_size], expected)
+        untouched = torch.full_like(staged, -7.0).view(torch.uint8)
+        assert torch.equal(staged_bytes[:, hidden_size:], untouched[:, hidden_size:])
 
 
 def test_build_moe_deployment_carries_finalize_and_locality_domain():

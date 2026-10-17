@@ -745,6 +745,9 @@ void Runner::setOpsData(MoERunnerArgs const& args, MoEWorkspace const& workspace
         finalizeData.mUseDeepSeekFp8 = false;
         finalizeData.inPtr = workspace.gemm2_output;
         finalizeData.outPtr = args.output;
+        finalizeData.outFp8Ptr = args.output_fp8;
+        finalizeData.outFp8RowStrideBytes = args.output_fp8_row_stride_bytes;
+        finalizeData.a2aFlagVal = args.a2a_flag_val;
         finalizeData.inDqSfsPtr = workspace.gemm2_output_scale;
         finalizeData.outDqSfsPtr = args.output_scale;
         if (args.mUseRoutingScalesOnInput)

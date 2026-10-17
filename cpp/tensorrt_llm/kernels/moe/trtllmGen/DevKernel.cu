@@ -19,6 +19,8 @@
 #include "cutlass/array.h"
 #include "cutlass/numeric_conversion.h"
 #include <cub/cub.cuh>
+#include <cuda_bf16.h>
+#include <cuda_fp8.h>
 #include <cutlass/cutlass.h>
 #include <cutlass/numeric_types.h>
 
@@ -968,6 +970,31 @@ namespace tg = batchedGemm::trtllm::gen;
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
+// MoE all-to-all low-precision combine staging (Data::outFp8Ptr): bf16 pair -> FP8 E4M3 pair, round-to-nearest and
+// saturating, the same instruction the combine's prepare pass uses, so the staged bytes are identical to the ones it
+// would write from the bf16 output.
+__device__ __forceinline__ uint16_t bf16x2ToE4m3x2(uint32_t bf16x2)
+{
+    uint16_t out = 0;
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+    asm volatile("cvt.rn.satfinite.e4m3x2.bf16x2 %0, %1;" : "=h"(out) : "r"(bf16x2));
+#else
+    __nv_bfloat162 const v = *reinterpret_cast<__nv_bfloat162 const*>(&bf16x2);
+    out = __nv_cvt_bfloat16raw2_to_fp8x2(static_cast<__nv_bfloat162_raw>(v), __NV_SATFINITE, __NV_E4M3);
+#endif
+    return out;
+}
+
+// The staging path advances the all-to-all round counter once per launch (the prepare pass's other job).
+template <typename KernelParams>
+__device__ __forceinline__ void advanceA2aRound(KernelParams const& params)
+{
+    if (params.a2aFlagVal != nullptr && blockIdx.x == 0 && blockIdx.y == 0 && threadIdx.x == 0)
+    {
+        *params.a2aFlagVal = *params.a2aFlagVal + 1;
+    }
+}
+
 template <typename KernelParams>
 __global__ void finalizeKernel(KernelParams params)
 {
@@ -981,6 +1008,7 @@ __global__ void finalizeKernel(KernelParams params)
         cudaGridDependencySynchronize();
     }
 #endif
+    advanceA2aRound(params);
 
     for (int tokenIdx = blockIdx.y; tokenIdx < params.numTokens; tokenIdx += gridDim.y)
     {
@@ -1015,6 +1043,17 @@ __global__ void finalizeKernel(KernelParams params)
                 }
             }
 
+            if constexpr (std::is_same_v<Type, cutlass::bfloat16_t>)
+            {
+                if (params.outFp8Ptr != nullptr)
+                {
+                    cutlass::bfloat16_t const v = static_cast<Type>(data);
+                    uint32_t const pair = static_cast<uint32_t>(v.raw());
+                    params.outFp8Ptr[static_cast<int64_t>(tokenIdx) * params.outFp8RowStrideBytes + hiddenIdx]
+                        = static_cast<uint8_t>(bf16x2ToE4m3x2(pair) & 0xffu);
+                    continue;
+                }
+            }
             params.outPtr[static_cast<int64_t>(tokenIdx) * params.hiddenDim + hiddenIdx] = static_cast<Type>(data);
         }
     }
@@ -1070,6 +1109,7 @@ __global__ void finalizeKernelVecLoad(KernelParams params)
         cudaGridDependencySynchronize();
     }
 #endif
+    advanceA2aRound(params);
 
     for (int elemIndex = startOffset; elemIndex < numElemsInColPerBlock; elemIndex += stride)
     {
@@ -1097,6 +1137,24 @@ __global__ void finalizeKernelVecLoad(KernelParams params)
         }
 
         OutputElem outputElem = arrayConvert<ComputeElem, OutputElem>(threadOutput);
+        if constexpr (std::is_same_v<Type, cutlass::bfloat16_t>)
+        {
+            if (params.outFp8Ptr != nullptr)
+            {
+                // 8 bf16 values -> 8 FP8 bytes at the same element offset of the staged row.
+                static_assert(FINALIZE_ELEM_PER_THREAD == 8, "bf16 rows are processed 8 values per thread");
+                uint32_t const* pairs = reinterpret_cast<uint32_t const*>(&outputElem);
+                uint2 packed;
+                packed.x = static_cast<uint32_t>(bf16x2ToE4m3x2(pairs[0]))
+                    | (static_cast<uint32_t>(bf16x2ToE4m3x2(pairs[1])) << 16);
+                packed.y = static_cast<uint32_t>(bf16x2ToE4m3x2(pairs[2]))
+                    | (static_cast<uint32_t>(bf16x2ToE4m3x2(pairs[3])) << 16);
+                *reinterpret_cast<uint2*>(params.outFp8Ptr + tokenIdx * params.outFp8RowStrideBytes
+                    + static_cast<int64_t>(elemIndex) * FINALIZE_ELEM_PER_THREAD)
+                    = packed;
+                continue;
+            }
+        }
         outElemPtr[elemIndex] = outputElem;
     }
 }

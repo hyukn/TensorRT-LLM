@@ -590,6 +590,11 @@ class MoECommPlan:
     recv_expert_count: Optional[torch.Tensor] = None
     deep_ep_expert_capacity: Optional[int] = None
     use_deep_ep_direct_metadata: bool = False
+    # NVLinkOneSided low-precision combine with the payload in the workspace: when set, ``run_moe``'s finalize writes
+    # the FP8 wire rows in place and advances this all-to-all round counter (a one-element view of the workspace), so
+    # the following ``combine()`` skips its prepare pass. Only set for backends whose
+    # ``supports_a2a_finalize_staging()`` is True.
+    a2a_staging_flag: Optional[torch.Tensor] = None
 
 
 @dataclass(frozen=True)

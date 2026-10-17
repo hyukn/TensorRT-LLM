@@ -179,6 +179,7 @@ class TRTLLMGenFp4BlockScaleBase(TrtllmGenFusedMoEBase):
             # Pass that to the autotuner so the top bucket profiles per-expert load at runtime scale.
             tune_max_num_tokens=self.max_num_tokens,
             use_dp=self.use_dp,
+            **({"a2a_flag_val": k.a2a_staging_flag} if k.a2a_staging_flag is not None else {}),
         )
 
         if not k.do_finalize:
@@ -204,6 +205,10 @@ class TRTLLMGenNvfp4Base(TRTLLMGenFp4BlockScaleBase):
         runners without a ``do_finalize`` parameter, which finalize regardless.
         """
         return True
+
+    def supports_a2a_finalize_staging(self) -> bool:
+        """The native NVFP4 runner's finalize can stage the FP8 combine payload (``run_moe_staged``)."""
+        return not self.use_flashinfer
 
     # Group size of the ``Bmm_E2m1_E2m1E2m1_..._siTuGlu_*`` cubins. Whether a
     # leaf may reach them is ``supports_situ``, declared per leaf because only

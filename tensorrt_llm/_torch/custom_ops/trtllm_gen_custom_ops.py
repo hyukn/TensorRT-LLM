@@ -499,24 +499,29 @@ class FP4BlockScaleMoERunner(TunableRunner):
         inputs: List[torch.Tensor],
         tactic: List[int] = [-1, -1],
         output: Optional[torch.Tensor] = None,
+        a2a_flag_val: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         assert isinstance(tactic, list)
 
         args = FP4BlockScaleMoEInputs(*inputs)
         kernel_runner = self.get_runner()
 
-        return kernel_runner.run_moe(
-            args.routing_logits, args.routing_bias, args.hidden_states,
-            args.hidden_states_scale, args.gemm1_weights,
-            args.gemm1_weights_scale, args.gemm1_bias, args.gemm1_alpha,
-            args.gemm1_beta, args.gemm1_clamp_limit, args.gemm2_weights,
-            args.gemm2_weights_scale, args.gemm2_bias,
-            args.output1_scale_scalar, args.output1_scale_gate_scalar,
-            args.output2_scale_scalar, self.num_experts, self.top_k,
-            self.n_group, self.topk_group, self.intermediate_size,
-            self.local_expert_offset, self.local_num_experts,
-            self.routed_scaling_factor, self.routing_method_type,
-            self.do_finalize, tactic, args.topk_weights, args.topk_ids, output)
+        common = (args.routing_logits, args.routing_bias, args.hidden_states,
+                  args.hidden_states_scale, args.gemm1_weights,
+                  args.gemm1_weights_scale, args.gemm1_bias, args.gemm1_alpha,
+                  args.gemm1_beta, args.gemm1_clamp_limit, args.gemm2_weights,
+                  args.gemm2_weights_scale, args.gemm2_bias,
+                  args.output1_scale_scalar, args.output1_scale_gate_scalar,
+                  args.output2_scale_scalar, self.num_experts, self.top_k,
+                  self.n_group, self.topk_group, self.intermediate_size,
+                  self.local_expert_offset, self.local_num_experts,
+                  self.routed_scaling_factor, self.routing_method_type,
+                  self.do_finalize, tactic, args.topk_weights, args.topk_ids)
+        if a2a_flag_val is not None:
+            # The finalize stages the MoE all-to-all low-precision combine payload in `output` (the workspace view)
+            # and advances the round counter; see MoECommPlan.a2a_staging_flag.
+            return kernel_runner.run_moe_staged(*common, output, a2a_flag_val)
+        return kernel_runner.run_moe(*common, output)
 
     def get_valid_tactics(self, inputs: List[torch.Tensor],
                           profile: OptimizationProfile,
@@ -648,38 +653,40 @@ class FP4BlockScaleMoERunner(TunableRunner):
 
 
 @torch.library.custom_op("trtllm::fp4_block_scale_moe_runner", mutates_args=())
-def fp4_block_scale_moe_runner(routing_logits: Optional[torch.Tensor],
-                               routing_bias: Optional[torch.Tensor],
-                               hidden_states: torch.Tensor,
-                               hidden_states_scale: torch.Tensor,
-                               gemm1_weights: torch.Tensor,
-                               gemm1_weights_scale: torch.Tensor,
-                               gemm1_bias: torch.Tensor,
-                               gemm1_alpha: torch.Tensor,
-                               gemm1_beta: torch.Tensor,
-                               gemm1_clamp_limit: torch.Tensor,
-                               gemm2_weights: torch.Tensor,
-                               gemm2_weights_scale: torch.Tensor,
-                               gemm2_bias: torch.Tensor,
-                               output1_scale_scalar: torch.Tensor,
-                               output1_scale_gate_scalar: torch.Tensor,
-                               output2_scale_scalar: torch.Tensor,
-                               num_experts: int,
-                               top_k: int,
-                               n_group: Optional[int],
-                               topk_group: Optional[int],
-                               intermediate_size: int,
-                               local_expert_offset: int,
-                               local_num_experts: int,
-                               routed_scaling_factor: Optional[float],
-                               routing_method_type: int,
-                               do_finalize: bool,
-                               act_type: int = ActType_TrtllmGen.SwiGlu.value,
-                               topk_weights: Optional[torch.Tensor] = None,
-                               topk_ids: Optional[torch.Tensor] = None,
-                               output: Optional[torch.Tensor] = None,
-                               tune_max_num_tokens: int = 8192,
-                               use_dp: bool = False) -> List[torch.Tensor]:
+def fp4_block_scale_moe_runner(
+        routing_logits: Optional[torch.Tensor],
+        routing_bias: Optional[torch.Tensor],
+        hidden_states: torch.Tensor,
+        hidden_states_scale: torch.Tensor,
+        gemm1_weights: torch.Tensor,
+        gemm1_weights_scale: torch.Tensor,
+        gemm1_bias: torch.Tensor,
+        gemm1_alpha: torch.Tensor,
+        gemm1_beta: torch.Tensor,
+        gemm1_clamp_limit: torch.Tensor,
+        gemm2_weights: torch.Tensor,
+        gemm2_weights_scale: torch.Tensor,
+        gemm2_bias: torch.Tensor,
+        output1_scale_scalar: torch.Tensor,
+        output1_scale_gate_scalar: torch.Tensor,
+        output2_scale_scalar: torch.Tensor,
+        num_experts: int,
+        top_k: int,
+        n_group: Optional[int],
+        topk_group: Optional[int],
+        intermediate_size: int,
+        local_expert_offset: int,
+        local_num_experts: int,
+        routed_scaling_factor: Optional[float],
+        routing_method_type: int,
+        do_finalize: bool,
+        act_type: int = ActType_TrtllmGen.SwiGlu.value,
+        topk_weights: Optional[torch.Tensor] = None,
+        topk_ids: Optional[torch.Tensor] = None,
+        output: Optional[torch.Tensor] = None,
+        tune_max_num_tokens: int = 8192,
+        use_dp: bool = False,
+        a2a_flag_val: Optional[torch.Tensor] = None) -> List[torch.Tensor]:
 
     tuner = AutoTuner.get()
     kernel_runner = FP4BlockScaleMoERunner(
@@ -755,7 +762,8 @@ def fp4_block_scale_moe_runner(routing_logits: Optional[torch.Tensor],
     result = kernel_runner(
         input_tensors,
         tactic=[-1, -1] if best_tactic == -1 else best_tactic,
-        output=output)
+        output=output,
+        a2a_flag_val=a2a_flag_val)
     # When output is provided and do_finalize=True, the result is written in-place to output.
     # Return empty tensor to avoid aliasing constraint violation in PyTorch 2.9.1+
     # (custom op output cannot be the same tensor as input).
@@ -823,7 +831,8 @@ def _(routing_logits,
       topk_ids: Optional[torch.Tensor] = None,
       output: Optional[torch.Tensor] = None,
       tune_max_num_tokens: int = 8192,
-      use_dp: bool = False) -> List[torch.Tensor]:
+      use_dp: bool = False,
+      a2a_flag_val: Optional[torch.Tensor] = None) -> List[torch.Tensor]:
     if do_finalize:
         num_tokens = hidden_states.shape[0]
         hidden_size = hidden_states.shape[1] * 2

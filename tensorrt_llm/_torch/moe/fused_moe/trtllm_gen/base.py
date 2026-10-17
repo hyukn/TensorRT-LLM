@@ -435,6 +435,10 @@ class TrtllmGenFusedMoEBase(MoEImplBase):
         """
         return not self.use_flashinfer
 
+    def supports_a2a_finalize_staging(self) -> bool:
+        """Whether ``run_moe`` can stage the low-precision combine payload itself (MoECommPlan.a2a_staging_flag)."""
+        return False
+
     def _unfinalized(self, outputs: list[torch.Tensor]) -> list[torch.Tensor]:
         """Hand back per-expert outputs for the caller to combine."""
         assert not self.reduce_results, "reduce_results must be False when do_finalize is False"

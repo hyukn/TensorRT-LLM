@@ -644,6 +644,7 @@ class MoeAlltoAll:
         payload_in_workspace: bool = False,
         use_low_precision_combine: bool = False,
         active_rank_mask: Optional[torch.Tensor] = None,
+        payload_prestaged: bool = False,
     ):
         """
         Perform MoE all-to-all combine operation.
@@ -656,6 +657,9 @@ class MoeAlltoAll:
             active_rank_mask: Optional uint64 CPU tensor. In rank-mask mode, it must match the mask captured by
                 dispatch for this collective when supplied. A committed-generation change since dispatch aborts
                 the collective epoch.
+            payload_prestaged: With use_low_precision_combine and payload_in_workspace: the producer already wrote
+                the FP8 wire rows in place (at the start of each row slot) and advanced the round counter, so the
+                prepare pass is skipped.
 
         Returns:
             combined_output: [local_num_tokens, num_elements_per_token] tensor of combined results
@@ -682,7 +686,10 @@ class MoeAlltoAll:
             self.metainfo, runtime_max_tokens_per_rank, self.ep_rank,
             self.ep_size, self.top_k, self._state.combine_payload_offset,
             payload_in_workspace, use_low_precision_combine,
-            use_cft_for_combine, self._rank_mask_enabled, active_rank_mask)
+            use_cft_for_combine, self._rank_mask_enabled, active_rank_mask,
+            **({
+                "payload_prestaged": True
+            } if payload_prestaged else {}))
         self._watchdog_coordinator.watch_collective(self._alltoall_watchdog,
                                                     "combine", active_rank_mask)
 

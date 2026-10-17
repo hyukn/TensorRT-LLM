@@ -336,6 +336,7 @@ class TRTLLMOpBackend(MoEOpBackend):
         output=None,
         tune_max_num_tokens=8192,
         use_dp=False,
+        a2a_flag_val=None,
     ):
         # The native runners take the block scales as one flat linear-layout
         # tensor (``fp4BlockScaleMoe.cpp`` checks ``dim() == 1``); the
@@ -446,6 +447,7 @@ class TRTLLMOpBackend(MoEOpBackend):
                     output=output,
                     tune_max_num_tokens=tune_max_num_tokens,
                     use_dp=use_dp,
+                    **({"a2a_flag_val": a2a_flag_val} if a2a_flag_val is not None else {}),
                 )
                 if not do_finalize:
                     return outputs

@@ -664,6 +664,10 @@ class TestMoEAlltoAll:
             (4, [32, 0, 16, 0], 4, True, True),
             (4, [16, 32, 64, 48], 4, True, True),  # non-uniform tokens
             (4, [32, 32, 32, 32], 10, True, True),
+            # payload_prestaged: the producer staged the FP8 rows and the round counter itself
+            (4, [32, 32, 32, 32], 4, True, "prestaged"),
+            (4, [32, 0, 16, 0], 4, True, "prestaged"),
+            (4, [16, 32, 64, 48], 4, True, "prestaged"),
         ],
         indirect=["mpi_pool_executor"])
     def test_combine(self, mpi_pool_executor, all_num_tokens, top_k,
@@ -709,7 +713,7 @@ class TestMoEAlltoAll:
             traceback.print_exc()
             raise
 
-        if use_fp8_combine:
+        if use_fp8_combine:  # True or "prestaged"
             verify_combine(all_results, ep_size, rtol=0.13, atol=1.0)
         else:
             verify_combine(all_results, ep_size, rtol=0.1, atol=0.5)
@@ -799,9 +803,37 @@ def run_moe_a2a_dispatch_moe_combine_single_rank(
                                    max_num_tokens,
                                    use_low_precision_combine=use_low_precision)
 
+        prestaged = use_low_precision_combine == "prestaged"
+        use_low_precision_combine = bool(use_low_precision_combine)
         moe_out = dispatch_and_fake_moe()
         combined_output = _combine(moe_out,
                                    use_low_precision=use_low_precision_combine)
+        if prestaged:
+            # Second round, same inputs: stage the FP8 wire rows in place (at the start of each bf16 row slot) and
+            # advance the round counter as a producer would, then combine without the prepare pass. The result
+            # must be bitwise the prepare pass's (RN-even FP8 of the same bf16 values).
+            moe_out2 = dispatch_and_fake_moe()
+            ws = moe_a2a.get_combine_payload_tensor_in_workspace(
+                max_num_tokens, hidden_size, torch.bfloat16)
+            rows = ws.view(-1, hidden_size)
+            # satfinite: clamp to the E4M3 range, then round to nearest even
+            fp8 = moe_out2.view(-1, hidden_size).float().clamp(
+                -448.0, 448.0).to(torch.float8_e4m3fn).view(torch.uint8)
+            rows.view(torch.uint8)[:, :hidden_size].copy_(fp8)
+            flag_val_offset = moe_a2a.metainfo[
+                MoeAlltoAll._METAINFO_INDEX["FLAG_VAL_OFFSET_INDEX"]].item()
+            moe_a2a.workspace[rank, flag_val_offset:flag_val_offset + 4].view(
+                torch.int32).add_(1)
+            prestaged_output = moe_a2a.combine(
+                ws.view(ep_size, max_num_tokens, hidden_size),
+                max_num_tokens,
+                payload_in_workspace=True,
+                use_low_precision_combine=True,
+                payload_prestaged=True,
+            )
+            assert torch.equal(prestaged_output, combined_output), (
+                f"Rank {rank}: prestaged combine differs from the prepare-pass combine"
+            )
 
         wire_bytes_per_token = hidden_size * (1 if use_low_precision_combine
                                               else moe_out.element_size())

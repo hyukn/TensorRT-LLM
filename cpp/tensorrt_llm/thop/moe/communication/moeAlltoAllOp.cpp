@@ -750,7 +750,7 @@ torch::Tensor moeA2ACombineOp(torch::Tensor const& payload, int64_t localNumToke
     torch::Tensor const& metainfo, int64_t runtimeMaxTokensPerRank, int64_t epRank, int64_t epSize, int64_t topK,
     int64_t combinePayloadOffset, bool payloadInWorkspace, bool useLowPrecision = false,
     bool useCftCountedWrites = false, bool enableRankMask = false,
-    torch::optional<torch::Tensor> activeRankMask = torch::nullopt)
+    torch::optional<torch::Tensor> activeRankMask = torch::nullopt, bool payloadPrestaged = false)
 {
     using tensorrt_llm::kernels::moe_comm::MoeA2ACombineParams;
     using tensorrt_llm::kernels::moe_comm::moe_a2a_combine_launch;
@@ -945,7 +945,17 @@ torch::Tensor moeA2ACombineOp(torch::Tensor const& payload, int64_t localNumToke
     params.timeout_cycles
         = tensorrt_llm::kernels::moe_comm::moeA2AGetTimeoutCycles(gInWarmup.load(std::memory_order_relaxed));
 
-    moe_a2a_prepare_combine_launch(params);
+    // payloadPrestaged: the producer (the MoE finalize) already wrote the FP8 wire rows in place in the workspace
+    // and advanced flag_val, i.e. did everything the prepare pass would do for the low-precision fence combine.
+    if (payloadPrestaged)
+    {
+        TORCH_CHECK(useLowPrecision && payloadInWorkspace && !params.use_cft_for_combine,
+            "payload_prestaged requires use_low_precision and payload_in_workspace, without CFT counted writes");
+    }
+    else
+    {
+        moe_a2a_prepare_combine_launch(params);
+    }
 
     // CFT combine push: processing rank pushes results back to originating rank's LE.
     if (params.use_cft_for_combine)
@@ -1058,7 +1068,8 @@ TORCH_LIBRARY_FRAGMENT(trtllm, module)
         "bool use_low_precision=False, "
         "bool use_cft_counted_writes=False, "
         "bool enable_rank_mask=False, "
-        "Tensor? active_rank_mask=None) -> Tensor");
+        "Tensor? active_rank_mask=None, "
+        "bool payload_prestaged=False) -> Tensor");
     module.def(
         "moe_a2a_cft_initialize(Tensor(a!) workspace, int workspace_mem_handle, "
         "int workspace_size_per_rank, int ep_rank, int ep_size) -> ()");

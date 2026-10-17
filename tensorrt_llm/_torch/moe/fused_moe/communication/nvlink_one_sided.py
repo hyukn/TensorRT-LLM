@@ -378,6 +378,9 @@ class NVLinkOneSided(Communication):
         self.max_num_tokens_per_rank = max_num_tokens_per_rank
         self.payload_in_workspace = payload_in_workspace
         self.use_low_precision_combine = use_low_precision_combine
+        # Set per forward by the scheduler (MoECommPlan.a2a_staging_flag): the MoE finalize already wrote the FP8 wire
+        # rows in place and advanced the round counter, so combine() skips the prepare pass.
+        self.payload_prestaged = False
         if num_experts is not None:
             assert num_experts > 0 and num_experts <= num_slots, (
                 "num_experts must be in (0, num_slots]"
@@ -693,6 +696,16 @@ class NVLinkOneSided(Communication):
             self.cft_max_batch_for_dispatch,
             runtime_max_tokens_per_rank,
         )
+
+    def get_round_counter_tensor(self) -> torch.Tensor:
+        """This rank's all-to-all round counter (``flag_val``) as a one-element int32 view of the workspace.
+
+        A producer that stages the low-precision combine payload itself advances it once per combine, as the
+        combine's prepare pass otherwise does.
+        """
+        self._require_mapped()
+        offset = int(self.moe_a2a_metainfo[self.FLAG_VAL_OFFSET_INDEX])
+        return self.workspace[self.ep_rank, offset : offset + 4].view(torch.int32)
 
     def use_cft_for_combine(self, runtime_max_tokens_per_rank: int) -> bool:
         return should_use_cft(
@@ -1037,13 +1050,15 @@ class NVLinkOneSided(Communication):
             use_cft_for_combine,
             self._rank_mask_enabled,
             active_rank_mask,
+            **({"payload_prestaged": True} if self.payload_prestaged else {}),
         )
         self._watchdog_coordinator.watch_collective(
             self._alltoall_watchdog, "combine", active_rank_mask
         )
 
-        # Reset state for next round
+        # Reset state for next round (the prestaged flag is per forward; the next plan sets it again)
         self.reset_state()
+        self.payload_prestaged = False
 
         return output
 

@@ -489,6 +489,14 @@ struct Data
     // Hidden dimension output of FC2. It might be padded.
     int32_t hiddenDimPadded;
     int32_t const* totalNumPaddedTokens;
+
+    // Optional MoE all-to-all low-precision combine staging (bf16 output only): instead of outPtr, write each row
+    // as FP8 E4M3 (round-to-nearest, saturating, from the bf16-rounded value: the conversion the combine's prepare
+    // pass applies) at outFp8Ptr + token * outFp8RowStrideBytes, and advance the all-to-all round counter
+    // (*a2aFlagVal += 1, the prepare pass's other job), so the combine can skip its prepare pass.
+    void* outFp8Ptr = nullptr;
+    int64_t outFp8RowStrideBytes = 0;
+    uint32_t* a2aFlagVal = nullptr;
 };
 
 template <typename Type_, typename TypeExpW_, bool UsePdl_>
@@ -501,6 +509,9 @@ struct KernelParams
     Type const* inPtr;
     TypeExpW const* expertWeightsPtr;
     Type* outPtr;
+    uint8_t* outFp8Ptr = nullptr;
+    int64_t outFp8RowStrideBytes = 0;
+    uint32_t* a2aFlagVal = nullptr;
 
     float* inDqSfsPtr = nullptr;
     float* outDqSfsPtr = nullptr;
@@ -522,6 +533,9 @@ struct KernelParams
         params.inPtr = (Type*) data.inPtr;
         params.expertWeightsPtr = (TypeExpW*) data.expertWeightsPtr;
         params.outPtr = (Type*) data.outPtr;
+        params.outFp8Ptr = static_cast<uint8_t*>(data.outFp8Ptr);
+        params.outFp8RowStrideBytes = data.outFp8RowStrideBytes;
+        params.a2aFlagVal = data.a2aFlagVal;
         params.inDqSfsPtr = data.inDqSfsPtr;
         params.outDqSfsPtr = data.outDqSfsPtr;
 

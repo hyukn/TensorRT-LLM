@@ -78,6 +78,7 @@ class KernelInputs:
     n_group: int | None
     topk_group: int | None
     routed_scaling_factor: float | None
+    a2a_staging_flag: torch.Tensor | None = None  # see MoECommPlan.a2a_staging_flag
 
 
 def to_trtllm_gen_act_type(activation_type: ActivationType) -> int:
@@ -189,6 +190,7 @@ def prepare_kernel_inputs(impl, ctx: MoERunContext) -> KernelInputs:
         token_selected_experts=ctx.token_selected_experts,
         token_final_scales=ctx.token_final_scales,
         moe_output=plan.moe_output,
+        a2a_staging_flag=plan.a2a_staging_flag,
         do_finalize=ctx.do_finalize,
         top_k=top_k,
         routing_bias=(routing_params.routing_bias if router_logits is not None else None),
