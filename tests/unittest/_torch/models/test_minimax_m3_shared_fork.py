@@ -38,7 +38,7 @@ from tensorrt_llm._torch.moe.fused_moe.moe_scheduler import (
     MOE_STAGE_PRE_DISPATCH,
     fire_stage_event,
 )
-from tensorrt_llm._torch.utils import EventType
+from tensorrt_llm._torch.utils import EventType, Fp4QuantizedTensor
 
 HIDDEN = 256
 NUM_EXPERTS = 8
@@ -136,6 +136,7 @@ def _make_moe(fire: bool = True) -> MiniMaxM3MoE:
     moe.aux_stream = torch.cuda.Stream()
     moe.event_dict = {key: torch.cuda.Event() for key in [EventType.Main, EventType.MoeShared]}
     moe._prequant_event = torch.cuda.Event()
+    moe._prequant_input_event = torch.cuda.Event()
     return moe
 
 
@@ -224,3 +225,166 @@ def test_late_fork_gating(monkeypatch: pytest.MonkeyPatch) -> None:
             moe.shared_experts = None
             assert not moe._use_late_shared_fork(None)
             moe.shared_experts = object()
+
+
+class _FoldingExperts(_Experts):
+    """_Experts whose combine honors the scheduler's combine_addend hook (as the external-comm scheduler does), and
+    which unwraps a stand-in prequantized input (the 'FP4' tensor is the bf16 input itself)."""
+
+    def __init__(self, supports_addend: bool = True) -> None:
+        super().__init__(fire=True)
+        self.comm = SimpleNamespace(
+            supports_combine_output_addend=lambda: supports_addend,
+            supports_post_quant_dispatch=lambda: True,
+        )
+        self.inputs = []
+
+    def forward(self, x, router_logits, **kwargs) -> torch.Tensor:
+        self.inputs.append(type(x).__name__)
+        if isinstance(x, Fp4QuantizedTensor):
+            x = x.fp4_tensor
+        out = super().forward(x, router_logits, **kwargs)
+        addend = moe_scheduler.take_combine_addend(self)
+        if addend is not None and self.comm.supports_combine_output_addend():
+            tensor, ready = addend
+            if ready is not None:
+                ready.wait()
+            out = out + tensor  # the kernel's rounding: round(round(routed) + shared)
+            self.combine_addend_folded = True
+        return out
+
+
+class _StandInBackend:
+    """quantize_input stand-in: hands back the bf16 activation as the 'FP4' tensor (the plumbing under test)."""
+
+    def quantize_input(self, x, post_quant_comm: bool = True):
+        return x.clone(), torch.zeros(x.shape[0], 1, dtype=torch.uint8, device=x.device)
+
+
+def _run_post_router_graph(moe, static_in, meta, monkeypatch, fold: bool, prequant: bool):
+    monkeypatch.setattr(m3, "_SHARED_EXPERT_FORK", "post_router")
+    monkeypatch.setattr(m3, "_COMBINE_SHARED_ADD", fold)
+    monkeypatch.setattr(m3, "_MOE_PREQUANT_A2A", prequant)
+    with with_multi_stream(True):
+        moe(static_in, meta)  # warm up outside capture
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            static_out = moe(static_in, meta)
+    assert getattr(moe.experts, "combine_addend", None) is None  # cleared after the forward
+    outs = []
+    for _ in range(3):
+        static_in.copy_(torch.randn_like(static_in))
+        graph.replay()
+        torch.cuda.synchronize()
+        outs.append(static_out.clone())
+    return outs
+
+
+@requires_cuda
+@pytest.mark.parametrize("supports_addend", [True, False], ids=["comm-folds", "comm-cannot"])
+@pytest.mark.parametrize("prequant", [False, True], ids=["bf16-in", "prequant"])
+@pytest.mark.parametrize("num_tokens", [4, 104])
+def test_post_router_fold_and_prequant_match_the_default_add(
+    monkeypatch: pytest.MonkeyPatch, supports_addend: bool, prequant: bool, num_tokens: int
+) -> None:
+    """The shared add folded into the combine and the routed input quantized on the shared-expert stream give, under
+    a captured two-stream CUDA graph, bitwise the post_router path with the separate add."""
+    monkeypatch.setattr(
+        m3, "_moe_prequant_backend", lambda experts, allow_comm=False: _StandInBackend()
+    )
+    meta = SimpleNamespace(all_rank_num_tokens=[num_tokens])
+
+    def run(fold: bool, pq: bool):
+        torch.manual_seed(1)
+        moe = _make_moe()
+        moe.experts = _FoldingExperts(supports_addend)
+        torch.manual_seed(2)
+        static_in = torch.randn((num_tokens, HIDDEN), dtype=torch.bfloat16, device="cuda")
+        return moe, _run_post_router_graph(moe, static_in, meta, monkeypatch, fold, pq)
+
+    _, ref = run(False, False)
+    moe, got = run(True, prequant)
+    for r, g in zip(ref, got):
+        assert torch.equal(r, g)
+    assert moe._use_combine_shared_add() == supports_addend
+    expected_input = "Fp4QuantizedTensor" if prequant else "Tensor"
+    assert set(moe.experts.inputs) == {expected_input}
+
+
+@requires_cuda
+def test_partials_are_never_folded(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A caller that takes the unsummed partials (to fold the add into its AllReduce) gets both branches."""
+    monkeypatch.setattr(m3, "_SHARED_EXPERT_FORK", "post_router")
+    monkeypatch.setattr(m3, "_COMBINE_SHARED_ADD", True)
+    monkeypatch.setattr(m3, "_MOE_PREQUANT_A2A", False)
+    torch.manual_seed(1)
+    moe = _make_moe()
+    moe.experts = _FoldingExperts(supports_addend=True)
+    x = torch.randn((8, HIDDEN), dtype=torch.bfloat16, device="cuda")
+    meta = SimpleNamespace(all_rank_num_tokens=[8])
+    with with_multi_stream(True):
+        assert moe._use_late_shared_fork(None) and moe._use_combine_shared_add()
+        shared, routed = moe(
+            x,
+            meta,
+            final_all_reduce_params=SimpleNamespace(enable_allreduce=False),
+            return_partials=True,
+        )
+        total = moe(x, meta)  # folded into the combine
+    torch.cuda.synchronize()
+    assert torch.equal(shared, moe.shared_experts(x))
+    assert torch.equal(shared + routed, total)
+
+
+@pytest.mark.cpu_only
+def test_take_combine_addend_is_consumed_once() -> None:
+    moe = SimpleNamespace(combine_addend=("t", None))
+    assert moe_scheduler.take_combine_addend(moe) == ("t", None)
+    assert moe_scheduler.take_combine_addend(moe) is None
+    assert moe_scheduler.take_combine_addend(SimpleNamespace()) is None  # every other MoE
+
+
+@pytest.mark.cpu_only
+def test_the_external_comm_scheduler_passes_the_addend_to_the_combine() -> None:
+    """The addend is taken after the pre-combine fork point, by a single-chunk forward only, and handed to the combine
+    call when it covers the chunk's tokens."""
+    src = inspect.getsource(moe_scheduler.ExternalCommMoEScheduler._forward_chunk_impl)
+    lines = [ln.strip() for ln in src.splitlines()]
+    pre_combine = lines.index("fire_stage_event(moe, MOE_STAGE_PRE_COMBINE)")
+    take = lines.index(
+        "addend = take_combine_addend(moe) if is_first_call and is_last_call else None"
+    )
+    combine = next(i for i, ln in enumerate(lines) if "moe.comm.combine(" in ln)
+    assert pre_combine < take < combine
+    assert "and addend[0].shape[0] == router_logits.shape[0]" in lines[take:combine]
+    assert "**combine_kwargs," in lines[combine : combine + 5]
+
+
+@pytest.mark.cpu_only
+def test_route_bf16_scales_gating(monkeypatch: pytest.MonkeyPatch) -> None:
+    """bfloat16 top-k weights only with the env, a bfloat16-scale backend and an op that can store them."""
+    from tensorrt_llm._torch.moe.fused_moe import routing as routing_mod
+    from tensorrt_llm._torch.moe.fused_moe.routing import MiniMaxM3MoeRoutingMethod
+
+    def experts(scales_dtype):
+        rm = MiniMaxM3MoeRoutingMethod(
+            top_k=4, num_experts=8, callable_e_score_correction_bias=lambda: None
+        )
+        backend = SimpleNamespace(
+            input_requirement=SimpleNamespace(routing_scales_dtype=scales_dtype)
+        )
+        return SimpleNamespace(backend=backend, routing_method=rm)
+
+    monkeypatch.setattr(routing_mod, "noaux_tc_supports_output_dtype", lambda: True)
+    monkeypatch.setattr(m3, "_ROUTING_BF16_SCALES", False)
+    e = experts(torch.bfloat16)
+    assert not m3._maybe_route_bf16_scales(e) and e.routing_method.output_dtype == torch.float32
+    monkeypatch.setattr(m3, "_ROUTING_BF16_SCALES", True)
+    assert m3._maybe_route_bf16_scales(e) and e.routing_method.output_dtype == torch.bfloat16
+    e = experts(torch.float32)  # a backend that wants float32 weights keeps them
+    assert not m3._maybe_route_bf16_scales(e) and e.routing_method.output_dtype == torch.float32
+    monkeypatch.setattr(
+        routing_mod, "noaux_tc_supports_output_dtype", lambda: False
+    )  # older libraries
+    e = experts(torch.bfloat16)
+    assert not m3._maybe_route_bf16_scales(e) and e.routing_method.output_dtype == torch.float32

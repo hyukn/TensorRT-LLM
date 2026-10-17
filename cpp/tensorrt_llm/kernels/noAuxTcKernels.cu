@@ -369,6 +369,7 @@ INSTANTIATE_NOAUX_TC(half, float, half, int32_t);
 INSTANTIATE_NOAUX_TC(half, half, half, int32_t);
 
 #ifdef ENABLE_BF16
+INSTANTIATE_NOAUX_TC(float, float, __nv_bfloat16, int32_t);
 INSTANTIATE_NOAUX_TC(float, __nv_bfloat16, float, int32_t);
 INSTANTIATE_NOAUX_TC(half, __nv_bfloat16, half, int32_t);
 

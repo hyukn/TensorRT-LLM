@@ -719,6 +719,40 @@ class TestMoEAlltoAll:
             verify_combine(all_results, ep_size, rtol=0.1, atol=0.5)
 
 
+@pytest.mark.parametrize(
+    "mpi_pool_executor,all_num_tokens,top_k,payload_in_workspace,use_fp8_combine",
+    [
+        (4, [32, 32, 32, 32], 4, False, False),
+        (4, [32, 0, 16, 0], 4, True, False),
+        (4, [16, 32, 64, 48], 4, False, True),
+        (4, [16, 32, 64, 48], 4, True, True),
+        (4, [16, 32, 64, 48], 4, True, "prestaged"),
+    ],
+    indirect=["mpi_pool_executor"])
+def test_combine_output_addend(mpi_pool_executor, all_num_tokens, top_k,
+                               payload_in_workspace, use_fp8_combine):
+    """combine(output_addend=t) == combine() + t, bitwise (bf16 and FP8 wire, staged, in-workspace and prestaged
+    payloads)."""
+    try:
+        MnnvlMemory.initialize()
+        assert MnnvlMemory.supports_mnnvl()
+    except Exception:
+        pytest.skip("MNNVL not supported on this system")
+    ep_size = mpi_pool_executor.num_workers
+    if ep_size > torch.cuda.device_count():
+        pytest.skip(f"Need at least {ep_size} GPUs")
+    results = mpi_pool_executor.map(
+        run_moe_a2a_dispatch_moe_combine_single_rank,
+        *zip(*[(ep_size, all_num_tokens, top_k, 512 * 1024 * 1024, 32, 2880, -1,
+                payload_in_workspace, use_fp8_combine, True)] * ep_size),
+    )
+    all_results = list(results)
+    verify_combine(all_results,
+                   ep_size,
+                   rtol=0.13 if use_fp8_combine else 0.1,
+                   atol=1.0 if use_fp8_combine else 0.5)
+
+
 def run_moe_a2a_dispatch_moe_combine_single_rank(
         ep_size,
         all_num_tokens,
@@ -728,7 +762,8 @@ def run_moe_a2a_dispatch_moe_combine_single_rank(
         hidden_size,
         invalid_token_expert_id,
         payload_in_workspace=False,
-        use_low_precision_combine=False):
+        use_low_precision_combine=False,
+        with_output_addend=False):
     """Worker function for dispatch and combine test.
 
     Runs one dispatch+combine round and returns
@@ -808,6 +843,15 @@ def run_moe_a2a_dispatch_moe_combine_single_rank(
         moe_out = dispatch_and_fake_moe()
         combined_output = _combine(moe_out,
                                    use_low_precision=use_low_precision_combine)
+        addend = None
+        if with_output_addend:
+            # An addend folded into the combine (e.g. a shared expert's output) must give bitwise the combine
+            # output plus a separate bf16 add.
+            torch.manual_seed(1000 + rank)
+            addend = torch.randn(rank_local_tokens,
+                                 hidden_size,
+                                 dtype=torch.bfloat16,
+                                 device=device)
         if prestaged:
             # Second round, same inputs: stage the FP8 wire rows in place (at the start of each bf16 row slot) and
             # advance the round counter as a producer would, then combine without the prepare pass. The result
@@ -830,9 +874,36 @@ def run_moe_a2a_dispatch_moe_combine_single_rank(
                 payload_in_workspace=True,
                 use_low_precision_combine=True,
                 payload_prestaged=True,
+                **({} if addend is None else {
+                    "output_addend": addend
+                }),
             )
-            assert torch.equal(prestaged_output, combined_output), (
+            expected = combined_output if addend is None else combined_output + addend
+            assert torch.equal(prestaged_output, expected), (
                 f"Rank {rank}: prestaged combine differs from the prepare-pass combine"
+            )
+
+        if with_output_addend:
+            # Another round, same inputs, with the addend folded into the combine.
+            moe_out2 = dispatch_and_fake_moe()
+            if payload_in_workspace:
+                ws = moe_a2a.get_combine_payload_tensor_in_workspace(
+                    max_num_tokens, hidden_size, torch.bfloat16)
+                ws.copy_(moe_out2.view(-1, hidden_size))
+                folded = moe_a2a.combine(
+                    ws.view(ep_size, max_num_tokens, hidden_size),
+                    max_num_tokens,
+                    payload_in_workspace=True,
+                    use_low_precision_combine=use_low_precision_combine,
+                    output_addend=addend)
+            else:
+                folded = moe_a2a.combine(
+                    moe_out2,
+                    max_num_tokens,
+                    use_low_precision_combine=use_low_precision_combine,
+                    output_addend=addend)
+            assert torch.equal(folded, combined_output + addend), (
+                f"Rank {rank}: the addend-folded combine differs from combine + add"
             )
 
         wire_bytes_per_token = hidden_size * (1 if use_low_precision_combine

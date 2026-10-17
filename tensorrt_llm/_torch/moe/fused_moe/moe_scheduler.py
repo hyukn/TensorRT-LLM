@@ -101,6 +101,21 @@ def fire_stage_event(moe, stage: str) -> None:
         fired.add(stage)
 
 
+def take_combine_addend(moe):
+    """The ``(tensor, ready_event)`` a caller registered in ``moe.combine_addend`` for the next combine, or None.
+
+    Cleared on read. The combine adds the tensor to every combined token with the rounding of a separate add (see
+    ``moe_a2a_combine``'s ``output_addend``), after the current stream waits for ``ready_event`` (may be None); the
+    scheduler sets ``moe.combine_addend_folded`` when it did, so the caller drops its own add. A path that never
+    reaches a supporting combine (or runs several chunks) leaves the flag unset and the caller adds as before.
+    """
+    addend = getattr(moe, "combine_addend", None)
+    if addend is None:
+        return None
+    moe.combine_addend = None
+    return addend
+
+
 class MoEScheduler(ABC):
     """Forward-execution strategy for ConfigurableMoE.
 
@@ -664,9 +679,23 @@ class ExternalCommMoEScheduler(MoEScheduler):
             if moe.enable_dummy_allreduce:
                 moe.dummy_allreduce()
             all_rank_max_num_tokens = max(all_rank_num_tokens)
+            combine_kwargs = {}
+            # Only a single-chunk forward folds the addend: it covers exactly this chunk's tokens.
+            addend = take_combine_addend(moe) if is_first_call and is_last_call else None
+            if (
+                addend is not None
+                and addend[0].shape[0] == router_logits.shape[0]
+                and getattr(moe.comm, "supports_combine_output_addend", lambda: False)()
+            ):
+                addend_tensor, addend_ready = addend
+                if addend_ready is not None:
+                    addend_ready.wait()
+                combine_kwargs["output_addend"] = addend_tensor
+                moe.combine_addend_folded = True
             final_hidden_states = moe.comm.combine(
                 final_hidden_states,
                 all_rank_max_num_tokens=all_rank_max_num_tokens,
+                **combine_kwargs,
             )
         else:
             # Non-comm path: attention TP or single rank; only AllReduce if reduce_results

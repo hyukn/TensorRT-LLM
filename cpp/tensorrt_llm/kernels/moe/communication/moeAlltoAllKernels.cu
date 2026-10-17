@@ -1557,6 +1557,22 @@ __device__ void vectorized_combine_impl(OutputT* dst_typed_base, int size_per_to
             }
         }
 
+        if (ptrs.output_addend != nullptr)
+        {
+            // Fold a per-token addend (e.g. the shared expert's output) into the store with the rounding of a
+            // separate add: the combined sum is rounded to OutputT first, then added in float32 and rounded again.
+            int const elems_per_token = size_per_token / static_cast<int>(sizeof(InputT));
+            vec_t<OutputT, elems_per_vec> addend;
+            addend.load(static_cast<OutputT const*>(ptrs.output_addend)
+                + static_cast<size_t>(local_token_idx) * static_cast<size_t>(elems_per_token)
+                + offset / static_cast<int>(sizeof(InputT)));
+#pragma unroll
+            for (int j = 0; j < elems_per_vec; ++j)
+            {
+                acc[0][j] = static_cast<float>(static_cast<OutputT>(acc[0][j])) + static_cast<float>(addend[j]);
+            }
+        }
+
         // cast_store converts each accumulated element to OutputT before the vectorized store.
         acc[0].cast_store(dst_typed_base + offset / static_cast<int>(sizeof(InputT)));
     }
@@ -2202,6 +2218,7 @@ void moe_a2a_combine_launch(MoeA2ACombineParams const& params)
         kp.flag_val = params.flag_val;
         kp.topk_target_ranks = params.topk_target_ranks;
         kp.topk_send_indices = params.topk_send_indices;
+        kp.output_addend = params.output_addend;
 
         // CFT combine metadata.
         kp.combine_counters = params.cft_le_combine_counters;
@@ -2274,6 +2291,7 @@ void moe_a2a_combine_launch(MoeA2ACombineParams const& params)
     // Copy communication tracking pointers
     kernel_ptrs.topk_target_ranks = params.topk_target_ranks;
     kernel_ptrs.topk_send_indices = params.topk_send_indices;
+    kernel_ptrs.output_addend = params.output_addend;
 
     // Copy active-rank bitmask into the kernel pointers struct
     for (int w = 0; w < kRankMaskWords; ++w)

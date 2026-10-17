@@ -645,6 +645,7 @@ class MoeAlltoAll:
         use_low_precision_combine: bool = False,
         active_rank_mask: Optional[torch.Tensor] = None,
         payload_prestaged: bool = False,
+        output_addend: Optional[torch.Tensor] = None,
     ):
         """
         Perform MoE all-to-all combine operation.
@@ -660,6 +661,8 @@ class MoeAlltoAll:
             payload_prestaged: With use_low_precision_combine and payload_in_workspace: the producer already wrote
                 the FP8 wire rows in place (at the start of each row slot) and advanced the round counter, so the
                 prepare pass is skipped.
+            output_addend: Optional [local_num_tokens, num_elements_per_token] tensor of the payload dtype added to
+                every combined token with the rounding of a separate add (round(round(sum) + addend)).
 
         Returns:
             combined_output: [local_num_tokens, num_elements_per_token] tensor of combined results
@@ -689,7 +692,10 @@ class MoeAlltoAll:
             use_cft_for_combine, self._rank_mask_enabled, active_rank_mask,
             **({
                 "payload_prestaged": True
-            } if payload_prestaged else {}))
+            } if payload_prestaged else {}),
+            **({} if output_addend is None else {
+                "output_addend": output_addend
+            }))
         self._watchdog_coordinator.watch_collective(self._alltoall_watchdog,
                                                     "combine", active_rank_mask)
 

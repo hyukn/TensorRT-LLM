@@ -1,3 +1,4 @@
+import functools
 import math
 import warnings
 from dataclasses import dataclass
@@ -376,7 +377,7 @@ class Deepseekv3RoutingImpl:
 
         return scores, scores_with_bias
 
-    def noaux_tc(self, logits, e_score_correction_bias):
+    def noaux_tc(self, logits, e_score_correction_bias, output_dtype=None):
         n_group = self.n_group
 
         _, num_experts = logits.shape
@@ -458,15 +459,38 @@ class Deepseekv3RoutingImpl:
         else:
             topk_values, topk_indices = torch.ops.trtllm.noaux_tc_op(
                 logits, e_score_correction_bias, n_group, self.topk_group,
-                self.top_k, self.routed_scaling_factor)
+                self.top_k, self.routed_scaling_factor,
+                **({} if output_dtype is None else {
+                    "output_dtype": output_dtype
+                }))
             return topk_values, topk_indices
 
     def apply(
-        self, logits: torch.Tensor, e_score_correction_bias: torch.Tensor
+        self,
+        logits: torch.Tensor,
+        e_score_correction_bias: torch.Tensor,
+        output_dtype: torch.dtype = torch.float32,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        topk_values, topk_indices = self.noaux_tc(logits,
-                                                  e_score_correction_bias)
-        return topk_indices.to(torch.int32), topk_values.to(torch.float32)
+        """Top-k expert ids and weights. ``output_dtype=torch.bfloat16`` (float32 logits and bias, fused kernel)
+        makes the kernel store the weights in bfloat16 (one rounding of the float32 value, as ``.to`` would)."""
+        if output_dtype == torch.float32:
+            topk_values, topk_indices = self.noaux_tc(logits,
+                                                      e_score_correction_bias)
+        else:
+            topk_values, topk_indices = self.noaux_tc(logits,
+                                                      e_score_correction_bias,
+                                                      output_dtype=output_dtype)
+        return topk_indices.to(torch.int32), topk_values.to(output_dtype)
+
+
+@functools.lru_cache(maxsize=None)
+def noaux_tc_supports_output_dtype() -> bool:
+    """Whether the loaded ``trtllm::noaux_tc_op`` takes ``output_dtype`` (the bfloat16-weights variant)."""
+    try:
+        schema = torch.ops.trtllm.noaux_tc_op.default._schema
+    except (AttributeError, RuntimeError):
+        return False
+    return any(arg.name == "output_dtype" for arg in schema.arguments)
 
 
 class DeepSeekV3MoeRoutingMethod(BaseMoeRoutingMethod):
@@ -736,7 +760,9 @@ class MiniMaxM3MoeRoutingMethod(MiniMaxM2MoeRoutingMethod):
         # op consumes raw contiguous CUDA buffers and emits FP32 weights.
         if (router_logits.is_cuda and router_logits.dtype == torch.float32
                 and router_logits.ndim == 2 and router_logits.is_contiguous()
-                and self.output_dtype == torch.float32):
+                and (self.output_dtype == torch.float32 or
+                     (self.output_dtype == torch.bfloat16
+                      and noaux_tc_supports_output_dtype()))):
             routing_bias = self.e_score_correction_bias
             if (routing_bias.is_cuda
                     and routing_bias.device == router_logits.device
@@ -744,7 +770,10 @@ class MiniMaxM3MoeRoutingMethod(MiniMaxM2MoeRoutingMethod):
                     and routing_bias.ndim == 1
                     and routing_bias.numel() == router_logits.shape[1]
                     and routing_bias.is_contiguous()):
-                return self.routing_impl.apply(router_logits, routing_bias)
+                # bfloat16 weights (set for a bfloat16-scale MoE backend) come out of the kernel directly.
+                return self.routing_impl.apply(router_logits,
+                                               routing_bias,
+                                               output_dtype=self.output_dtype)
 
         # ``moe_scheduler.MoEScheduler`` calls ``routing_method.apply(router_logits,
         # input_ids)`` positionally; mirror the parent's signature so the

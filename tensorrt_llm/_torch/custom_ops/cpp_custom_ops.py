@@ -354,13 +354,18 @@ def _register_fake():
         return ret
 
     @torch.library.register_fake("trtllm::noaux_tc_op")
-    def _(scores, scores_with_bias, n_group, topk_group, topk,
-          routed_scaling_factor):
+    def _(scores,
+          scores_with_bias,
+          n_group,
+          topk_group,
+          topk,
+          routed_scaling_factor,
+          output_dtype=None):
         shape = list(scores.shape)
         shape[-1] = topk
-        return scores.new_empty(shape,
-                                dtype=scores_with_bias.dtype), scores.new_empty(
-                                    shape, dtype=torch.int32)
+        values_dtype = scores_with_bias.dtype if output_dtype is None else output_dtype
+        return scores.new_empty(shape, dtype=values_dtype), scores.new_empty(
+            shape, dtype=torch.int32)
 
     @torch.library.register_fake("trtllm::kimi_k3_noaux_tc_mxfp8_quant")
     def _(scores, bias, hidden_states, routed_scaling_factor):

@@ -618,6 +618,21 @@ _MOE_PREQUANT_OVERLAP = os.environ.get("TRTLLM_M3_MOE_PREQUANT_OVERLAP", "0") ==
 # branches run on two streams); same kernels and inputs, so bitwise. Without an all-to-all (TP) the
 # default placement stays.
 _SHARED_EXPERT_FORK = os.environ.get("TRTLLM_M3_SHARED_EXPERT_FORK", "")
+# The three below shorten the routed critical path of the attention-DP MoE (all-to-all) on decode CUDA graphs; each is
+# bitwise. Measured at HI (DEP8, 26 requests per rank) the chain is router GEMM -> top-k -> fp32->bf16 weight cast ->
+# NVFP4 input quantize -> dispatch ... combine -> shared + routed add -> next input norm.
+# TRTLLM_M3_ROUTING_BF16_SCALES=1: with a MoE backend that takes bfloat16 routing weights (TRTLLM-Gen), the top-k kernel
+# stores them in bfloat16 directly (one rounding of the float32 value, as the cast does): no cast launch. Needs a
+# noaux_tc_op with output_dtype (C++).
+_ROUTING_BF16_SCALES = os.environ.get("TRTLLM_M3_ROUTING_BF16_SCALES", "0") == "1"
+# TRTLLM_M3_MOE_PREQUANT_A2A=1: TRTLLM_M3_MOE_PREQUANT_OVERLAP for the all-to-all path with the post_router
+# shared-expert fork: the routed input's NVFP4 quantize (the backend's own quantize_input, linear scales as the dispatch
+# needs) runs on the shared-expert stream next to the router GEMM and top-k; the dispatch takes the quantized tensor.
+_MOE_PREQUANT_A2A = os.environ.get("TRTLLM_M3_MOE_PREQUANT_A2A", "0") == "1"
+# TRTLLM_M3_COMBINE_SHARED_ADD=1: with the post_router fork the shared expert finishes long before the combine, so the
+# all-to-all combine adds its output to every combined token (output = round(round(routed) + shared), the separate
+# add's rounding) and the add launch after the combine goes away. Needs a moe_a2a_combine with output_addend (C++).
+_COMBINE_SHARED_ADD = os.environ.get("TRTLLM_M3_COMBINE_SHARED_ADD", "0") == "1"
 _SHARED_EXPERT_FORK_POST_ROUTER = "post_router"
 _SHARED_EXPERT_FORK_STAGES = (_SHARED_EXPERT_FORK_POST_ROUTER, "pre_dispatch", "pre_combine")
 # TRTLLM_M3_ATTN_OUT_MXFP8=1: on decode graph steps the sparse-attention merge kernel also emits
@@ -705,24 +720,49 @@ def _open_attn_out_mxfp8_request() -> Optional[Mxfp8OutputRequest]:
     return current_mxfp8_output_request()
 
 
-def _moe_prequant_backend(experts: nn.Module) -> Optional[nn.Module]:
+def _moe_prequant_backend(experts: nn.Module, allow_comm: bool = False) -> Optional[nn.Module]:
     """The routed-expert backend whose input quantize can run ahead of the router, or None.
 
-    Only the TRTLLM-Gen NVFP4 backend without MoE communication qualifies: its
-    ``quantize_input`` is a pure function of the activation (``fp4_quantize`` with the
-    static ``fc31_input_scale`` and linear scale layout), and it unpacks an
-    ``Fp4QuantizedTensor`` input without re-quantizing it.
+    Only the TRTLLM-Gen NVFP4 backend qualifies: its ``quantize_input`` is a pure function of the
+    activation (``fp4_quantize`` with the static ``fc31_input_scale`` and linear scale layout, the same
+    with or without communication), and it unpacks an ``Fp4QuantizedTensor`` input without
+    re-quantizing it. ``allow_comm`` admits a MoE all-to-all (quantize -> dispatch).
     """
     from ..moe.fused_moe.trtllm_gen.fp4_block_scale import TRTLLMGenNvfp4Base
 
     backend = getattr(experts, "backend", None)
     if not isinstance(backend, TRTLLMGenNvfp4Base):
         return None
-    if getattr(experts, "comm", None) is not None or getattr(experts, "enable_dwdp", False):
+    comm = getattr(experts, "comm", None)
+    if comm is not None and not (allow_comm and comm.supports_post_quant_dispatch()):
+        return None
+    if getattr(experts, "enable_dwdp", False):
+        return None
+    if getattr(experts, "_using_load_balancer", lambda: False)():
         return None
     if getattr(experts, "apply_router_weight_on_input", False):
         return None
     return backend
+
+
+def _maybe_route_bf16_scales(experts: nn.Module) -> bool:
+    """Switch the routing method to bfloat16 top-k weights (TRTLLM_M3_ROUTING_BF16_SCALES) when the MoE backend wants
+    bfloat16 routing scales and the loaded top-k op can store them."""
+    if not _ROUTING_BF16_SCALES:
+        return False
+    from ..moe.fused_moe.routing import noaux_tc_supports_output_dtype
+
+    backend = getattr(experts, "backend", None)
+    requirement = getattr(backend, "input_requirement", None)
+    routing_method = getattr(experts, "routing_method", None)
+    if (
+        getattr(requirement, "routing_scales_dtype", None) != torch.bfloat16
+        or not isinstance(routing_method, MiniMaxM3MoeRoutingMethod)
+        or not noaux_tc_supports_output_dtype()
+    ):
+        return False
+    routing_method.output_dtype = torch.bfloat16
+    return True
 
 
 class MiniMaxM3Gate(nn.Module):
@@ -920,6 +960,11 @@ class MiniMaxM3MoE(nn.Module):
             activation=self.moe_activation,
         )
         self.routed_output_is_global = _moe_routed_output_is_global(self.experts)
+        if _maybe_route_bf16_scales(self.experts):
+            logger.info_once(
+                "MiniMax-M3: the top-k kernel stores bfloat16 routing weights (TRTLLM_M3_ROUTING_BF16_SCALES=1)",
+                key="m3_routing_bf16_scales",
+            )
         # Shared expert: dense MLP fused into MoE output. Constructed
         # with ``is_shared_expert=True`` so ``reduce_output=False``
         # (the external AllReduce below performs the combined
@@ -958,6 +1003,7 @@ class MiniMaxM3MoE(nn.Module):
         self.aux_stream = aux_stream_dict[AuxStreamType.MoeShared]
         self.event_dict = {key: torch.cuda.Event() for key in [EventType.Main, EventType.MoeShared]}
         self._prequant_event = torch.cuda.Event()
+        self._prequant_input_event = torch.cuda.Event()
 
     def _use_prequant_overlap(self, hidden_states: torch.Tensor, lora_params) -> bool:
         """Whether this forward takes the routed-input pre-quantize path (see _MOE_PREQUANT_OVERLAP)."""
@@ -1023,41 +1069,108 @@ class MiniMaxM3MoE(nn.Module):
         hidden_states: torch.Tensor,
         shared_input,
         all_rank_num_tokens: Optional[List[int]],
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        fold_shared_add: bool = True,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """Routed branch on the main stream; the shared expert forks off where the routed path records the event.
 
         The MoE scheduler records the fork event on the main stream just before the configured stage
         (dispatch / combine), so the shared expert runs in the all-to-all latency window instead of next to
         the router GEMM. If the routed path never reached the stage (another MoE implementation), the event
         is recorded after it, which serializes the branches but keeps the dependency on the input.
+
+        With the post_router fork, TRTLLM_M3_MOE_PREQUANT_A2A moves the routed input quantize onto the shared-expert
+        stream, and TRTLLM_M3_COMBINE_SHARED_ADD (unless ``fold_shared_add`` is False: the caller wants the partials)
+        hands the shared expert output to the combine; the returned shared output is then None (already added).
         """
         fork = self.event_dict[EventType.Main]
         event_shared = self.event_dict[EventType.MoeShared]
         experts = self.experts
         post_router = _SHARED_EXPERT_FORK == _SHARED_EXPERT_FORK_POST_ROUTER
+        prequant = post_router and self._use_a2a_prequant(hidden_states)
+        fold = post_router and fold_shared_add and self._use_combine_shared_add()
         experts.stage_events = {} if post_router else {_SHARED_EXPERT_FORK: fork}
         experts.stage_events_fired = set()
+        routed_input = hidden_states
+        routed_kwargs = {}
+        shared_output = None
+        folded = False
         try:
+            if prequant:
+                # The routed input's NVFP4 quantize needs only hidden_states: run it on the shared-expert stream
+                # next to the router GEMM and top-k; the routed path waits for it before the dispatch.
+                input_ready = self._prequant_input_event
+                input_ready.record()
+                with torch.cuda.stream(self.aux_stream):
+                    input_ready.wait()
+                    x_fp4, x_sf = _moe_prequant_backend(experts, allow_comm=True).quantize_input(
+                        hidden_states
+                    )
+                    self._prequant_event.record()
+                routed_input = Fp4QuantizedTensor(
+                    fp4_tensor=x_fp4, scaling_factor=x_sf, is_sf_swizzled=False
+                )
+                routed_kwargs["output_dtype"] = hidden_states.dtype
             router_logits = self.gate(hidden_states)
             if post_router:
                 fork.record()
+            if fold:
+                # Launched before the routed path so the combine can take its output (on the GPU the shared
+                # expert still starts after the router GEMM).
+                with torch.cuda.stream(self.aux_stream):
+                    fork.wait()
+                    shared_output = self.shared_experts(shared_input)
+                    event_shared.record()
+                experts.combine_addend = (shared_output, event_shared)
+                experts.combine_addend_folded = False
+            if prequant:
+                self._prequant_event.wait()
             routed_output = experts(
-                hidden_states,
+                routed_input,
                 router_logits,
                 all_rank_num_tokens=all_rank_num_tokens,
                 use_dp_padding=False,
+                **routed_kwargs,
             )
             fired = post_router or _SHARED_EXPERT_FORK in experts.stage_events_fired
+            folded = fold and bool(getattr(experts, "combine_addend_folded", False))
         finally:
             experts.stage_events = {}
+            experts.combine_addend = None
+            experts.combine_addend_folded = False
         if not fired:
             fork.record()
-        with torch.cuda.stream(self.aux_stream):
-            fork.wait()
-            shared_output = self.shared_experts(shared_input)
-            event_shared.record()
+        if shared_output is None:
+            with torch.cuda.stream(self.aux_stream):
+                fork.wait()
+                shared_output = self.shared_experts(shared_input)
+                event_shared.record()
         event_shared.wait()
+        if folded:
+            logger.info_once(
+                "MiniMax-M3: the all-to-all combine adds the shared expert output "
+                "(TRTLLM_M3_COMBINE_SHARED_ADD=1)",
+                key="m3_combine_shared_add",
+            )
+            return routed_output, None
         return routed_output, shared_output
+
+    def _use_a2a_prequant(self, hidden_states: torch.Tensor) -> bool:
+        """Whether the late-fork path quantizes the routed input on the shared-expert stream (_MOE_PREQUANT_A2A)."""
+        if not _MOE_PREQUANT_A2A or hidden_states.dim() != 2:
+            return False
+        if _moe_prequant_backend(self.experts, allow_comm=True) is None:
+            return False
+        calc = getattr(self.experts, "calculate_num_chunks", None)
+        return calc is None or calc([hidden_states.shape[0]]) == 1
+
+    def _use_combine_shared_add(self) -> bool:
+        """Whether the late-fork path hands the shared expert output to the combine (_COMBINE_SHARED_ADD)."""
+        if not _COMBINE_SHARED_ADD or self.routed_output_is_global:
+            return False
+        comm = getattr(self.experts, "comm", None)
+        return comm is not None and bool(
+            getattr(comm, "supports_combine_output_addend", lambda: False)()
+        )
 
     def accepts_mxfp8_shared_input(self) -> bool:
         """Whether the shared expert's next eager forward runs its gate_up projection as an MXFP8 GEMM that can
@@ -1139,7 +1252,10 @@ class MiniMaxM3MoE(nn.Module):
         else:
             if self._use_late_shared_fork(lora_params):
                 routed_output, shared_output = self._forward_late_shared_fork(
-                    hidden_states, shared_input, all_rank_num_tokens
+                    hidden_states,
+                    shared_input,
+                    all_rank_num_tokens,
+                    fold_shared_add=not return_partials,
                 )
             elif self._use_prequant_overlap(hidden_states, lora_params):
                 routed_output, shared_output = self._forward_prequant_overlap(
@@ -1162,10 +1278,11 @@ class MiniMaxM3MoE(nn.Module):
                 )
                 return shared_output.add_(routed_output)
             if return_partials:
+                assert shared_output is not None, "the combine-folded shared add has no partials"
                 return shared_output, routed_output
             # In-place add into ``shared_output`` to avoid allocating a temporary
-            # (matches DeepSeekV3 / GLM convention).
-            result = shared_output.add_(routed_output)
+            # (matches DeepSeekV3 / GLM convention). None: the all-to-all combine already added it.
+            result = routed_output if shared_output is None else shared_output.add_(routed_output)
 
         if self.allreduce is not None and not self.routed_output_is_global:
             result = self.allreduce(result, all_reduce_params=final_all_reduce_params)

@@ -22,6 +22,8 @@
 #include "tensorrt_llm/kernels/noAuxTcKernels.h"
 #include "tensorrt_llm/thop/thUtils.h"
 
+#include <optional>
+
 // #include <c10/cuda/CUDAStream.h>
 // #include <cassert>
 // #include <set>
@@ -38,7 +40,7 @@ TRTLLM_NAMESPACE_BEGIN
 namespace torch_ext
 {
 std::tuple<at::Tensor, at::Tensor> noaux_tc_op(th::Tensor const& scores, th::Tensor const& bias, int64_t n_group,
-    int64_t topk_group, int64_t topk, double routed_scaling_factor)
+    int64_t topk_group, int64_t topk, double routed_scaling_factor, std::optional<at::ScalarType> output_dtype)
 {
     auto data_type = scores.scalar_type();
     auto bias_type = bias.scalar_type();
@@ -57,11 +59,29 @@ std::tuple<at::Tensor, at::Tensor> noaux_tc_op(th::Tensor const& scores, th::Ten
     TORCH_CHECK(
         topk <= 32, "topk should be smaller than or equal to 32 for now");       //@todo: remove this restriction later
 
-    th::Tensor topk_values = th::empty({num_tokens, topk}, th::dtype(data_type).device(torch::kCUDA));
+    // The top-k weights come out in the scores' dtype unless output_dtype asks otherwise. The one other supported
+    // combination is float32 scores and bias with bfloat16 weights: the kernel computes each weight in float32 and
+    // rounds it once on store (round to nearest even, as a separate .to(torch.bfloat16) would), which saves the
+    // cast launch a bfloat16-scale MoE backend would otherwise run on the routing critical path.
+    auto const out_type = output_dtype.value_or(data_type);
+    TORCH_CHECK(out_type == data_type
+            || (data_type == torch::kFloat32 && bias_type == torch::kFloat32 && out_type == torch::kBFloat16),
+        "noaux_tc_op: output_dtype must equal the scores dtype, or be bfloat16 for float32 scores and bias");
+    th::Tensor topk_values = th::empty({num_tokens, topk}, th::dtype(out_type).device(torch::kCUDA));
     th::Tensor topk_indices = th::empty({num_tokens, topk}, th::dtype(torch::kInt32).device(torch::kCUDA));
     //@TODO check the data type of indices
 
     auto stream = at::cuda::getCurrentCUDAStream(scores.get_device());
+
+    if (out_type != data_type)
+    {
+        tk::invokeNoAuxTc<float, float, __nv_bfloat16, int32_t>(reinterpret_cast<float*>(scores.mutable_data_ptr()),
+            reinterpret_cast<float*>(bias.mutable_data_ptr()),
+            reinterpret_cast<__nv_bfloat16*>(topk_values.mutable_data_ptr()),
+            reinterpret_cast<int32_t*>(topk_indices.mutable_data_ptr()), num_tokens, num_experts, n_group, topk_group,
+            topk, routed_scaling_factor, stream);
+        return {topk_values, topk_indices};
+    }
 
     switch (data_type)
     {
@@ -210,7 +230,7 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
     m.def(
         "noaux_tc_op(Tensor scores, Tensor bias, int n_group, int topk_group, int topk, float "
-        "routed_scaling_factor) -> (Tensor, Tensor)");
+        "routed_scaling_factor, ScalarType? output_dtype=None) -> (Tensor, Tensor)");
     m.def(
         "kimi_k3_noaux_tc_mxfp8_quant(Tensor scores, Tensor bias, Tensor hidden_states, float "
         "routed_scaling_factor) -> (Tensor, Tensor, Tensor, Tensor)");

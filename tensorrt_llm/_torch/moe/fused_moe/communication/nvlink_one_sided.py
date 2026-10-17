@@ -24,6 +24,7 @@ This module implements the NVLINK one-sided comm AllToAll throughput communicati
 NVLINK One-Sided supports post-quant dispatch.
 """
 
+import functools
 import os
 import re
 import sys
@@ -195,6 +196,15 @@ def _get_cft_max_batch_for_dispatch() -> int | None:
 
 def _get_cft_max_batch_for_combine() -> int | None:
     return _get_cft_max_batch(_CFT_MAX_BATCH_FOR_COMBINE_ENV, _CFT_DEFAULT_MAX_BATCH_FOR_COMBINE)
+
+
+@functools.lru_cache(maxsize=1)
+def _moe_a2a_combine_has_output_addend() -> bool:
+    try:
+        schema = torch.ops.trtllm.moe_a2a_combine.default._schema
+    except (AttributeError, RuntimeError):
+        return False
+    return any(arg.name == "output_addend" for arg in schema.arguments)
 
 
 class NVLinkOneSided(Communication):
@@ -621,6 +631,10 @@ class NVLinkOneSided(Communication):
         """
         return MnnvlMemory.supports_mnnvl()
 
+    def supports_combine_output_addend(self) -> bool:
+        """Whether ``combine`` takes ``output_addend`` (the loaded ``moe_a2a_combine`` has the argument)."""
+        return _moe_a2a_combine_has_output_addend()
+
     def supports_post_quant_dispatch(self) -> bool:
         """
         NVLINK one-sided comm supports post-quant dispatch.
@@ -1035,6 +1049,20 @@ class NVLinkOneSided(Communication):
         combine_payload_offset = self._reserve_combine_region(
             final_hidden_states.shape[-1], final_hidden_states.dtype
         )
+        # output_addend: [local_num_tokens, hidden] of the payload dtype added to every combined token with the
+        # rounding of a separate add (e.g. the shared expert's output; see moe_a2a_combine).
+        output_addend = kwargs.get("output_addend")
+        if output_addend is not None:
+            if not self.supports_combine_output_addend():
+                raise RuntimeError("the loaded moe_a2a_combine op has no output_addend argument")
+            if output_addend.shape != (int(local_num_tokens), final_hidden_states.shape[-1]) or (
+                output_addend.dtype != final_hidden_states.dtype
+            ):
+                raise ValueError(
+                    f"output_addend must be [{int(local_num_tokens)}, {final_hidden_states.shape[-1]}] "
+                    f"{final_hidden_states.dtype}, got {tuple(output_addend.shape)} {output_addend.dtype}"
+                )
+            output_addend = output_addend.contiguous()
         output = torch.ops.trtllm.moe_a2a_combine(
             final_hidden_states,
             int(local_num_tokens),
@@ -1051,6 +1079,7 @@ class NVLinkOneSided(Communication):
             self._rank_mask_enabled,
             active_rank_mask,
             **({"payload_prestaged": True} if self.payload_prestaged else {}),
+            **({} if output_addend is None else {"output_addend": output_addend}),
         )
         self._watchdog_coordinator.watch_collective(
             self._alltoall_watchdog, "combine", active_rank_mask

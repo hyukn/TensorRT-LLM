@@ -750,7 +750,8 @@ torch::Tensor moeA2ACombineOp(torch::Tensor const& payload, int64_t localNumToke
     torch::Tensor const& metainfo, int64_t runtimeMaxTokensPerRank, int64_t epRank, int64_t epSize, int64_t topK,
     int64_t combinePayloadOffset, bool payloadInWorkspace, bool useLowPrecision = false,
     bool useCftCountedWrites = false, bool enableRankMask = false,
-    torch::optional<torch::Tensor> activeRankMask = torch::nullopt, bool payloadPrestaged = false)
+    torch::optional<torch::Tensor> activeRankMask = torch::nullopt, bool payloadPrestaged = false,
+    torch::optional<torch::Tensor> outputAddend = torch::nullopt)
 {
     using tensorrt_llm::kernels::moe_comm::MoeA2ACombineParams;
     using tensorrt_llm::kernels::moe_comm::moe_a2a_combine_launch;
@@ -835,6 +836,19 @@ torch::Tensor moeA2ACombineOp(torch::Tensor const& payload, int64_t localNumToke
 
     // Setup combine parameters
     MoeA2ACombineParams params{};
+    // outputAddend: added to every combined token with the rounding of a separate add (output = round(round(sum) +
+    // addend)), so a caller can fold e.g. the shared expert's output into the combine instead of a separate add.
+    if (outputAddend.has_value())
+    {
+        torch::Tensor const& addend = outputAddend.value();
+        CHECK_TH_CUDA(addend);
+        CHECK_CONTIGUOUS(addend);
+        TORCH_CHECK(addend.scalar_type() == scalarType, "output_addend must have the payload dtype");
+        TORCH_CHECK(addend.dim() == 2 && addend.size(0) == localNumTokens && addend.size(1) == elementsPerToken,
+            "output_addend must be [local_num_tokens, elements_per_token]");
+        TORCH_CHECK(reinterpret_cast<uintptr_t>(addend.data_ptr()) % 16 == 0, "output_addend must be 16-byte aligned");
+        params.output_addend = addend.data_ptr();
+    }
     params.ep_size = static_cast<int>(epSize);
     params.ep_rank = static_cast<int>(epRank);
     params.local_num_tokens = static_cast<int>(localNumTokens);
@@ -1069,7 +1083,8 @@ TORCH_LIBRARY_FRAGMENT(trtllm, module)
         "bool use_cft_counted_writes=False, "
         "bool enable_rank_mask=False, "
         "Tensor? active_rank_mask=None, "
-        "bool payload_prestaged=False) -> Tensor");
+        "bool payload_prestaged=False, "
+        "Tensor? output_addend=None) -> Tensor");
     module.def(
         "moe_a2a_cft_initialize(Tensor(a!) workspace, int workspace_mem_handle, "
         "int workspace_size_per_rank, int ep_rank, int ep_size) -> ()");

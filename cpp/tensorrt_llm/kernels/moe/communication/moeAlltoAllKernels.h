@@ -140,6 +140,11 @@ struct CombineKernelPointers
     int const* topk_target_ranks; // target rank per k, -1 for invalid or duplicate routes
     int const* topk_send_indices; // dst index per k, -1 for invalid or duplicate routes
 
+    // Optional [local_num_tokens, elements_per_token] tensor of the output dtype added to every combined token
+    // (e.g. a shared expert's output): output = round(round(sum) + addend), what a separate add of the combine
+    // output and the addend gives. nullptr: plain combine.
+    void const* output_addend;
+
     // ---- CFT combine (counted-write) fields. Unused by the fence combine path. ----
     // Local LE combine counters: per receive-slot HW-incremented byte counters.
     uint64_t* combine_counters;
@@ -269,6 +274,8 @@ struct MoeA2ACombineParams
 
     // Output tensor
     void* output_data; // Output buffer [local_num_tokens, elements_per_token]
+    // Optional addend of the output dtype and shape, added to every combined token (see CombineKernelPointers).
+    void const* output_addend;
     // Payload information
     int elements_per_token;       // Number of elements per token
     tensorrt_llm::DataType dtype; // Data type of the payload (used for combine kernel dispatch)
