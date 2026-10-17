@@ -631,6 +631,13 @@ _ATTN_OUT_MXFP8 = os.environ.get("TRTLLM_M3_ATTN_OUT_MXFP8", "0") == "1"
 # NCCL_SYMMETRIC strategies (residual + RMSNorm + quantize as one kernel after the collective). Needs the C++ op
 # (libtensorrt_llm.so + libth_common.so with that fusion op on the strategy's path).
 _AR_MXFP8_QKV = os.environ.get("TRTLLM_M3_AR_MXFP8_QKV", "0") == "1"
+# TRTLLM_M3_AR_NVFP4_QKV=1: the tensor-parallel counterpart of the attention-DP fused input-norm quantize of
+# TRTLLM_M3_QKV_NVFP4. When the next layer's fused QKV+index projection runs as an NVFP4 W4A4 GEMM, the layer-boundary
+# MNNVL AllReduce + residual + RMSNorm also emits the NVFP4 quantization of the norm output with the projection's
+# static (calibrated) activation scale (RESIDUAL_RMS_NORM_OUT_QUANT_NVFP4, swizzled scale factors), and the projection
+# takes it. Without it, the repacked projection quantizes its bf16 input in a separate kernel, which costs about what
+# the NVFP4 GEMM saves at TP4. Eager steps (decode graphs), MNNVL AllReduce only.
+_AR_NVFP4_QKV = os.environ.get("TRTLLM_M3_AR_NVFP4_QKV", "0") == "1"
 # TRTLLM_M3_AR_F32_ROUTER=1: the post-attention MNNVL AllReduce + residual + RMSNorm (PRE fusion)
 # also writes an fp32 copy of the norm output (RESIDUAL_RMS_NORM_OUT_F32), and the MoE router GEMM
 # reads it instead of upcasting the bf16 norm in a separate launch on the routed (critical) branch.
@@ -2337,15 +2344,46 @@ class MiniMaxM3Attention(Attention):
         fused QKV projection; any other input leaves it unused."""
         self._staged_mxfp8_qkv_input = (hidden_states, quantized)
 
+    def accepts_nvfp4_qkv_input(self) -> bool:
+        """Whether this layer's fused QKV+index projection is an NVFP4-repacked GEMM (TRTLLM_M3_QKV_NVFP4) that can
+        take an activation quantized with its static scale ``nvfp4_qkv_input_scale`` (see stage_nvfp4_qkv_input)."""
+        return (
+            self.enable_fused_qkv_index_projection
+            and isinstance(self.attn, MiniMaxM3MsaSparseAttention)
+            and getattr(self.qkv_proj, "lora", None) is None
+            and getattr(self.qkv_proj, "_nvfp4_repacked", False)
+        )
+
+    @property
+    def nvfp4_qkv_input_scale(self) -> torch.Tensor:
+        """The fp32 [1] global scale the NVFP4-repacked QKV projection quantizes its activation with."""
+        return self.qkv_proj._nvfp4_input_scale
+
+    def stage_nvfp4_qkv_input(
+        self, hidden_states: torch.Tensor, quantized: Fp4QuantizedTensor
+    ) -> None:
+        """Hand the NVFP4 form of ``hidden_states`` (quantized with ``nvfp4_qkv_input_scale``, swizzled scales) to
+        the NVFP4-repacked fused QKV projection; any other input leaves it unused."""
+        if not quantized.is_sf_swizzled:
+            raise ValueError("The NVFP4 QKV input needs swizzled scale factors")
+        self._staged_mxfp8_qkv_input = (hidden_states, quantized)
+
     def _take_staged_mxfp8_qkv_input(self, hidden_states: torch.Tensor):
         staged = getattr(self, "_staged_mxfp8_qkv_input", None)
         self._staged_mxfp8_qkv_input = None
         if staged is not None and staged[0] is hidden_states:
-            logger.info_once(
-                "MiniMax-M3 fused QKV projection takes the MXFP8 activation from the "
-                "layer-boundary AllReduce (TRTLLM_M3_AR_MXFP8_QKV=1)",
-                key="m3_ar_mxfp8_qkv_input",
-            )
+            if isinstance(staged[1], Fp4QuantizedTensor):
+                logger.info_once(
+                    "MiniMax-M3 fused QKV projection takes the NVFP4 activation from the "
+                    "layer-boundary AllReduce (TRTLLM_M3_AR_NVFP4_QKV=1)",
+                    key="m3_ar_nvfp4_qkv_input",
+                )
+            else:
+                logger.info_once(
+                    "MiniMax-M3 fused QKV projection takes the MXFP8 activation from the "
+                    "layer-boundary AllReduce (TRTLLM_M3_AR_MXFP8_QKV=1)",
+                    key="m3_ar_mxfp8_qkv_input",
+                )
             return staged[1]
         return hidden_states
 
@@ -3116,6 +3154,25 @@ class MiniMaxM3DecoderLayer(DecoderLayer):
         if self.next_layer_layernorm is None:
             return hidden_states, residual
         if self.post_feed_forward_fusion:
+            nvfp4_attn = self._next_layer_nvfp4_attention(hidden_states)
+            if nvfp4_attn is not None:
+                norm, quant, scale, residual = self.allreduce(
+                    hidden_states,
+                    all_reduce_params=AllReduceParams(
+                        fusion_op=AllReduceFusionOp.RESIDUAL_RMS_NORM_OUT_QUANT_NVFP4,
+                        residual=residual,
+                        norm_weight=self.next_layer_layernorm.weight,
+                        eps=self.next_layer_layernorm.variance_epsilon,
+                        scale=nvfp4_attn.nvfp4_qkv_input_scale,
+                        trigger_completion_at_end=False,
+                        input_add=input_add,
+                    ),
+                )
+                nvfp4_attn.stage_nvfp4_qkv_input(
+                    norm,
+                    Fp4QuantizedTensor(fp4_tensor=quant, scaling_factor=scale, is_sf_swizzled=True),
+                )
+                return norm, residual
             next_attn = self._next_layer_mxfp8_attention(hidden_states)
             if next_attn is not None:
                 norm, quant, scale, residual = self.allreduce(
@@ -3148,6 +3205,18 @@ class MiniMaxM3DecoderLayer(DecoderLayer):
                 ),
             )
         return self.next_layer_layernorm(hidden_states, residual)
+
+    def _next_layer_nvfp4_attention(self, hidden_states: torch.Tensor):
+        """The next layer's attention if the boundary AllReduce should quantize to NVFP4 for its repacked QKV GEMM."""
+        ref = getattr(self, "next_layer_attn_ref", None)
+        next_attn = ref[0] if ref else None
+        if not _AR_NVFP4_QKV or next_attn is None or hidden_states.dim() != 2:
+            return None
+        if is_torch_compiling() or torch.compiler.is_compiling():
+            return None
+        if self.allreduce is None or getattr(self.allreduce, "mnnvl_allreduce", None) is None:
+            return None
+        return next_attn if next_attn.accepts_nvfp4_qkv_input() else None
 
     def _next_layer_mxfp8_attention(self, hidden_states: torch.Tensor):
         """The next layer's attention if the boundary AllReduce should also quantize for its QKV GEMM, else None."""
