@@ -33,7 +33,8 @@ from tensorrt_llm._torch.modules.linear import (
 )
 from tensorrt_llm._torch.modules.mxfp8_utils import quant_bf16_to_mxfp8
 from tensorrt_llm._torch.modules.nvfp4_fake_quant import nvfp4_fake_quant
-from tensorrt_llm._torch.utils import MxFp8QuantizedTensor
+from tensorrt_llm._torch.modules.rms_norm import RMSNorm
+from tensorrt_llm._torch.utils import Fp4QuantizedTensor, MxFp8QuantizedTensor
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
 
@@ -188,15 +189,18 @@ def test_calibration_records_the_running_input_amax_in_graphs():
 
 
 class _Attn(nn.Module):
-    def __init__(self, proj):
+    def __init__(self, proj, sparse=False):
         super().__init__()
         self.qkv_proj = proj
+        self.is_sparse_attention_layer = sparse
+        self.enable_fused_qkv_index_projection = sparse
 
 
 class _Layer(nn.Module):
-    def __init__(self, proj):
+    def __init__(self, proj, sparse=False, hidden=512):
         super().__init__()
-        self.self_attn = _Attn(proj)
+        self.self_attn = _Attn(proj, sparse)
+        self.input_layernorm = RMSNorm(hidden_size=hidden, eps=1e-6, dtype=torch.bfloat16).cuda()
 
 
 def test_setup_calibrates_then_repacks_from_the_merged_file(monkeypatch, tmp_path):
@@ -252,3 +256,50 @@ def test_linear_traces_under_torch_compile_fullgraph(monkeypatch, repack):
     monkeypatch.setenv("TRTLLM_FAKEQUANT_DENSE_NVFP4", "1")  # ignored while tracing
     compiled = torch.compile(lambda t: lin(t), backend="eager", fullgraph=True)
     assert _rel(compiled(x), eager) < 1e-2  # the compiled MXFP8 path may pick another GEMM backend
+
+
+def test_fused_input_norm_feeds_the_repacked_projection(monkeypatch, tmp_path):
+    """Sparse layers: the input layernorm emits NVFP4 with the projection's static scale (fused add + RMSNorm +
+    quantize); the projection consumes it. Dense layers keep the bf16 norm."""
+    torch.manual_seed(9)
+    layers = nn.ModuleList(
+        [
+            _Layer(_mxfp8_linear(384, 512, seed=7), sparse=False),
+            _Layer(_mxfp8_linear(384, 512, seed=8), sparse=True),
+        ]
+    )
+    for layer in layers:
+        layer.input_layernorm.weight.data.uniform_(0.5, 1.5)
+    w_deq_sparse = layers[1].self_attn.qkv_proj.quant_method.dequantized_weight(
+        layers[1].self_attn.qkv_proj
+    )
+    path = str(tmp_path / "amax.json")
+    with open(path, "w") as f:
+        json.dump({"amax": {"0": 8.0, "1": 8.0}}, f)
+    monkeypatch.setenv(qkv_nvfp4.ENABLE_ENV, "1")
+    monkeypatch.setenv(qkv_nvfp4.SCALES_ENV, path)
+    assert qkv_nvfp4.setup(layers, rank=0) == ("nvfp4", 2)
+    dense_norm, sparse_norm = layers[0].input_layernorm, layers[1].input_layernorm
+    assert not dense_norm.is_nvfp4 and sparse_norm.is_nvfp4
+    proj = layers[1].self_attn.qkv_proj
+    h = torch.randn(24, 512, dtype=torch.bfloat16, device="cuda")
+    residual = torch.randn(24, 512, dtype=torch.bfloat16, device="cuda")
+    fp4, res_fused = sparse_norm(h, residual.clone())
+    assert isinstance(fp4, Fp4QuantizedTensor)
+    sparse_norm.is_nvfp4 = False  # the unfused reference: bf16 norm, then the projection quantizes
+    normed, res_ref = sparse_norm(h, residual.clone())
+    sparse_norm.is_nvfp4 = True
+    torch.testing.assert_close(res_fused, res_ref, rtol=0, atol=0)
+    # The fused kernel quantizes the fp32 normed value, the unfused path its bf16 rounding: some elements land on
+    # the neighbouring E2M1 point. Same scales, same accuracy vs the bf16 GEMM of the normed activation.
+    exact = F.linear(normed, w_deq_sparse.to(torch.bfloat16))
+    fused_err, unfused_err = _rel(proj(fp4), exact), _rel(proj(normed), exact)
+    assert fused_err < 0.25 and fused_err < 1.15 * unfused_err, (fused_err, unfused_err)
+    assert _rel(proj(fp4), proj(normed)) < 5e-2
+
+    monkeypatch.setenv(qkv_nvfp4.FUSE_NORM_ENV, "0")
+    fresh = nn.ModuleList([_Layer(_mxfp8_linear(384, 512, seed=10), sparse=True)])
+    with open(path, "w") as f:
+        json.dump({"amax": {"0": 8.0}}, f)
+    assert qkv_nvfp4.setup(fresh, rank=0) == ("nvfp4", 1)
+    assert not fresh[0].input_layernorm.is_nvfp4

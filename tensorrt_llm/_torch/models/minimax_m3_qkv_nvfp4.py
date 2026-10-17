@@ -22,6 +22,8 @@ and quantizes its activation per call with a static global scale from a calibrat
   TRTLLM_M3_QKV_NVFP4_MARGIN   multiplier on the calibrated amax (default 2.0; larger inputs saturate)
   TRTLLM_M3_QKV_NVFP4_BACKENDS NVFP4 GEMM backends (default "cublaslt,cutedsl")
   TRTLLM_M3_QKV_NVFP4_KEEP_MXFP8=1 keeps the MXFP8 weight in memory (default: freed)
+  TRTLLM_M3_QKV_NVFP4_FUSE_NORM=0 keeps the activation quantize separate (default: the sparse layers' input
+    layernorm emits NVFP4 directly, fused add + RMSNorm + quantize with the projection's static scale)
 
 ``TRTLLM_M3_QKV_NVFP4_CALIBRATE=<path>`` instead records each layer's running max |input| (MXFP8 GEMM
 unchanged) and writes ``<path>.rank<r>`` (every 30 s from eager steps and at exit); merge the ranks
@@ -49,6 +51,7 @@ MARGIN_ENV = "TRTLLM_M3_QKV_NVFP4_MARGIN"
 BACKENDS_ENV = "TRTLLM_M3_QKV_NVFP4_BACKENDS"
 KEEP_MXFP8_ENV = "TRTLLM_M3_QKV_NVFP4_KEEP_MXFP8"
 CALIBRATE_ENV = "TRTLLM_M3_QKV_NVFP4_CALIBRATE"
+FUSE_NORM_ENV = "TRTLLM_M3_QKV_NVFP4_FUSE_NORM"
 DEFAULT_MARGIN = 2.0
 DEFAULT_BACKENDS = ("cublaslt", "cutedsl")
 
@@ -88,6 +91,36 @@ class QkvAmaxRecorder:
             json.dump({"amax": amax}, f, indent=1)
         os.replace(tmp, self.path)
         self.last = time.monotonic()
+
+
+def fuse_input_norm(layer: nn.Module, proj: nn.Module) -> bool:
+    """Make ``layer.input_layernorm`` emit NVFP4 for its repacked QKV projection (fused add + RMSNorm + quantize).
+
+    Only for sparse-attention layers with the fused QKV+index projection: their forward hands the norm output
+    straight to ``qkv_proj``. The norm is also the previous layer's ``next_layer_layernorm``; off the AllReduce
+    fusion path (attention DP, Eagle3 capture layers) that call returns the quantized activation too.
+    """
+    from tensorrt_llm._utils import get_sm_version
+
+    from ..modules.rms_norm import RMSNorm
+    from ..utils import is_nvfp4_marlin_enabled
+
+    attn = getattr(layer, "self_attn", None)
+    norm = getattr(layer, "input_layernorm", None)
+    if not (
+        getattr(attn, "is_sparse_attention_layer", False)
+        and getattr(attn, "enable_fused_qkv_index_projection", False)
+        and isinstance(norm, RMSNorm)
+        and not norm.use_gemma
+        and not norm.return_hp_output
+        and getattr(proj, "_nvfp4_repacked", False)
+    ):
+        return False
+    if not (100 <= get_sm_version() < 120) or is_nvfp4_marlin_enabled():
+        return False
+    norm.is_nvfp4 = True
+    norm.nvfp4_scale = proj._nvfp4_input_scale
+    return True
 
 
 def merge_calibration(paths: Sequence[str], out: Optional[str] = None) -> Dict[str, float]:
@@ -143,16 +176,21 @@ def setup(layers: Iterable[nn.Module], rank: int) -> Tuple[str, int]:
         if b.strip()
     )
     free_mxfp8 = os.environ.get(KEEP_MXFP8_ENV, "0") != "1"
+    fuse_norm = os.environ.get(FUSE_NORM_ENV, "1") != "0"
+    layers = list(layers)
+    fused = 0
     for idx, proj in projections.items():
         proj.quant_method.repack_to_nvfp4(
             proj, amax[idx] * margin, allowed_backends=backends, free_mxfp8=free_mxfp8
         )
+        if fuse_norm:
+            fused += fuse_input_norm(layers[idx], proj)
     if free_mxfp8 and torch.cuda.is_available():
         torch.cuda.empty_cache()
     logger.info(
         f"[M3 QKV NVFP4] {len(projections)} QKV projections -> NVFP4 W4A4 (static activation scales from "
         f"{scales_path} x {margin}, backends {','.join(backends)}, MXFP8 weights "
-        f"{'freed' if free_mxfp8 else 'kept'})"
+        f"{'freed' if free_mxfp8 else 'kept'}; {fused} input layernorms quantize for them)"
     )
     return "nvfp4", len(projections)
 

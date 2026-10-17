@@ -3668,12 +3668,23 @@ class MXFP8LinearMethod(LinearMethodBase):
             raise RuntimeError(
                 "An NVFP4-repacked MXFP8 Linear needs the bf16 activation, got a "
                 "pre-quantized MXFP8 one")
-        original_shape = input.shape
-        if input.dim() > 2:
-            input = input.reshape(-1, input.shape[-1])
-        act_fp4, act_sf = torch.ops.trtllm.fp4_quantize(
-            input.contiguous(), module._nvfp4_input_scale,
-            fp4_utils.NVFP4_SF_VEC_SIZE, False)
+        if isinstance(input, Fp4QuantizedTensor):
+            # Quantized by the producer (fused add + RMSNorm + NVFP4 quantize with this
+            # module's static scale, see minimax_m3_qkv_nvfp4).
+            if not input.is_sf_swizzled:
+                raise RuntimeError(
+                    "An NVFP4-repacked MXFP8 Linear needs swizzled FP4 scales")
+            act_fp4, act_sf = input.fp4_tensor, input.scaling_factor
+            original_shape = act_fp4.shape
+            if act_fp4.dim() > 2:
+                act_fp4 = act_fp4.reshape(-1, act_fp4.shape[-1])
+        else:
+            original_shape = input.shape
+            if input.dim() > 2:
+                input = input.reshape(-1, input.shape[-1])
+            act_fp4, act_sf = torch.ops.trtllm.fp4_quantize(
+                input.contiguous(), module._nvfp4_input_scale,
+                fp4_utils.NVFP4_SF_VEC_SIZE, False)
         if (not is_torch_compiling() and not torch.compiler.is_compiling()
                 and _FLASHINFER_MXFP8_DECODE_GRAPH_CAPTURE_ACTIVE.get()):
             # Decode graphs: the tactic for this exact M, tuned in the warmup-only pass.

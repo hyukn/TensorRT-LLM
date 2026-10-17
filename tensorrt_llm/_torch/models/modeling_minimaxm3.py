@@ -2593,10 +2593,13 @@ class MiniMaxM3Attention(Attention):
         # split the packed output and retain the existing producer paths.
         packed_qkv = None
         packed_idx_qk = None
+        # An NVFP4 activation from the fused input layernorm (TRTLLM_M3_QKV_NVFP4) takes the direct path.
+        prequantized_fp4 = isinstance(hidden_states, Fp4QuantizedTensor)
         if self.enable_fused_qkv_index_projection:
             if (
                 self.register_to_config
                 and is_torch_compiling()
+                and not prequantized_fp4
                 and isinstance(self.attn, MiniMaxM3MsaSparseAttention)
                 and self._emit_fp8_main_qkv()
                 and self.attn.indexer_kv_dtype == "fp8"
@@ -2614,7 +2617,11 @@ class MiniMaxM3Attention(Attention):
                 )
                 o = self._forward_attention_core(q, None, None, idx_q, None, attn_metadata)
                 return self.o_proj(o, all_reduce_params=all_reduce_params)
-            if self.register_to_config and (is_torch_compiling() or is_in_breakable_cuda_graph()):
+            if (
+                self.register_to_config
+                and not prequantized_fp4
+                and (is_torch_compiling() or is_in_breakable_cuda_graph())
+            ):
                 # Keep the projection in the captured segment while hiding
                 # its shape-specializing MXFP8 internals behind a symbolic
                 # fake implementation. Cache insertion and MSA remain in the
