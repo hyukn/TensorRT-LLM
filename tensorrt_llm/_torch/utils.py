@@ -536,20 +536,29 @@ def get_per_request_prefill_cuda_graph_flag() -> bool:
     return getattr(_global_attrs, 'per_request_prefill_cuda_graph_flag', True)
 
 
-def create_lm_head_tp_mapping(mapping: Mapping, token_count: int) -> Mapping:
-    # We use heuristic to determine the lm_head_tp_size
-    # Since token_count=256 will hit the boundary of math-bound problem
-    # We use 256 // token_count to determine the lm_head_tp_size
-    # For more details, refer to the blog: https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/blogs/tech_blog/blog14_Scaling_Expert_Parallelism_in_TensorRT-LLM_part3.md#mtp-lm-head-tensor-parallelism
-    lm_head_tp_size_raw = 256 // token_count
-    # TODO: On platforms like GB200, setting lm_head_tp_size_upper_bound to world_size could be more efficient when world_size > gpus_per_node, we need to do further investigation.
-    lm_head_tp_size_upper_bound = min(mapping.world_size, mapping.gpus_per_node)
-    lm_head_tp_size = int(
-        os.getenv(
-            'LM_HEAD_TP_SIZE',
-            nearest_in_buckets(lm_head_tp_size_raw,
-                               [1, lm_head_tp_size_upper_bound])))
-    assert mapping.tp_size % lm_head_tp_size == 0, f"mapping.tp_size: {mapping.tp_size}, lm_head_tp_size: {lm_head_tp_size}"
+def create_lm_head_tp_mapping(mapping: Mapping,
+                              token_count: int,
+                              lm_head_tp_size: Optional[int] = None) -> Mapping:
+    """The LM-head TP mapping for ``token_count`` rows per rank.
+
+    ``lm_head_tp_size`` (a divisor of ``mapping.tp_size``) overrides the heuristic and the
+    ``LM_HEAD_TP_SIZE`` environment variable for this call.
+    """
+    if lm_head_tp_size is None:
+        # We use heuristic to determine the lm_head_tp_size
+        # Since token_count=256 will hit the boundary of math-bound problem
+        # We use 256 // token_count to determine the lm_head_tp_size
+        # For more details, refer to the blog: https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/blogs/tech_blog/blog14_Scaling_Expert_Parallelism_in_TensorRT-LLM_part3.md#mtp-lm-head-tensor-parallelism
+        lm_head_tp_size_raw = 256 // token_count
+        # TODO: On platforms like GB200, setting lm_head_tp_size_upper_bound to world_size could be more efficient when world_size > gpus_per_node, we need to do further investigation.
+        lm_head_tp_size_upper_bound = min(mapping.world_size,
+                                          mapping.gpus_per_node)
+        lm_head_tp_size = int(
+            os.getenv(
+                'LM_HEAD_TP_SIZE',
+                nearest_in_buckets(lm_head_tp_size_raw,
+                                   [1, lm_head_tp_size_upper_bound])))
+    assert lm_head_tp_size >= 1 and mapping.tp_size % lm_head_tp_size == 0, f"mapping.tp_size: {mapping.tp_size}, lm_head_tp_size: {lm_head_tp_size}"
     lm_head_pp_size = mapping.pp_size * mapping.tp_size // lm_head_tp_size
 
     return Mapping(

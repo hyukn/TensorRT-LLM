@@ -459,6 +459,27 @@ _CTX_DRAFT_WINDOW = int(os.environ.get("TRTLLM_EAGLE3_CTX_DRAFT_WINDOW", "256"))
 _CTX_DRAFT_MIN_QK = float(
     os.environ.get("TRTLLM_EAGLE3_CTX_DRAFT_MIN_QK", "3e9"))
 
+# TRTLLM_SPEC_DRAFT_LM_HEAD_TP_SIZE=<n>: under attention DP with enable_lm_head_tp_in_adp, the Eagle3 draft-token
+# projection (one row per request, greedy argmax over vocab shards) uses an LM-head TP group of n ranks instead of
+# create_lm_head_tp_mapping's pick, which is capped at gpus_per_node. With 2 GEN ranks per node (CTX/GEN co-located
+# DEP8) that cap is 2: every rank projects half the vocabulary, a 1.2 GB bf16 weight read per draft step (~200 us for
+# 26 rows per rank on GB300). The 8 ranks of one NVLink domain project 1/8 each (~57 us). Only the draft head: the
+# sampler combines the shards' (index, max) pairs, so the gather stays small, while the target's full-vocab gather
+# grows with the group. n must divide the attention-DP group size. Unset or 0: unchanged.
+_DRAFT_LM_HEAD_TP_SIZE = int(
+    os.environ.get("TRTLLM_SPEC_DRAFT_LM_HEAD_TP_SIZE", "0") or 0)
+
+
+def draft_lm_head_tp_size(mapping: Optional[Mapping]) -> Optional[int]:
+    """The LM-head TP group size for the draft-token projection (TRTLLM_SPEC_DRAFT_LM_HEAD_TP_SIZE), else None."""
+    if _DRAFT_LM_HEAD_TP_SIZE <= 0 or mapping is None:
+        return None
+    if mapping.tp_size % _DRAFT_LM_HEAD_TP_SIZE != 0:
+        raise ValueError(
+            f"TRTLLM_SPEC_DRAFT_LM_HEAD_TP_SIZE={_DRAFT_LM_HEAD_TP_SIZE} must divide the attention-DP group size "
+            f"{mapping.tp_size}")
+    return _DRAFT_LM_HEAD_TP_SIZE
+
 
 def _draft_attention_backends(draft_model: nn.Module) -> list:
     """The attention backends of the draft model's attention modules."""
@@ -1047,7 +1068,8 @@ class Eagle3OneModelWorker(SpecWorkerBase):
                     logits, mapping_lm_head_tp = (
                         draft_model.lm_head.forward_lm_head_tp_in_adp(
                             hidden_states[gather_ids],
-                            max(spec_metadata.all_rank_num_seqs)))
+                            max(spec_metadata.all_rank_num_seqs),
+                            draft_lm_head_tp_size(self.mapping)))
                 elif (not advanced_draft_sampling
                       and self._draft_from_tp_vocab_shards(draft_model)):
                     # Plain TP, greedy drafts: this rank's vocab shard of every

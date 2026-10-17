@@ -236,8 +236,11 @@ class LMHead(Linear):
         return self.apply_linear(input, self.bias)
 
     def forward_lm_head_tp_in_adp(
-            self, input: torch.Tensor,
-            num_rows_per_rank: int) -> Tuple[torch.Tensor, Mapping]:
+            self,
+            input: torch.Tensor,
+            num_rows_per_rank: int,
+            lm_head_tp_size: Optional[int] = None
+    ) -> Tuple[torch.Tensor, Mapping]:
         """Project the attention-DP group's rows onto this rank's vocab shard.
 
         Under attention DP every rank holds the whole weight, so a batch of a
@@ -250,6 +253,9 @@ class LMHead(Linear):
             input: This rank's ``[num_rows, hidden_size]`` rows.
             num_rows_per_rank: The row count every rank pads to. It must be
                 identical on all ranks and at least the largest ``num_rows``.
+            lm_head_tp_size: The LM-head TP group size (a divisor of the
+                attention-DP group size, identical on all ranks); None picks it
+                from ``num_rows_per_rank`` (see ``create_lm_head_tp_mapping``).
 
         Returns:
             The ``[group_size * num_rows_per_rank, shard_size]`` logits, with
@@ -265,7 +271,8 @@ class LMHead(Linear):
             raise ValueError(f"LM head input has {num_rows} rows, more than "
                              f"num_rows_per_rank={num_rows_per_rank}")
         mapping_lm_head_tp = create_lm_head_tp_mapping(self.mapping,
-                                                       num_rows_per_rank)
+                                                       num_rows_per_rank,
+                                                       lm_head_tp_size)
         if num_rows < num_rows_per_rank:
             input = F.pad(input, (0, 0, 0, num_rows_per_rank - num_rows))
         input = allgather(input, mapping_lm_head_tp, dim=0)
@@ -279,7 +286,10 @@ class LMHead(Linear):
         return output, mapping_lm_head_tp
 
     def forward_lm_head_tp_in_adp_full_vocab(
-            self, input: torch.Tensor, num_rows_per_rank: int) -> torch.Tensor:
+            self,
+            input: torch.Tensor,
+            num_rows_per_rank: int,
+            lm_head_tp_size: Optional[int] = None) -> torch.Tensor:
         """Full-vocab logits of this rank's rows, computed vocab-parallel.
 
         Runs :meth:`forward_lm_head_tp_in_adp`, then gathers every LM-head TP
@@ -288,7 +298,7 @@ class LMHead(Linear):
         """
         num_rows = input.shape[0]
         shards, mapping_lm_head_tp = self.forward_lm_head_tp_in_adp(
-            input, num_rows_per_rank)
+            input, num_rows_per_rank, lm_head_tp_size)
         group_size = mapping_lm_head_tp.tp_size
         # [shard owner, row owner, row, shard column]
         shards = allgather(shards, mapping_lm_head_tp,

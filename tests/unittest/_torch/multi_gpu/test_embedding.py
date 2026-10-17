@@ -1,3 +1,4 @@
+import functools
 import pickle
 import sys
 import traceback
@@ -192,14 +193,24 @@ def row_lm_head_forward(x, vocab_size, hidden_size, dtype, tensor_parallel_size,
 
 
 @torch.inference_mode
-def lm_head_tp_in_adp_forward(x, vocab_size, hidden_size, dtype,
-                              tensor_parallel_size, tensor_parallel_rank,
-                              weight):
+def lm_head_tp_in_adp_forward(x,
+                              vocab_size,
+                              hidden_size,
+                              dtype,
+                              tensor_parallel_size,
+                              tensor_parallel_rank,
+                              weight,
+                              lm_head_tp_size=None):
     # Attention-DP ranks own different numbers of rows: rank r owns 2r+1.
     rows_per_rank = [2 * r + 1 for r in range(tensor_parallel_size)]
     num_rows_per_rank = max(rows_per_rank)
     all_rows = torch.split(x.cuda(), rows_per_rank)
     rows = all_rows[tensor_parallel_rank]
+    # The LM-head TP group: the heuristic picks the whole attention-DP group
+    # here; an explicit size splits it into consecutive groups of that size.
+    group_size = lm_head_tp_size or tensor_parallel_size
+    group_rank = tensor_parallel_rank % group_size
+    group_start = tensor_parallel_rank - group_rank
 
     lm_head = LMHead(
         num_embeddings=vocab_size,
@@ -220,9 +231,9 @@ def lm_head_tp_in_adp_forward(x, vocab_size, hidden_size, dtype,
     lm_head.cuda()
 
     shards, mapping_lm_head_tp = lm_head.forward_lm_head_tp_in_adp(
-        rows, num_rows_per_rank)
+        rows, num_rows_per_rank, lm_head_tp_size)
     logits = lm_head.forward_lm_head_tp_in_adp_full_vocab(
-        rows, num_rows_per_rank)
+        rows, num_rows_per_rank, lm_head_tp_size)
 
     # torch run
     torch_lm_head = nn.Linear(
@@ -234,13 +245,13 @@ def lm_head_tp_in_adp_forward(x, vocab_size, hidden_size, dtype,
     torch_lm_head.weight.data.copy_(weight)
     torch_lm_head.cuda()
 
-    # Every rank's rows, zero-padded, projected onto this rank's vocab shard;
-    # the shard past the vocabulary is -inf.
-    shard_size = (vocab_size + tensor_parallel_size - 1) // tensor_parallel_size
-    shard_start = tensor_parallel_rank * shard_size
+    # Every group rank's rows, zero-padded, projected onto this rank's vocab
+    # shard; the shard past the vocabulary is -inf.
+    shard_size = (vocab_size + group_size - 1) // group_size
+    shard_start = group_rank * shard_size
     stacked_rows = torch.cat([
         nn.functional.pad(r, (0, 0, 0, num_rows_per_rank - r.shape[0]))
-        for r in all_rows
+        for r in all_rows[group_start:group_start + group_size]
     ])
     stacked_logits = torch_lm_head.forward(stacked_rows)
     torch_shards = stacked_logits[:, shard_start:shard_start + shard_size]
@@ -251,7 +262,8 @@ def lm_head_tp_in_adp_forward(x, vocab_size, hidden_size, dtype,
 
     # compare
     torch.cuda.synchronize()
-    assert mapping_lm_head_tp.tp_size == tensor_parallel_size
+    assert mapping_lm_head_tp.tp_size == group_size
+    assert mapping_lm_head_tp.tp_rank == group_rank
     torch.testing.assert_close(shards, torch_shards)
     torch.testing.assert_close(logits, torch_logits)
 
@@ -357,5 +369,33 @@ def test_lm_head_tp_in_adp(vocab_size, mpi_pool_executor):
         run_single_rank,
         *zip(*[(tensor_parallel_size, lm_head_tp_in_adp_forward, input, weight,
                 vocab_size, hidden_size, dtype)] * 2))
+    for r in results:
+        assert r is True
+
+
+@pytest.mark.parametrize("lm_head_tp_size", [1, 2, 4])
+@pytest.mark.parametrize("mpi_pool_executor", [2, 4], indirect=True)
+def test_lm_head_tp_in_adp_explicit_group(lm_head_tp_size, mpi_pool_executor):
+    """An explicit LM-head TP size (the Eagle3 draft head's
+    TRTLLM_SPEC_DRAFT_LM_HEAD_TP_SIZE) splits the attention-DP group into
+    consecutive LM-head TP groups of that size, whole group included."""
+    tensor_parallel_size = mpi_pool_executor.num_workers
+    if torch.cuda.device_count() < tensor_parallel_size:
+        pytest.skip(f"needs {tensor_parallel_size} GPUs to run this test")
+    if tensor_parallel_size % lm_head_tp_size != 0:
+        pytest.skip("the LM-head TP size must divide the attention-DP group")
+    torch.manual_seed(42)
+    vocab_size = 127
+    hidden_size = 16
+    dtype = torch.bfloat16
+    num_rows = sum(2 * r + 1 for r in range(tensor_parallel_size))
+    input = torch.randn((num_rows, hidden_size), dtype=dtype)
+    weight = torch.randn((vocab_size, hidden_size), dtype=dtype)
+    forward = functools.partial(lm_head_tp_in_adp_forward,
+                                lm_head_tp_size=lm_head_tp_size)
+    results = mpi_pool_executor.map(
+        run_single_rank,
+        *zip(*[(tensor_parallel_size, forward, input, weight, vocab_size,
+                hidden_size, dtype)] * tensor_parallel_size))
     for r in results:
         assert r is True
