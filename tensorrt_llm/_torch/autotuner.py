@@ -42,6 +42,81 @@ from tensorrt_llm.mapping import Mapping
 # Unique tag to avoid collisions with other comms
 PP_COMM_TAG_AUTOTUNING = 30000
 
+# TP agreement on near-tie picks (env-gated, default off). Every TP rank runs the same GEMMs on
+# the same shapes, but each one times its candidates independently, so near-tie picks diverge
+# between ranks (and the slowest rank's pick sets the step). With TLLM_AUTOTUNER_TP_AGREE=1 the
+# ops matching TLLM_AUTOTUNER_TP_AGREE_OPS (comma-separated substrings, default "mxfp8") pick the
+# candidate with the best worst-rank time: TRT-LLM's tuner all-gathers each profile's candidate
+# times over the TP group and takes the argmin of the per-candidate maximum, and FlashInfer's
+# tuner (whose configs back the MXFP8 CuTe DSL "tuned" tactic) gets the per-config maximum over
+# the TP group. Requires the same cache hits on every TP rank (fresh or agreed cache files).
+TP_AGREE_ENV = "TLLM_AUTOTUNER_TP_AGREE"
+TP_AGREE_OPS_ENV = "TLLM_AUTOTUNER_TP_AGREE_OPS"
+# FlashInfer's tuner queues its CUDA-graph replays behind a fixed 100 us delay; this sets it (the
+# FlashInfer counterpart of TLLM_AUTOTUNER_CUDA_GRAPH_DELAY_US).
+FLASHINFER_GRAPH_DELAY_ENV = "TLLM_AUTOTUNER_FLASHINFER_GRAPH_DELAY_US"
+
+
+def _tp_agree_patterns() -> List[str]:
+    return [
+        p.strip().lower()
+        for p in os.environ.get(TP_AGREE_OPS_ENV, "mxfp8").split(",")
+        if p.strip()
+    ]
+
+
+def _tp_agreeing_profile(profile_fn: Callable) -> Callable:
+    """Wrap FlashInfer's per-config profiler so matching runners return the TP-max time.
+
+    Every TP rank must reach the all-gather once per call, so a failing config still takes part
+    (with an infinite time, which disqualifies it everywhere) before its error is re-raised.
+    """
+
+    def wrapped(self, runner, *args, **kwargs):
+        tuner = AutoTuner.get()
+        if not tuner._tp_agree_active(type(runner).__name__):
+            return profile_fn(self, runner, *args, **kwargs)
+        error = None
+        try:
+            measured = float(profile_fn(self, runner, *args, **kwargs))
+        except BaseException as e:  # noqa: BLE001 - every rank must reach the all-gather
+            measured, error = float('inf'), e
+        agreed = max(tuner._dist.tp_allgather(measured, small_payload=True))
+        if error is not None:
+            raise error
+        return agreed
+
+    wrapped.__wrapped__ = profile_fn
+    return wrapped
+
+
+def install_flashinfer_tuner_overrides() -> None:
+    """Apply TLLM_AUTOTUNER_FLASHINFER_GRAPH_DELAY_US / TLLM_AUTOTUNER_TP_AGREE to FlashInfer's tuner.
+
+    Idempotent; a no-op when neither is set or FlashInfer's tuner is unavailable.
+    """
+    delay = os.environ.get(FLASHINFER_GRAPH_DELAY_ENV)
+    agree = os.environ.get(TP_AGREE_ENV, "0") == "1"
+    if not delay and not agree:
+        return
+    try:
+        from flashinfer.autotuner import autotuner as flashinfer_autotuner
+    except ImportError:
+        return
+    cls = getattr(flashinfer_autotuner, "AutoTuner", None)
+    if cls is None or not hasattr(cls, "_profile_single_kernel"):
+        return
+    if delay:
+        cls._CUDA_GRAPH_DELAY_MICRO_SECS = int(delay)
+    if agree and not getattr(cls, "_trtllm_tp_agree_installed", False):
+        cls._profile_single_kernel = _tp_agreeing_profile(
+            cls._profile_single_kernel)
+        cls._trtllm_tp_agree_installed = True
+    logger.info_once(
+        f"[AutoTuner] FlashInfer tuner overrides: graph delay "
+        f"{cls._CUDA_GRAPH_DELAY_MICRO_SECS} us, TP agreement {'on' if agree else 'off'}",
+        key="flashinfer_tuner_overrides")
+
 
 class DistributedTuningStrategy(enum.Enum):
     """
@@ -1422,6 +1497,10 @@ class AutoTuner:
                 f"time={(0.0 if best_runner_id is not None else float('inf')):.3f}ms"
             )
         else:
+            agree = (tuning_config.distributed_tuning_strategy
+                     == DistributedTuningStrategy.INDEPENDENT
+                     and self._tp_agree_active(custom_op))
+            measured_pairs, measured_times = [], []
             for runner_id, runner, runner_arg_names, all_valid_tactics in candidates:
                 valid_tactics = self._maybe_parallelize_tactics(
                     all_valid_tactics,
@@ -1482,9 +1561,14 @@ class AutoTuner:
                         f"runner={runner}, tactic={tac}, "
                         f"shapes={profile.get_opt_shapes()}, "
                         f"time={time_measured:.3f}ms")
+                    measured_pairs.append((runner_id, tac))
+                    measured_times.append(time_measured)
                     if time_measured < min_time:
                         min_time = time_measured
                         best_runner_id, best_tactic = runner_id, tac
+            if agree:
+                best_runner_id, best_tactic, min_time = self._agree_over_tp(
+                    custom_op, measured_pairs, measured_times)
 
         if best_runner_id is not None:
             # At least one valid (runner, tactic) pair is found
@@ -2066,10 +2150,52 @@ class AutoTuner:
         self._debug_logger(
             f"[AutoTuner] Whether using distributed tuning: {self._is_distributed()}"
         )
+        install_flashinfer_tuner_overrides()
 
     def _is_distributed(self) -> bool:
         """Check if we're in a distributed environment."""
         return self.mapping is not None and self.mapping.tp_size > 1 and self._dist is not None
+
+    def _tp_agree_active(self, name: str) -> bool:
+        """Whether picks for ``name`` (custom op or runner) are agreed over the TP group.
+
+        TLLM_AUTOTUNER_TP_AGREE=1, a TP group of more than one rank, and ``name`` matching
+        TLLM_AUTOTUNER_TP_AGREE_OPS. Not under attention DP, whose ranks can tune different shapes.
+        """
+        if os.environ.get(TP_AGREE_ENV,
+                          "0") != "1" or not self._is_distributed():
+            return False
+        if getattr(self.mapping, "enable_attention_dp", False):
+            return False
+        lowered = name.lower()
+        return any(p in lowered for p in _tp_agree_patterns())
+
+    def _agree_over_tp(self, custom_op: str, candidates: List[Tuple[int, Any]],
+                       times: List[float]) -> Tuple[Optional[int], Any, float]:
+        """Pick the candidate whose slowest TP rank is fastest (one all-gather per profile).
+
+        Returns (runner_id, tactic, worst-rank time), or (None, None, inf) when no candidate is
+        valid on every rank. Every TP rank calls this once per profiled (op, shape).
+        """
+        all_times = self._dist.tp_allgather(list(times), small_payload=True)
+        if any(len(t) != len(times) for t in all_times):
+            logger.warning(
+                f"[AutoTuner] TP agreement skipped for {custom_op}: candidate counts differ "
+                f"across ranks ({[len(t) for t in all_times]}); keeping the local pick."
+            )
+            best = min(range(len(times)), key=lambda i: times[i], default=None)
+            if best is None or times[best] == float('inf'):
+                return None, None, float('inf')
+            return candidates[best][0], candidates[best][1], times[best]
+        worst = [max(t[i] for t in all_times) for i in range(len(times))]
+        best = min(range(len(worst)), key=lambda i: worst[i], default=None)
+        if best is None or worst[best] == float('inf'):
+            return None, None, float('inf')
+        self._debug_logger(
+            f"[AutoTuner] TP-agreed pick for {custom_op}: {candidates[best]} "
+            f"(worst-rank {worst[best]:.4f} ms; per-rank {[t[best] for t in all_times]})"
+        )
+        return candidates[best][0], candidates[best][1], worst[best]
 
     def _maybe_parallelize_tactics(
             self, all_valid_tactics: List[Any],
