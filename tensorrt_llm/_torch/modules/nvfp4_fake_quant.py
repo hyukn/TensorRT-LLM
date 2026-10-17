@@ -55,6 +55,10 @@ _SUSPENDED = contextvars.ContextVar("trtllm_fakequant_dense_suspended", default=
 
 
 def fake_quant_mode() -> int:
+    """The active TRTLLM_FAKEQUANT_DENSE_NVFP4 mode; always 0 while torch.compile traces (the study runs eager /
+    in CUDA graphs, and Dynamo cannot trace ``ContextVar.get``)."""
+    if torch.compiler.is_compiling():
+        return 0
     if _SUSPENDED.get():
         return 0
     return int(os.environ.get("TRTLLM_FAKEQUANT_DENSE_NVFP4", "0") or 0)

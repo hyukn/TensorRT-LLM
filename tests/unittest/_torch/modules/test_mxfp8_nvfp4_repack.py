@@ -237,3 +237,18 @@ def test_setup_calibrates_then_repacks_from_the_merged_file(monkeypatch, tmp_pat
     assert proj._nvfp4_repacked and proj._nvfp4_backends == ("cutlass",)
     assert proj._nvfp4_input_scale.item() == pytest.approx(448 * 6 / (2 * amax * 4), rel=1e-6)
     assert qkv_nvfp4.setup(layers, rank=0) == ("nvfp4", 0)  # already repacked: left alone
+
+
+@pytest.mark.parametrize("repack", [False, True])
+def test_linear_traces_under_torch_compile_fullgraph(monkeypatch, repack):
+    """Piecewise-compiled CTX servers trace MXFP8LinearMethod.apply: the fake-quant mode / NVFP4 checks must not
+    break the graph (Dynamo cannot trace ContextVar.get)."""
+    torch._dynamo.reset()
+    lin = _mxfp8_linear(256, 512)
+    if repack:
+        lin.quant_method.repack_to_nvfp4(lin, 20.0, allowed_backends=("cutlass",))
+    x = torch.randn(16, 512, dtype=torch.bfloat16, device="cuda")
+    eager = lin(x)
+    monkeypatch.setenv("TRTLLM_FAKEQUANT_DENSE_NVFP4", "1")  # ignored while tracing
+    compiled = torch.compile(lambda t: lin(t), backend="eager", fullgraph=True)
+    assert _rel(compiled(x), eager) < 1e-2  # the compiled MXFP8 path may pick another GEMM backend

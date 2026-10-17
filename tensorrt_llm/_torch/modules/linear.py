@@ -3674,7 +3674,7 @@ class MXFP8LinearMethod(LinearMethodBase):
         act_fp4, act_sf = torch.ops.trtllm.fp4_quantize(
             input.contiguous(), module._nvfp4_input_scale,
             fp4_utils.NVFP4_SF_VEC_SIZE, False)
-        if (not is_torch_compiling()
+        if (not is_torch_compiling() and not torch.compiler.is_compiling()
                 and _FLASHINFER_MXFP8_DECODE_GRAPH_CAPTURE_ACTIVE.get()):
             # Decode graphs: the tactic for this exact M, tuned in the warmup-only pass.
             output = nvfp4_gemm_exact_m(
@@ -3792,7 +3792,9 @@ class MXFP8LinearMethod(LinearMethodBase):
         if getattr(module, "_nvfp4_repacked", False):
             return self._apply_nvfp4_repacked(module, input, bias)
         calib_amax = getattr(module, "_nvfp4_calib_amax", None)
-        if calib_amax is not None and isinstance(input, torch.Tensor):
+        if (calib_amax is not None and isinstance(input, torch.Tensor)
+                and not is_torch_compiling()
+                and not torch.compiler.is_compiling()):
             torch.maximum(calib_amax,
                           input.detach().abs().amax().float().reshape(1),
                           out=calib_amax)
