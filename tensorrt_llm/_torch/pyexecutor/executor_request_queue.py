@@ -12,6 +12,7 @@ from typing import Iterable, List, Optional
 from tensorrt_llm.llmapi.disagg_utils import get_local_request_id
 
 from ..distributed import Distributed
+from .kv_cache.hazard_eviction import hazard_eviction_enabled
 from .llm_request import ExecutorRequest
 from .request_utils import get_num_child_requests
 
@@ -100,6 +101,8 @@ class ExecutorRequestQueue:
         self.next_request_id = max_batch_size
         self.enable_iter_perf_stats = enable_iter_perf_stats
         self.start_times = {}
+        # Conversation-aware KV eviction needs one clock on all ranks: stamp requests here, on rank 0.
+        self._stamp_kv_evict_time = hazard_eviction_enabled()
         self.active = True
         self.admission_state = RequestAdmissionState.RUNNING
         self._pending_sleep_tags: frozenset[str] = frozenset()
@@ -231,6 +234,8 @@ class ExecutorRequestQueue:
                 req_id = self._get_request_id(request)
                 if self.enable_iter_perf_stats:
                     self.start_times[req_id] = start_time
+                if self._stamp_kv_evict_time:
+                    request.py_kv_evict_time = start_time
                 child_req_ids = self._generate_child_request_ids(request)
 
                 self.request_queue.put(

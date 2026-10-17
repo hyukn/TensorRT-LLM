@@ -808,6 +808,35 @@ void StorageManager::excludeFromEviction(Page& page)
     mLevels.at(page.cacheLevel).controller.remove(*page.nodeRef);
 }
 
+void StorageManager::setHazardEvictionModel(std::unique_ptr<HazardEvictionModel> model)
+{
+    // Point the controllers at the new model before the old one is destroyed.
+    for (auto& level : mLevels)
+    {
+        level.controller.setHazardModel(model.get());
+    }
+    mHazardEvictionModel = std::move(model);
+}
+
+void StorageManager::setEvictionHint(Page& page, EvictionCell cell, double stamp)
+{
+    if (page.evictionCell == cell && page.evictionStamp == stamp)
+    {
+        return;
+    }
+    bool const scheduled = page.scheduledForEviction();
+    if (scheduled)
+    {
+        excludeFromEviction(page);
+    }
+    page.evictionCell = cell;
+    page.evictionStamp = stamp;
+    if (scheduled)
+    {
+        mLevels.at(page.cacheLevel).controller.scheduleForEviction(page);
+    }
+}
+
 [[nodiscard]] auto StorageManager::makeEvictionRollbackGuard(
     TypedVec<PoolGroupIndex, std::vector<SharedPtr<Page>>> const& evicted)
 {

@@ -30,6 +30,7 @@
 #include <functional>
 #include <memory>
 #include <optional>
+#include <utility>
 #include <variant>
 #include <vector>
 
@@ -196,6 +197,12 @@ public:
 
     // Close: release all blocks back to KvCacheManager.
     void close();
+
+    // Conversation-aware eviction (opt-in, KvCacheManager::setEvictionHazard): classify the pages this cache
+    // releases. close() stamps every page it still references with (cell, stamp) before releasing it, so the
+    // eviction queues rank them by the model's hazard of `cell` at idle time (clock - stamp). Requires an
+    // installed model and 0 <= cell < its number of cells.
+    void setEvictionHint(EvictionCell cell, double stamp);
 
     // Commit or discard request-local statistics accumulated since the previous scheduler commit.
     KVCacheStatsDelta commitPendingStats();
@@ -674,6 +681,10 @@ private:
     // SWA scratch slot support.
     bool mEnableSwaScratchReuse = false;
     TypedVec<LifeCycleId, std::vector<ScratchSlotLock>> mScratchSlots;
+
+    // Applied to the remaining pages by close(); see setEvictionHint().
+    std::optional<std::pair<EvictionCell, double>> mEvictionHint;
+    void _applyEvictionHint();
 };
 
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager_v2

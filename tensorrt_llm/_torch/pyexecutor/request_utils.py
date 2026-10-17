@@ -466,6 +466,8 @@ class RequestBroadcaster:
             new_requests, "py_conversation_params", include_none=True
         )
         py_lora_path = collect_py_objects_from_requests(new_requests, "py_lora_path")
+        # Rank 0's enqueue time (only set with TLLM_KV_EVICT_HAZARD): the shared eviction clock.
+        py_kv_evict_time = collect_py_objects_from_requests(new_requests, "py_kv_evict_time")
 
         return tuple(
             filter(
@@ -478,6 +480,7 @@ class RequestBroadcaster:
                     py_disaggregated_params,
                     py_conversation_params,
                     py_lora_path,
+                    py_kv_evict_time,
                 ],
             )
         )

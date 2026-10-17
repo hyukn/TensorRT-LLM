@@ -1068,6 +1068,10 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
             logprobs_mode)  # handle passed a raw string
         self.py_disaggregated_params = None
         self.py_conversation_params = None
+        # Conversation-aware KV eviction (kv_cache/hazard_eviction.py, opt-in): rank 0's enqueue time,
+        # broadcast with the request, and the parent session of a sub-agent request.
+        self.py_kv_evict_time = None
+        self.py_subagent_affinity_id = None
 
         self.py_num_connector_matched_tokens = 0
 
@@ -1687,6 +1691,11 @@ def executor_request_to_llm_request(
                                                   None)
     llm_request.py_conversation_params = getattr(executor_request,
                                                  "py_conversation_params", None)
+    llm_request.py_kv_evict_time = getattr(executor_request, "py_kv_evict_time",
+                                           None)
+    llm_request.py_subagent_affinity_id = getattr(
+        getattr(executor_request, "py_scheduling_params", None),
+        "subagent_affinity_id", None)
     if child_req_ids:
         for child_id in child_req_ids:
             llm_request.create_child_request(child_id)

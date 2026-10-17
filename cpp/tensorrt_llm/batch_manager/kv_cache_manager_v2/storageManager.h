@@ -168,6 +168,19 @@ public:
     // Remove a page from the eviction queue.
     void excludeFromEviction(Page& page);
 
+    // Opt-in conversation-aware eviction ranking for every cache level (nullptr: plain priority + LRU). Pages
+    // already scheduled keep their sub-queue; only the choice among sub-queue heads changes.
+    void setHazardEvictionModel(std::unique_ptr<HazardEvictionModel> model);
+
+    [[nodiscard]] HazardEvictionModel* hazardEvictionModel() const noexcept
+    {
+        return mHazardEvictionModel.get();
+    }
+
+    // Set a page's eviction hint (cell, release time), re-queueing it if it is scheduled so that it moves to the
+    // sub-queue of its new cell.
+    void setEvictionHint(Page& page, EvictionCell cell, double stamp);
+
     // Check if a page is evictable (optionally at a target level).
     bool isEvictable(Page const& page, std::optional<CacheLevel> level = std::nullopt) const noexcept;
 
@@ -499,6 +512,8 @@ private:
     std::unordered_map<Page const*, DiskCopy> mDiskCopies;
     // Per (disk level, pool group): pages with a copy, oldest copy first.
     std::map<std::pair<CacheLevel, PoolGroupIndex>, std::list<Page const*>> mDiskCopyLru;
+    // Shared by the eviction controllers of all levels (they hold raw pointers); see setHazardEvictionModel().
+    std::unique_ptr<HazardEvictionModel> mHazardEvictionModel;
 };
 
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager_v2

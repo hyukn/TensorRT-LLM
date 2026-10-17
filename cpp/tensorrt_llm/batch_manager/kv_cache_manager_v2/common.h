@@ -120,6 +120,13 @@ inline constexpr Priority kPriorityMin = 0;
 inline constexpr Priority kPriorityMax = 100;
 inline constexpr Priority kPriorityDefault = 35;
 
+// Eviction cell of a page for the opt-in HazardEvictionModel (evictionController.h): the class of the
+// conversation that last released the page. 0 = unclassified; it is the only cell without a model.
+using EvictionCell = int;
+inline constexpr EvictionCell kDefaultEvictionCell = 0;
+// Release time of a page that was never stamped; the eviction queue stamps it with the model clock on push.
+inline constexpr double kNoEvictionStamp = -1.0;
+
 // Optional sliding window size (nullopt = no sliding window).
 using SlidingWindowSize = std::optional<int>;
 

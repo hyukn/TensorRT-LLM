@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 from typing import Any, Mapping, Optional, Protocol
 
 # Disagg edge-to-worker routing key, independent of conversation history.
@@ -61,8 +62,19 @@ def get_request_subagent_affinity_id(
     return getattr(conversation_params, "subagent_affinity_id", None)
 
 
+def subagent_affinity_hint_only() -> bool:
+    """Whether TLLM_SUBAGENT_AFFINITY_HINT_ONLY=1 is set.
+
+    Then the parent session id still reaches the workers (e.g. as a KV-eviction hint), but every conversation
+    keeps being routed by its own id.
+    """
+    return os.environ.get("TLLM_SUBAGENT_AFFINITY_HINT_ONLY", "0").strip() == "1"
+
+
 def get_request_routing_id(request: RequestWithConversationParams) -> Optional[str]:
     """Return the parent affinity key when present, else the conversation id."""
+    if subagent_affinity_hint_only():
+        return get_request_conversation_id(request)
     return get_request_subagent_affinity_id(request) or get_request_conversation_id(request)
 
 

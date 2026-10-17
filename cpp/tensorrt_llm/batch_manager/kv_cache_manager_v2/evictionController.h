@@ -26,6 +26,7 @@
 #include <list>
 #include <map>
 #include <optional>
+#include <utility>
 #include <vector>
 
 namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
@@ -92,9 +93,65 @@ private:
 };
 
 // ---------------------------------------------------------------------------
+// HazardEvictionModel — opt-in, conversation-aware ranking of evictable pages.
+//
+// A page carries an eviction cell (the class of the conversation that last released it, e.g. "sub-agent whose
+// previous turn came back within 5 s") and its release time on the model clock (Page::evictionCell /
+// evictionStamp). hazard(cell, idle) is the probability that a page of that cell, idle for `idle` seconds, is
+// reused within the model's horizon. Rows are made non-increasing in idle on construction (running minimum), so
+// within a cell the least recently released page -- the head of the cell's LRU list -- always has the lowest
+// hazard, and eviction only compares the heads of the per-cell lists.
+//
+// The clock is supplied by the caller and must be identical on all ranks that have to make the same eviction
+// choices (tensor-parallel ranks); it never decreases. Everything else is a pure function of the request stream.
+// ---------------------------------------------------------------------------
+class HazardEvictionModel
+{
+public:
+    // stepSec: idle-time bucket width; table[cell][bucket]: hazard of cell after bucket * stepSec seconds idle
+    // (the last bucket covers everything beyond). Row 0 is the unclassified cell.
+    HazardEvictionModel(double stepSec, std::vector<std::vector<float>> table);
+
+    [[nodiscard]] float hazard(EvictionCell cell, double idleSec) const;
+
+    [[nodiscard]] int numCells() const noexcept
+    {
+        return static_cast<int>(mTable.size());
+    }
+
+    [[nodiscard]] double stepSec() const noexcept
+    {
+        return mStepSec;
+    }
+
+    [[nodiscard]] std::vector<std::vector<float>> const& table() const noexcept
+    {
+        return mTable;
+    }
+
+    [[nodiscard]] double now() const noexcept
+    {
+        return mNow;
+    }
+
+    // Monotone: an earlier time is ignored.
+    void advanceClock(double now) noexcept;
+
+private:
+    double mStepSec;
+    std::vector<std::vector<float>> mTable;
+    double mNow{0.0};
+};
+
+// ---------------------------------------------------------------------------
 // PrioritizedEvictionPolicy — wraps per-priority LRU sub-queues.
 // Mirrors _eviction_controller.py::PrioritizedEvictionPolicy.
 // Lower priority key = evicted first.
+//
+// Sub-queues are keyed by (priority, eviction cell). Without a HazardEvictionModel every page is in cell 0 and
+// pop() takes the LRU head of the lowest priority, exactly as with one queue per priority. With a model, pop()
+// takes, among the lowest priority's cells, the head with the lowest hazard (ties: earlier release, then lower
+// cell), so the choice is deterministic.
 // ---------------------------------------------------------------------------
 class PrioritizedEvictionPolicy
 {
@@ -102,6 +159,12 @@ public:
     NodeRef push(SharedPtr<Page> page, bool evictFirst = false);
     SharedPtr<Page> pop();
     SharedPtr<Page> remove(NodeRef node);
+
+    // nullptr: plain priority + LRU order. The model must outlive this policy (owned by the StorageManager).
+    void setHazardModel(HazardEvictionModel const* model) noexcept
+    {
+        mModel = model;
+    }
 
     SlotCount size() const noexcept;
 
@@ -115,7 +178,7 @@ public:
     // No extra strong refs — the pointer references the shared_ptr inside the list node.
     [[nodiscard]] auto pageGenerator() const
     {
-        using MapIt = std::map<Priority, LRUEvictionPolicy>::const_iterator;
+        using MapIt = std::map<Key, LRUEvictionPolicy>::const_iterator;
         MapIt mapIt = mPolicies.cbegin();
         MapIt mapEnd = mPolicies.cend();
         EvictionList::const_iterator listIt;
@@ -143,10 +206,16 @@ public:
     }
 
 private:
-    LRUEvictionPolicy& getOrCreate(Priority p);
+    using Key = std::pair<Priority, EvictionCell>;
+
+    static Key keyOf(Page const& page) noexcept;
+
+    // The sub-queue pop() takes from. mPolicies must not be empty.
+    std::map<Key, LRUEvictionPolicy>::iterator selectVictimQueue();
 
     // std::map keeps keys sorted. We evict from the lowest-priority key first.
-    std::map<Priority, LRUEvictionPolicy> mPolicies;
+    std::map<Key, LRUEvictionPolicy> mPolicies;
+    HazardEvictionModel const* mModel{nullptr};
 };
 
 // ---------------------------------------------------------------------------
@@ -181,11 +250,13 @@ public:
         return mPolicies.size();
     }
 
-    // All pages in eviction order for a pool group.
+    // All pages in eviction order for a pool group (with a HazardEvictionModel: grouped by priority and cell).
     [[nodiscard]] auto pageGenerator(PoolGroupIndex pgIdx) const
     {
         return mPolicies.at(pgIdx).pageGenerator();
     }
+
+    void setHazardModel(HazardEvictionModel const* model) noexcept;
 
 private:
     PrioritizedEvictionPolicy& getPolicy(LifeCycleId lcId);

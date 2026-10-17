@@ -289,6 +289,10 @@ SharedPageLock PageHolder::lock(
         page->manager->excludeFromEviction(*page);
         TLLM_CHECK_DEBUG(!page->scheduledForEviction());
     }
+    // A reused page is classified again by the cache that releases it next (KvCache::setEvictionHint); without a
+    // hint it ranks as released at that time. Only the opt-in HazardEvictionModel reads these.
+    page->evictionCell = kDefaultEvictionCell;
+    page->evictionStamp = kNoEvictionStamp;
 
     return ul->share(kvCache, beamIndex, ordinal, lc, skipWait);
 }

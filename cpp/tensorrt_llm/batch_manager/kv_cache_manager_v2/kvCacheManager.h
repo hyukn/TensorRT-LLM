@@ -125,6 +125,23 @@ public:
     // Clear all reusable (committed) blocks from the radix tree.
     void clearReusableBlocks();
 
+    // ---- Conversation-aware eviction (opt-in) ------------------------------
+
+    // Install a HazardEvictionModel (see evictionController.h): table[cell][bucket] = probability that a page of
+    // `cell` idle for bucket * stepSec seconds is reused soon; row 0 is the unclassified cell. An empty table
+    // removes the model (plain priority + LRU eviction). KvCache::setEvictionHint() then classifies released pages.
+    void setEvictionHazard(double stepSec, std::vector<std::vector<float>> table);
+
+    // Advance the model clock (seconds; never decreases). It must be identical on all ranks that have to make the
+    // same eviction choices. No-op without a model.
+    void setEvictionClock(double now);
+
+    // Model clock, or nullopt without a model.
+    [[nodiscard]] std::optional<double> evictionClock() const;
+
+    // Number of cells of the installed model (0 without a model).
+    [[nodiscard]] int numEvictionCells() const;
+
     // ---- KvCache creation -------------------------------------------------
 
     // Create a new KvCache. Returned cache is SUSPENDED; call resume() with a stream.

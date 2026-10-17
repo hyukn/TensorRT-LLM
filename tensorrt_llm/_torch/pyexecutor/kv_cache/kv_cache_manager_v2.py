@@ -39,6 +39,13 @@ from strenum import StrEnum
 from tensorrt_llm._torch.disaggregation.resource.page import MapperKind, RoleLayout
 from tensorrt_llm._torch.distributed.communicator import Distributed, ReduceOp
 from tensorrt_llm._torch.pyexecutor.kv_cache import per_layer_block_offsets
+from tensorrt_llm._torch.pyexecutor.kv_cache.hazard_eviction import (
+    ENV_TABLE as _KV_EVICT_HAZARD_ENV,
+)
+from tensorrt_llm._torch.pyexecutor.kv_cache.hazard_eviction import (
+    ConversationEvictionHints,
+    load_hazard_eviction_from_env,
+)
 from tensorrt_llm._torch.utils import helix_local_len, maybe_compile
 from tensorrt_llm._utils import (
     TensorWrapper,
@@ -1191,6 +1198,8 @@ class KVCacheManagerV2(BaseResourceManager):
     # Read by KvCacheCreator: a subclass that overrides the context
     # commit/history protocol opts out of generic reuse-match backoff.
     _supports_reuse_match_backoff = True
+    # Opt-in conversation-aware eviction state; None (plain LRU) unless TLLM_KV_EVICT_HAZARD is set.
+    _evict_hints: Optional[ConversationEvictionHints] = None
 
     def __init__(
         self,
@@ -1787,6 +1796,17 @@ class KVCacheManagerV2(BaseResourceManager):
             if enable_conversation_manager
             else None
         )
+        # Opt-in conversation-aware eviction (hazard_eviction.py). It changes only which reusable pages
+        # leave GPU/host memory first; without TLLM_KV_EVICT_HAZARD eviction is plain priority + LRU.
+        self._evict_hints = load_hazard_eviction_from_env() if self.enable_block_reuse else None
+        if self._evict_hints is not None:
+            table = self._evict_hints.table
+            self.impl.set_eviction_hazard(table.step_s, table.rows)
+            logger.info(
+                f"KV cache eviction: conversation-aware hazard ranking from "
+                f"{os.environ[_KV_EVICT_HAZARD_ENV]} ({len(table.rows)} cells, features "
+                f"{list(table.features)}, step {table.step_s:g} s, draft={self.is_draft})"
+            )
 
         # With pipeline parallelism, multiple microbatches can be in-flight
         # simultaneously, so we need slots for all concurrent sequences.
@@ -3653,6 +3673,7 @@ class KVCacheManagerV2(BaseResourceManager):
         if req.is_first_context_chunk:
             if self.conversation_manager is not None:
                 self.conversation_manager.prepare_request(req)
+            self._advance_eviction_clock(req)
             kv_cache = self.kv_cache_map.get(req.py_request_id)
             # Stays None when the cache was resumed rather than freshly
             # matched, which is also the case where no branch point applies.
@@ -4411,6 +4432,7 @@ class KVCacheManagerV2(BaseResourceManager):
         # separate draft engine still uses the legacy draft request view.
         with request_context(not self.enable_joint_kv_cache_reuse, scheduled_batch):
             for req in scheduled_batch.context_requests:
+                self._advance_eviction_clock(req)
                 kv_cache = self._mirror_draft_kv_cache(req)
                 if kv_cache is None:
                     # Pre-existing behaviour, kept deliberately: skipping does NOT buy a
@@ -5421,6 +5443,13 @@ class KVCacheManagerV2(BaseResourceManager):
             self.impl.clear_stats_excluded(request.py_request_id)
             return
         kv_cache.discard_pending_stats()
+        if self._evict_hints is not None:
+            hint = self._evict_hints.release_hint(request)
+            if hint is not None:
+                self.impl.set_eviction_clock(self._evict_hints.clock)
+                kv_cache.set_eviction_hint(*hint)
+                if self._evict_hints.num_releases >= 2000 and not self.is_draft:
+                    logger.info(f"KV cache eviction hints: {self._evict_hints.summary()}")
         kv_cache.close()
         self.impl.clear_stats_excluded(request.py_request_id)
         if request.py_request_id in self._early_freed_index_requests:
@@ -6264,6 +6293,11 @@ class KVCacheManagerV2(BaseResourceManager):
         self.index_mapper.add_new_sequence(request_id)
         self._set_page_index_bufs(request_id, kv_cache)
         return kv_cache
+
+    def _advance_eviction_clock(self, req: LlmRequest) -> None:
+        """Move the eviction clock to the request's rank-0 stamp before its pages are allocated."""
+        if self._evict_hints is not None and self._evict_hints.observe(req):
+            self.impl.set_eviction_clock(self._evict_hints.clock)
 
     def probe_prefix_match_length(self, input_tokens, lora_task_id=None, cache_salt=None):
         """Probe the v2 KV cache radix tree for prefix match length.

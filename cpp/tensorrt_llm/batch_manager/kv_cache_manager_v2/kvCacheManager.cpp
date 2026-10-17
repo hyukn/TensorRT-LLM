@@ -183,6 +183,47 @@ void KvCacheManager::clearReusableBlocks()
     mRadixTree->clear();
 }
 
+void KvCacheManager::setEvictionHazard(double stepSec, std::vector<std::vector<float>> table)
+{
+    KVCM2_API_GUARD();
+    auto const apiLock = lockExclusive();
+    if (table.empty())
+    {
+        mStorage->setHazardEvictionModel(nullptr);
+        return;
+    }
+    auto model = std::make_unique<HazardEvictionModel>(stepSec, std::move(table));
+    if (auto const* old = mStorage->hazardEvictionModel())
+    {
+        model->advanceClock(old->now());
+    }
+    mStorage->setHazardEvictionModel(std::move(model));
+}
+
+void KvCacheManager::setEvictionClock(double now)
+{
+    KVCM2_API_GUARD();
+    auto const apiLock = lockExclusive();
+    if (auto* model = mStorage->hazardEvictionModel())
+    {
+        model->advanceClock(now);
+    }
+}
+
+std::optional<double> KvCacheManager::evictionClock() const
+{
+    auto const apiLock = lockShared();
+    auto const* model = mStorage->hazardEvictionModel();
+    return model == nullptr ? std::nullopt : std::optional<double>{model->now()};
+}
+
+int KvCacheManager::numEvictionCells() const
+{
+    auto const apiLock = lockShared();
+    auto const* model = mStorage->hazardEvictionModel();
+    return model == nullptr ? 0 : model->numCells();
+}
+
 std::shared_ptr<KvCache> KvCacheManager::createKvCache(ReuseScope reuseScope, TokenSpan inputTokens,
     std::optional<RequestIdType> id, KvCache::PriorityCb priorityCb, std::optional<int> expectedPromptLength,
     std::optional<bool> textOnly, bool enableRequestStats)

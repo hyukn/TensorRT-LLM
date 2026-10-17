@@ -26,9 +26,12 @@
 
 #include "tensorrt_llm/common/assert.h"
 #include <algorithm>
+#include <cmath>
 #include <set>
 #include <stdexcept>
+#include <string>
 #include <unordered_set>
+#include <utility>
 
 namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
 {
@@ -648,6 +651,9 @@ void KvCache::close()
         mManager->tryUpdateTargetRatios();
     }
 
+    // Classify the pages before releasing them, so that they enter the eviction queues in their cell.
+    _applyEvictionHint();
+
     // Record event scope — mirrors Python's `with self._record_event()`.
     // Python always enters _record_event() here; _cuda_stream is valid for both ACTIVE and SUSPENDED.
     {
@@ -656,6 +662,62 @@ void KvCache::close()
     }
     mStatus = Status::CLOSED;
     mManager->unregisterKvCache(this);
+}
+
+void KvCache::setEvictionHint(EvictionCell cell, double stamp)
+{
+    KVCM2_REJECT_IF_POISONED();
+    auto const apiLock = mManager->lockExclusive();
+    auto const* model = mManager->storage().hazardEvictionModel();
+    if (model == nullptr)
+    {
+        throw std::logic_error("setEvictionHint() needs an eviction hazard model (set_eviction_hazard)");
+    }
+    if (cell < 0 || cell >= model->numCells())
+    {
+        throw std::out_of_range("eviction cell " + std::to_string(cell) + " is outside the model's "
+            + std::to_string(model->numCells()) + " cells");
+    }
+    if (!std::isfinite(stamp) || stamp < 0.0)
+    {
+        throw std::invalid_argument("eviction stamp must be finite and non-negative");
+    }
+    if (mStatus == Status::CLOSED)
+    {
+        return;
+    }
+    mEvictionHint = std::make_pair(cell, stamp);
+}
+
+void KvCache::_applyEvictionHint()
+{
+    if (!mEvictionHint.has_value() || mManager->storage().hazardEvictionModel() == nullptr)
+    {
+        return;
+    }
+    auto const [cell, stamp] = *mEvictionHint;
+    auto& storage = mManager->storage();
+    auto stampPages = [&](LifeCycleBlockPages const& pages)
+    {
+        for (auto const& bp : pages)
+        {
+            if (auto const& page = blockPageGetPage(bp))
+            {
+                storage.setEvictionHint(*page, cell, stamp);
+            }
+        }
+    };
+    for (auto const& block : mBlocks)
+    {
+        for (auto const& beamPages : block.pages)
+        {
+            stampPages(beamPages);
+        }
+    }
+    for (auto const& beamPages : mSsmBlocks)
+    {
+        stampPages(beamPages);
+    }
 }
 
 KVCacheStatsDelta KvCache::commitPendingStats()

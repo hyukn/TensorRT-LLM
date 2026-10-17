@@ -53,6 +53,11 @@ public:
     // Immutable: PrioritizedEvictionPolicy locates a scheduled page's sub-queue by this value,
     // so changing it while the page is scheduled would erase from the wrong list.
     Priority const priority;
+    // Conversation-aware eviction hint (HazardEvictionModel, opt-in): the cell of the conversation that last
+    // released the page and that release time on the model clock. Like `priority` they select the page's
+    // eviction sub-queue, so they may only change while the page is not scheduled (see KvCache::setEvictionHint).
+    EvictionCell evictionCell{kDefaultEvictionCell};
+    double evictionStamp{kNoEvictionStamp};
     WeakPtr<PageHolder> holder;     // empty → DROPPABLE
     std::optional<NodeRef> nodeRef; // present → scheduled for eviction
 

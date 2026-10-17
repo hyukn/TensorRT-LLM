@@ -1772,6 +1772,9 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             "prefetch", [](kv::KvCache& self, int target) { return self.prefetch(kv::CacheLevel{target}); },
             nb::arg("target"), nb::call_guard<nb::gil_scoped_release>())
         .def("close", &kv::KvCache::close, nb::call_guard<nb::gil_scoped_release>())
+        .def("set_eviction_hint", &kv::KvCache::setEvictionHint, nb::arg("cell"), nb::arg("stamp"),
+            nb::call_guard<nb::gil_scoped_release>(),
+            "Classify the pages close() releases for the manager's eviction hazard model (set_eviction_hazard).")
         .def("commit_pending_stats", &kv::KvCache::commitPendingStats, nb::call_guard<nb::gil_scoped_release>())
         .def("discard_pending_stats", &kv::KvCache::discardPendingStats, nb::call_guard<nb::gil_scoped_release>())
         .def("drop_cached_token_attribution", &kv::KvCache::dropCachedTokenAttribution,
@@ -2381,6 +2384,14 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         .def("shutdown", &kv::KvCacheManager::shutdown, nb::call_guard<nb::gil_scoped_release>())
         .def(
             "clear_reusable_blocks", &kv::KvCacheManager::clearReusableBlocks, nb::call_guard<nb::gil_scoped_release>())
+        .def("set_eviction_hazard", &kv::KvCacheManager::setEvictionHazard, nb::arg("step_sec"), nb::arg("table"),
+            nb::call_guard<nb::gil_scoped_release>(),
+            "Install (or, with an empty table, remove) the conversation-aware eviction hazard model.")
+        .def("set_eviction_clock", &kv::KvCacheManager::setEvictionClock, nb::arg("now"),
+            nb::call_guard<nb::gil_scoped_release>())
+        .def_prop_ro("eviction_clock", &kv::KvCacheManager::evictionClock, nb::call_guard<nb::gil_scoped_release>())
+        .def_prop_ro(
+            "num_eviction_cells", &kv::KvCacheManager::numEvictionCells, nb::call_guard<nb::gil_scoped_release>())
         .def(
             "create_kv_cache",
             [](std::shared_ptr<kv::KvCacheManager> self, nb::object reuseScopeObj, nb::object inputTokens,

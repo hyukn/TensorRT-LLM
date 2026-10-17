@@ -21,7 +21,11 @@
 #include "kv_cache_manager_v2/page.h"
 
 #include "tensorrt_llm/common/assert.h"
+#include <algorithm>
+#include <cmath>
 #include <cstddef>
+#include <iterator>
+#include <limits>
 #include <numeric>
 #include <set>
 #include <stdexcept>
@@ -68,26 +72,112 @@ SharedPtr<Page> LRUEvictionPolicy::remove(NodeRef node)
 }
 
 // ---------------------------------------------------------------------------
+// HazardEvictionModel
+// ---------------------------------------------------------------------------
+
+HazardEvictionModel::HazardEvictionModel(double stepSec, std::vector<std::vector<float>> table)
+    : mStepSec(stepSec)
+    , mTable(std::move(table))
+{
+    if (!(mStepSec > 0.0) || !std::isfinite(mStepSec))
+    {
+        throw std::invalid_argument("HazardEvictionModel: stepSec must be positive and finite");
+    }
+    if (mTable.empty())
+    {
+        throw std::invalid_argument("HazardEvictionModel: the table needs at least the unclassified cell (row 0)");
+    }
+    for (auto& row : mTable)
+    {
+        if (row.empty())
+        {
+            throw std::invalid_argument("HazardEvictionModel: every cell needs at least one idle bucket");
+        }
+        // Running minimum: the list-head comparison in PrioritizedEvictionPolicy is exact only for rows that do
+        // not increase with idle time.
+        float runMin = std::numeric_limits<float>::infinity();
+        for (auto& v : row)
+        {
+            if (!std::isfinite(v))
+            {
+                throw std::invalid_argument("HazardEvictionModel: table values must be finite");
+            }
+            runMin = std::min(runMin, v);
+            v = runMin;
+        }
+    }
+}
+
+float HazardEvictionModel::hazard(EvictionCell cell, double idleSec) const
+{
+    auto const& row = mTable.at(static_cast<size_t>(cell));
+    double const buckets = std::max(idleSec, 0.0) / mStepSec;
+    size_t const last = row.size() - 1;
+    size_t const b = buckets >= static_cast<double>(last) ? last : static_cast<size_t>(buckets);
+    return row[b];
+}
+
+void HazardEvictionModel::advanceClock(double now) noexcept
+{
+    if (now > mNow)
+    {
+        mNow = now;
+    }
+}
+
+// ---------------------------------------------------------------------------
 // PrioritizedEvictionPolicy
 // ---------------------------------------------------------------------------
 
-LRUEvictionPolicy& PrioritizedEvictionPolicy::getOrCreate(Priority p)
+PrioritizedEvictionPolicy::Key PrioritizedEvictionPolicy::keyOf(Page const& page) noexcept
 {
-    return mPolicies[p]; // std::map default-constructs if not present
+    return {page.priority, page.evictionCell};
 }
 
 NodeRef PrioritizedEvictionPolicy::push(SharedPtr<Page> page, bool evictFirst)
 {
-    Priority p = page->priority;
-    LRUEvictionPolicy& policy = getOrCreate(p);
+    if (mModel != nullptr && page->evictionStamp < 0.0)
+    {
+        // Released without a hint (no conversation, or before the model existed): it ranks as released now.
+        page->evictionStamp = mModel->now();
+    }
+    LRUEvictionPolicy& policy = mPolicies[keyOf(*page)]; // std::map default-constructs if not present
     return policy.push(std::move(page), evictFirst);
+}
+
+std::map<PrioritizedEvictionPolicy::Key, LRUEvictionPolicy>::iterator PrioritizedEvictionPolicy::selectVictimQueue()
+{
+    // Lowest priority key evicted first (std::map iterates in ascending key order)
+    auto best = mPolicies.begin();
+    if (mModel == nullptr)
+    {
+        return best;
+    }
+    // Among the cells of the lowest priority, the head with the lowest hazard. Within a cell the head is the
+    // least recently released page, whose hazard is the cell's lowest (rows are non-increasing in idle time).
+    Priority const lowest = best->first.first;
+    double const now = mModel->now();
+    auto headOf = [](auto const& it) -> Page const& { return **it->second.cbegin(); };
+    float bestHazard = mModel->hazard(best->first.second, now - headOf(best).evictionStamp);
+    double bestStamp = headOf(best).evictionStamp;
+    for (auto it = std::next(best); it != mPolicies.end() && it->first.first == lowest; ++it)
+    {
+        double const stamp = headOf(it).evictionStamp;
+        float const h = mModel->hazard(it->first.second, now - stamp);
+        if (h < bestHazard || (h == bestHazard && stamp < bestStamp))
+        {
+            best = it;
+            bestHazard = h;
+            bestStamp = stamp;
+        }
+    }
+    return best;
 }
 
 SharedPtr<Page> PrioritizedEvictionPolicy::pop()
 {
     TLLM_CHECK_DEBUG(!mPolicies.empty());
-    // Lowest priority key evicted first (std::map iterates in ascending key order)
-    auto it = mPolicies.begin();
+    auto it = selectVictimQueue();
     auto page = it->second.pop();
     if (it->second.empty())
     {
@@ -99,8 +189,7 @@ SharedPtr<Page> PrioritizedEvictionPolicy::pop()
 SharedPtr<Page> PrioritizedEvictionPolicy::remove(NodeRef node)
 {
     auto page = *node;
-    Priority p = page->priority;
-    auto it = mPolicies.find(p);
+    auto it = mPolicies.find(keyOf(*page));
     TLLM_CHECK_DEBUG(it != mPolicies.end());
     it->second.remove(node);
     if (it->second.empty())
@@ -238,6 +327,14 @@ void PerLevelEvictionController::remove(NodeRef node)
 SlotCount PerLevelEvictionController::numEvictablePages(PoolGroupIndex pgIdx) const
 {
     return mPolicies.at(pgIdx).size();
+}
+
+void PerLevelEvictionController::setHazardModel(HazardEvictionModel const* model) noexcept
+{
+    for (auto& policy : mPolicies)
+    {
+        policy.setHazardModel(model);
+    }
 }
 
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
