@@ -46,15 +46,38 @@ PP_COMM_TAG_AUTOTUNING = 30000
 # the same shapes, but each one times its candidates independently, so near-tie picks diverge
 # between ranks (and the slowest rank's pick sets the step). With TLLM_AUTOTUNER_TP_AGREE=1 the
 # ops matching TLLM_AUTOTUNER_TP_AGREE_OPS (comma-separated substrings, default "mxfp8") pick the
-# candidate with the best worst-rank time: TRT-LLM's tuner all-gathers each profile's candidate
-# times over the TP group and takes the argmin of the per-candidate maximum, and FlashInfer's
-# tuner (whose configs back the MXFP8 CuTe DSL "tuned" tactic) gets the per-config maximum over
-# the TP group. Requires the same cache hits on every TP rank (fresh or agreed cache files).
+# candidate with the best combined time over the TP group: TRT-LLM's tuner all-gathers each
+# profile's candidate times and takes the argmin of the per-candidate combination, and
+# FlashInfer's tuner (whose configs back the MXFP8 CuTe DSL "tuned" tactic) gets the combined
+# per-config time. TLLM_AUTOTUNER_TP_AGREE_REDUCE picks the combination: max (default; best
+# worst-rank time), min or mean. Requires the same cache hits on every TP rank (fresh or agreed
+# cache files).
 TP_AGREE_ENV = "TLLM_AUTOTUNER_TP_AGREE"
 TP_AGREE_OPS_ENV = "TLLM_AUTOTUNER_TP_AGREE_OPS"
+TP_AGREE_REDUCE_ENV = "TLLM_AUTOTUNER_TP_AGREE_REDUCE"
 # FlashInfer's tuner queues its CUDA-graph replays behind a fixed 100 us delay; this sets it (the
 # FlashInfer counterpart of TLLM_AUTOTUNER_CUDA_GRAPH_DELAY_US).
 FLASHINFER_GRAPH_DELAY_ENV = "TLLM_AUTOTUNER_FLASHINFER_GRAPH_DELAY_US"
+
+_TP_AGREE_REDUCERS = {
+    "max": max,
+    "min": min,
+    "mean": lambda values: sum(values) / len(values),
+}
+
+
+def _tp_agree_reduce(values) -> float:
+    """Combine one candidate's per-rank times (TLLM_AUTOTUNER_TP_AGREE_REDUCE, default max).
+
+    max: best worst-rank time. min: host stalls only ever add to a measurement, so the fastest
+    rank is the cleanest estimate of the kernel itself. A candidate that failed on any rank (inf)
+    stays out everywhere, whatever the reducer.
+    """
+    values = list(values)
+    if any(v == float('inf') for v in values):
+        return float('inf')
+    name = os.environ.get(TP_AGREE_REDUCE_ENV, "max").strip().lower()
+    return _TP_AGREE_REDUCERS.get(name, max)(values)
 
 
 def _tp_agree_patterns() -> List[str]:
@@ -66,7 +89,7 @@ def _tp_agree_patterns() -> List[str]:
 
 
 def _tp_agreeing_profile(profile_fn: Callable) -> Callable:
-    """Wrap FlashInfer's per-config profiler so matching runners return the TP-max time.
+    """Wrap FlashInfer's per-config profiler so matching runners return the TP-combined time.
 
     Every TP rank must reach the all-gather once per call, so a failing config still takes part
     (with an infinite time, which disqualifies it everywhere) before its error is re-raised.
@@ -81,7 +104,8 @@ def _tp_agreeing_profile(profile_fn: Callable) -> Callable:
             measured = float(profile_fn(self, runner, *args, **kwargs))
         except BaseException as e:  # noqa: BLE001 - every rank must reach the all-gather
             measured, error = float('inf'), e
-        agreed = max(tuner._dist.tp_allgather(measured, small_payload=True))
+        agreed = _tp_agree_reduce(
+            tuner._dist.tp_allgather(measured, small_payload=True))
         if error is not None:
             raise error
         return agreed
@@ -2187,7 +2211,9 @@ class AutoTuner:
             if best is None or times[best] == float('inf'):
                 return None, None, float('inf')
             return candidates[best][0], candidates[best][1], times[best]
-        worst = [max(t[i] for t in all_times) for i in range(len(times))]
+        worst = [
+            _tp_agree_reduce(t[i] for t in all_times) for i in range(len(times))
+        ]
         best = min(range(len(worst)), key=lambda i: worst[i], default=None)
         if best is None or worst[best] == float('inf'):
             return None, None, float('inf')

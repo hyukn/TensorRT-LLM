@@ -194,3 +194,16 @@ def test_install_flashinfer_overrides(monkeypatch):
     autotuner_module.install_flashinfer_tuner_overrides()
     autotuner_module.install_flashinfer_tuner_overrides()  # idempotent
     assert cls._profile_single_kernel.__wrapped__ is original
+
+
+@pytest.mark.parametrize(
+    "reduce,expected", [("max", (0, 5.0)), ("min", (1, 1.0)), ("mean", (1, 3.375))]
+)
+def test_profile_runners_reducer(monkeypatch, reduce, expected):
+    # Per-rank times of tactic 0: 5, 4, 5, 4.5 ; tactic 1: 1, 2, 8, 2.5 ; tactic 2 fails on rank 3.
+    monkeypatch.setenv(autotuner_module.TP_AGREE_REDUCE_ENV, reduce)
+    local = [5.0, 1.0, 0.5]
+    peers = [[[4.0, 2.0, 0.5], [5.0, 8.0, 0.5], [4.5, 2.5, float("inf")]]]
+    tuner = _tuner(peers, monkeypatch)
+    _, tactic, t = _profile(tuner, monkeypatch, local)
+    assert (tactic, t) == expected  # the failing tactic 2 is out under every reducer
