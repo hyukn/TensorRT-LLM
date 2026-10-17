@@ -57,6 +57,7 @@ from ..attention.backends.sparse.minimax_m3.index_tp_split import (
 )
 from ..attention.backends.sparse.params import SparseBackendForwardArgs
 from ..distributed import AllReduce, AllReduceFusionOp, AllReduceParams, MiniMaxAllReduceRMS
+from ..modules import nvfp4_fake_quant
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
 from ..modules.gated_mlp import GatedMLP
@@ -3464,6 +3465,9 @@ class MiniMaxM3ForCausalLM(SpecDecOneEngineForCausalLM[MiniMaxM3Model, Pretraine
             # representation while the target remains NVFP4.
             model_config.extra_attrs["draft_kv_cache_quant_algo_override"] = QuantAlgo.FP8
         super().__init__(MiniMaxM3Model(model_config), model_config)
+        if nvfp4_fake_quant.fake_quant_mode():
+            # Accuracy study (TRTLLM_FAKEQUANT_DENSE_NVFP4): name the projections for the role filter.
+            nvfp4_fake_quant.tag_linear_roles(self)
 
     def load_weights(
         self,

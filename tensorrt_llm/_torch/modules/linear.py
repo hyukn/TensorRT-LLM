@@ -44,6 +44,10 @@ from ..utils import (Fp4QuantizedTensor, MxFp8QuantizedTensor,
                      get_model_extra_attrs, is_torch_compiling,
                      replace_parameter_and_save_metadata, unswizzle_sf)
 from .low_m_gemm import _should_apply_low_m_gemm, apply_low_m_gemm
+from .nvfp4_fake_quant import activation_fake_quant
+from .nvfp4_fake_quant import fake_quant_mode as nvfp4_fake_quant_mode
+from .nvfp4_fake_quant import (fake_quant_rows, fake_quant_suspended,
+                               weight_fake_quant)
 
 
 class WeightMode(str, enum.Enum):
@@ -3578,7 +3582,72 @@ class MXFP8LinearMethod(LinearMethodBase):
         as an ``MxFp8QuantizedTensor`` (swizzled scales) instead of the bf16 activation; the
         GEMM that follows is the one the bf16 input would have run.
         """
+        if nvfp4_fake_quant_mode():
+            return False  # the NVFP4 fake-quant study needs the bf16 activation
         return self.on_decode_graph_path() or self.on_eager_quantize_path()
+
+    def _nvfp4_fake_quant_weight(self, module: Linear,
+                                 mode: int) -> torch.Tensor:
+        """The MXFP8 weight rounded to the 4-bit weight format of fake-quant ``mode`` (accuracy study,
+        TRTLLM_FAKEQUANT_DENSE_NVFP4), built once per weight format, eagerly."""
+        # Modes 1 and 2 share the NVFP4 weight; the others have their own.
+        fmt = 1 if mode in (1, 2) else mode
+        w = getattr(module, "_fq_nvfp4_weight", None)
+        if w is not None and getattr(module, "_fq_nvfp4_weight_format",
+                                     None) == fmt:
+            return w
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(
+                "TRTLLM_FAKEQUANT_DENSE_NVFP4: the fake-quantized weight must be built by an "
+                "eager forward before CUDA graph capture")
+        from tensorrt_llm._torch.modules.mxfp8_utils import dequant_mxfp8_weight
+        out_features, in_features = module.weight.shape
+        sf_cols = in_features // self.BLOCK_SIZE
+        if self.use_cutlass:
+            pad_rows = fp4_utils.pad_up(out_features, self._SF_ROW_PAD)
+            pad_cols = fp4_utils.pad_up(sf_cols, self._SF_COL_PAD)
+            swizzled = module.weight_scale.data.view(torch.uint8).reshape(
+                pad_rows, pad_cols)
+            scale_2d = torch.ops.trtllm.block_scale_interleave_reverse(
+                swizzled).view(torch.uint8).reshape(
+                    pad_rows, pad_cols)[:out_features, :sf_cols].contiguous()
+        else:
+            scale_2d = module.weight_scale.data
+        w_deq = dequant_mxfp8_weight(module.weight.data, scale_2d,
+                                     self.BLOCK_SIZE)
+        w = weight_fake_quant(w_deq, mode).to(module.dtype)
+        module._fq_nvfp4_weight = w
+        module._fq_nvfp4_weight_format = fmt
+        logger.info(
+            f"NVFP4 fake quant (mode {mode}): MXFP8 linear "
+            f"{out_features}x{in_features}, rel. error vs MXFP8 "
+            f"{((w.float() - w_deq).norm() / w_deq.norm().clamp(min=1e-30)).item():.4f}"
+        )
+        return w
+
+    def _apply_nvfp4_fake_quant(self, module: Linear, input: torch.Tensor,
+                                bias: Optional[torch.Tensor],
+                                mode: int) -> torch.Tensor:
+        if isinstance(input, MxFp8QuantizedTensor):
+            raise RuntimeError(
+                "TRTLLM_FAKEQUANT_DENSE_NVFP4 needs the bf16 activation, got a "
+                "pre-quantized MXFP8 one")
+        rows = fake_quant_rows(module)
+        if rows is not None:
+            # Role filter: today's GEMM, then the selected rows recomputed with the fake-quantized operands.
+            with fake_quant_suspended():
+                out = self.apply(module, input, bias)
+            if rows:
+                w = self._nvfp4_fake_quant_weight(module, mode)
+                x = activation_fake_quant(input, mode).to(w.dtype)
+                for start, end in rows:
+                    out[..., start:end] = F.linear(
+                        x, w[start:end],
+                        None if bias is None else bias[start:end])
+            return out
+        w = self._nvfp4_fake_quant_weight(module, mode)
+        x = activation_fake_quant(input, mode)
+        return F.linear(x.to(w.dtype), w, bias)
 
     def _quantized_gemm(self, module: Linear, act_e4m3: torch.Tensor,
                         act_sf: torch.Tensor) -> torch.Tensor:
@@ -3618,6 +3687,9 @@ class MXFP8LinearMethod(LinearMethodBase):
     def apply(self, module: Linear, input: torch.Tensor,
               bias: Optional[torch.Tensor]):
         """Apply MXFP8 linear projection with eager or capture-safe dispatch."""
+        fq_mode = nvfp4_fake_quant_mode()
+        if fq_mode:
+            return self._apply_nvfp4_fake_quant(module, input, bias, fq_mode)
         if isinstance(input, MxFp8QuantizedTensor):
             # Pre-quantized by the producer (see accepts_prequantized_input).
             if not input.is_sf_swizzled:
