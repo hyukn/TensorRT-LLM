@@ -1726,6 +1726,52 @@ def _(
                              dtype=output_dtype)
 
 
+class NVFP4GemmExactMRunner(NVFP4GemmUnifiedRunner):
+    """``NVFP4GemmUnifiedRunner`` tuned and looked up at the exact token count.
+
+    The unified runner maps M to the last power of two, so every decode
+    CUDA-graph size between two powers replays the smaller bucket's pick
+    (MiniMax-M3 DEP QKV at M=104: the M=64 CuTe DSL pick runs 11.0 us where
+    cuBLASLt takes 8.4 us). Each rank tunes independently (attention-DP ranks
+    see different batches).
+    """
+    tuning_config = TuningConfig(
+        dynamic_tensor_specs=(DynamicTensorSpec(
+            0, 0, get_last_power_of_2_num_tokens_buckets, lambda m: m), ),
+        constraint_specs=(ConstraintSpec(2, 0, fp4_scale_infer_shape), ),
+        distributed_tuning_strategy=DistributedTuningStrategy.INDEPENDENT,
+    )
+
+
+NVFP4_GEMM_EXACT_M_OP = "trtllm::nvfp4_gemm::exact_m"
+
+
+def nvfp4_gemm_exact_m(
+    act_fp4: torch.Tensor,
+    weight: torch.Tensor,
+    act_sf: torch.Tensor,
+    weight_scale: torch.Tensor,
+    alpha: torch.Tensor,
+    output_dtype: torch.dtype,
+    allowed_backends: List[str],
+    tune: bool = False,
+) -> torch.Tensor:
+    """NVFP4 W4A4 GEMM with the tactic picked for exactly this M (decode CUDA graphs).
+
+    ``tune`` profiles on a cache miss (the warmup-only graph pass); otherwise a
+    miss runs the runner's fallback tactic. Like the MXFP8 decode-graph picks,
+    the entries persist in ``TLLM_AUTOTUNER_CACHE_PATH`` with
+    ``TLLM_AUTOTUNER_PIN_GRAPH_TACTICS=1``.
+    """
+    runner = NVFP4GemmExactMRunner(int(BufferKind.DEFAULT), output_dtype,
+                                   list(allowed_backends))
+    inputs = [act_fp4, weight, act_sf, weight_scale, alpha]
+    with autotune(tune_mode=tune, skip_dynamic_tuning_buckets=True):
+        _, tactic = AutoTuner.get().choose_one(NVFP4_GEMM_EXACT_M_OP, [runner],
+                                               runner.tuning_config, inputs)
+    return runner(inputs=inputs, tactic=tactic)
+
+
 class FP8BatchedGemmRunner(TunableRunner):
     runner_dict = dict()
     tuning_config = None

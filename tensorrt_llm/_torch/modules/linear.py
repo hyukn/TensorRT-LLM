@@ -11,7 +11,7 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
-from typing import ClassVar, Dict, List, Optional, Tuple, Union
+from typing import ClassVar, Dict, List, Optional, Sequence, Tuple, Union
 
 import torch
 import torch.nn.functional as F
@@ -20,7 +20,8 @@ from torch.nn.parameter import Parameter
 
 import tensorrt_llm.quantization.utils.fp4_utils as fp4_utils
 from tensorrt_llm._torch.custom_ops.torch_custom_ops import (
-    BufferKind, mxfp8_gemm_autotuned, mxfp8_quantize_gemm_autotuned)
+    BufferKind, mxfp8_gemm_autotuned, mxfp8_quantize_gemm_autotuned,
+    nvfp4_gemm_exact_m)
 from tensorrt_llm._torch.peft.lora.layer import LoraLayer
 from tensorrt_llm._utils import is_device_integrated, mpi_disabled
 from tensorrt_llm.bindings import ipc_nvls_supported
@@ -3584,7 +3585,121 @@ class MXFP8LinearMethod(LinearMethodBase):
         """
         if nvfp4_fake_quant_mode():
             return False  # the NVFP4 fake-quant study needs the bf16 activation
+        if getattr(module, "_nvfp4_repacked", False) or getattr(
+                module, "_nvfp4_calib_amax", None) is not None:
+            return False  # NVFP4 W4A4 / its calibration quantize the bf16 activation
         return self.on_decode_graph_path() or self.on_eager_quantize_path()
+
+    def dequantized_weight(self, module: Linear) -> torch.Tensor:
+        """The MXFP8 weight as fp32 ``[out_features, in_features]`` (exact)."""
+        from tensorrt_llm._torch.modules.mxfp8_utils import dequant_mxfp8_weight
+        out_features, in_features = module.weight.shape
+        sf_cols = in_features // self.BLOCK_SIZE
+        if self.use_cutlass:
+            pad_rows = fp4_utils.pad_up(out_features, self._SF_ROW_PAD)
+            pad_cols = fp4_utils.pad_up(sf_cols, self._SF_COL_PAD)
+            swizzled = module.weight_scale.data.view(torch.uint8).reshape(
+                pad_rows, pad_cols)
+            scale_2d = torch.ops.trtllm.block_scale_interleave_reverse(
+                swizzled).view(torch.uint8).reshape(
+                    pad_rows, pad_cols)[:out_features, :sf_cols].contiguous()
+        else:
+            scale_2d = module.weight_scale.data
+        return dequant_mxfp8_weight(module.weight.data, scale_2d,
+                                    self.BLOCK_SIZE)
+
+    def enable_input_amax_calibration(self, module: Linear) -> None:
+        """Record the running max |input| of ``module`` (``module._nvfp4_calib_amax``, fp32 [1]).
+
+        On-device and in place, so CUDA-graph replays keep updating it; for calibrating the
+        static activation scale of ``repack_to_nvfp4``. Producers hand over bf16 activations
+        while it is on.
+        """
+        module._nvfp4_calib_amax = torch.zeros(1,
+                                               dtype=torch.float32,
+                                               device=module.weight.device)
+
+    def repack_to_nvfp4(self,
+                        module: Linear,
+                        input_amax: float,
+                        allowed_backends: Sequence[str] = ("cublaslt",
+                                                           "cutedsl"),
+                        free_mxfp8: bool = True) -> None:
+        """Run ``module`` as an NVFP4 W4A4 GEMM from now on.
+
+        The MXFP8 weight is dequantized (exact) and re-quantized to NVFP4 (16-element E4M3
+        block scales, 448 * 6 / amax global scale); activations are quantized per call with
+        the static global scale 448 * 6 / ``input_amax`` (a calibrated bound: larger inputs
+        saturate). ``free_mxfp8`` drops the MXFP8 weight; the module cannot reload weights
+        after that. Decode CUDA graphs pick the GEMM tactic per exact token count
+        (``nvfp4_gemm_exact_m``); other calls use ``nvfp4_gemm`` over ``allowed_backends``.
+        """
+        if not input_amax > 0:
+            raise ValueError(
+                f"NVFP4 repack needs a positive input amax, got {input_amax}")
+        w_deq = self.dequantized_weight(module)
+        device = w_deq.device
+        e4m3_e2m1_max = 448.0 * 6.0
+        weight_global = (e4m3_e2m1_max / w_deq.abs().amax().clamp(
+            min=torch.finfo(torch.float32).tiny)).reshape(1).float()
+        # MXFP8 values (3 mantissa bits, power-of-two scales) are exact in bf16.
+        w_fp4, w_sf = torch.ops.trtllm.fp4_quantize(w_deq.to(torch.bfloat16),
+                                                    weight_global,
+                                                    fp4_utils.NVFP4_SF_VEC_SIZE,
+                                                    False, True)
+        input_global = torch.tensor([e4m3_e2m1_max / float(input_amax)],
+                                    dtype=torch.float32,
+                                    device=device)
+        module._nvfp4_weight = w_fp4
+        module._nvfp4_weight_scale = w_sf
+        module._nvfp4_input_scale = input_global
+        module._nvfp4_alpha = (1.0 / (input_global * weight_global)).float()
+        module._nvfp4_backends = tuple(allowed_backends)
+        module._nvfp4_repacked = True
+        del w_deq
+        if free_mxfp8:
+            module.weight.data = module.weight.data.new_empty(0)
+            module.weight_scale.data = module.weight_scale.data.new_empty(0)
+
+    def _apply_nvfp4_repacked(self, module: Linear, input: torch.Tensor,
+                              bias: Optional[torch.Tensor]) -> torch.Tensor:
+        """The NVFP4 W4A4 GEMM of a ``repack_to_nvfp4`` module (static activation scale)."""
+        if isinstance(input, MxFp8QuantizedTensor):
+            raise RuntimeError(
+                "An NVFP4-repacked MXFP8 Linear needs the bf16 activation, got a "
+                "pre-quantized MXFP8 one")
+        original_shape = input.shape
+        if input.dim() > 2:
+            input = input.reshape(-1, input.shape[-1])
+        act_fp4, act_sf = torch.ops.trtllm.fp4_quantize(
+            input.contiguous(), module._nvfp4_input_scale,
+            fp4_utils.NVFP4_SF_VEC_SIZE, False)
+        if (not is_torch_compiling()
+                and _FLASHINFER_MXFP8_DECODE_GRAPH_CAPTURE_ACTIVE.get()):
+            # Decode graphs: the tactic for this exact M, tuned in the warmup-only pass.
+            output = nvfp4_gemm_exact_m(
+                act_fp4,
+                module._nvfp4_weight,
+                act_sf,
+                module._nvfp4_weight_scale,
+                module._nvfp4_alpha,
+                module.dtype,
+                module._nvfp4_backends,
+                tune=_FLASHINFER_MXFP8_AUTOTUNE_ACTIVE.get())
+        else:
+            output = torch.ops.trtllm.nvfp4_gemm(act_fp4,
+                                                 module._nvfp4_weight,
+                                                 act_sf,
+                                                 module._nvfp4_weight_scale,
+                                                 module._nvfp4_alpha,
+                                                 module.dtype,
+                                                 allowed_backends=",".join(
+                                                     module._nvfp4_backends))
+        if bias is not None:
+            output = output + bias
+        if len(original_shape) > 2:
+            output = output.reshape(*original_shape[:-1], output.shape[-1])
+        return output
 
     def _nvfp4_fake_quant_weight(self, module: Linear,
                                  mode: int) -> torch.Tensor:
@@ -3600,21 +3715,8 @@ class MXFP8LinearMethod(LinearMethodBase):
             raise RuntimeError(
                 "TRTLLM_FAKEQUANT_DENSE_NVFP4: the fake-quantized weight must be built by an "
                 "eager forward before CUDA graph capture")
-        from tensorrt_llm._torch.modules.mxfp8_utils import dequant_mxfp8_weight
         out_features, in_features = module.weight.shape
-        sf_cols = in_features // self.BLOCK_SIZE
-        if self.use_cutlass:
-            pad_rows = fp4_utils.pad_up(out_features, self._SF_ROW_PAD)
-            pad_cols = fp4_utils.pad_up(sf_cols, self._SF_COL_PAD)
-            swizzled = module.weight_scale.data.view(torch.uint8).reshape(
-                pad_rows, pad_cols)
-            scale_2d = torch.ops.trtllm.block_scale_interleave_reverse(
-                swizzled).view(torch.uint8).reshape(
-                    pad_rows, pad_cols)[:out_features, :sf_cols].contiguous()
-        else:
-            scale_2d = module.weight_scale.data
-        w_deq = dequant_mxfp8_weight(module.weight.data, scale_2d,
-                                     self.BLOCK_SIZE)
+        w_deq = self.dequantized_weight(module)
         w = weight_fake_quant(w_deq, mode).to(module.dtype)
         module._fq_nvfp4_weight = w
         module._fq_nvfp4_weight_format = fmt
@@ -3687,6 +3789,17 @@ class MXFP8LinearMethod(LinearMethodBase):
     def apply(self, module: Linear, input: torch.Tensor,
               bias: Optional[torch.Tensor]):
         """Apply MXFP8 linear projection with eager or capture-safe dispatch."""
+        if getattr(module, "_nvfp4_repacked", False):
+            return self._apply_nvfp4_repacked(module, input, bias)
+        calib_amax = getattr(module, "_nvfp4_calib_amax", None)
+        if calib_amax is not None and isinstance(input, torch.Tensor):
+            torch.maximum(calib_amax,
+                          input.detach().abs().amax().float().reshape(1),
+                          out=calib_amax)
+            flush = getattr(module, "_nvfp4_calib_flush", None)
+            if (flush is not None and not is_torch_compiling()
+                    and not torch.cuda.is_current_stream_capturing()):
+                flush()
         fq_mode = nvfp4_fake_quant_mode()
         if fq_mode:
             return self._apply_nvfp4_fake_quant(module, input, bias, fq_mode)

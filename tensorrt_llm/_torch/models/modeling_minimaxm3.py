@@ -89,6 +89,7 @@ from ..utils import (
     get_model_extra_attrs,
     is_torch_compiling,
 )
+from . import minimax_m3_qkv_nvfp4
 from .checkpoints.base_weight_mapper import BaseWeightMapper
 from .checkpoints.hf.minimaxm3_weight_mapper import MINIMAX_M3_PARAMS_MAP, MiniMaxM3HfWeightMapper
 from .modeling_speculative import SpecDecOneEngineForCausalLM
@@ -3508,6 +3509,9 @@ class MiniMaxM3ForCausalLM(SpecDecOneEngineForCausalLM[MiniMaxM3Model, Pretraine
                 _aligned_nvfp4_dequant_scales(
                     attention.attn, attention.qkv_proj.kv_scales, refresh=True
                 )
+        # Opt-in: QKV(+index) projection as NVFP4 W4A4 (TRTLLM_M3_QKV_NVFP4) or its calibration.
+        if not allow_partial_loading:
+            minimax_m3_qkv_nvfp4.setup(self.model.layers, self.model_config.mapping.rank)
 
     def setup_aliases(self) -> None:
         """Chain each decoder layer's next_layer_layernorm for POST fusion.
