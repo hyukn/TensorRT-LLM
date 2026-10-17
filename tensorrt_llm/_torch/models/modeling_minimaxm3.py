@@ -606,6 +606,18 @@ _ROUTER_FAST_UPCAST = os.environ.get("TRTLLM_M3_ROUTER_FAST_UPCAST", "0") == "1"
 # kernel and arguments, so bitwise; decode CUDA graphs only (where the routed and shared branches
 # already run on two streams).
 _MOE_PREQUANT_OVERLAP = os.environ.get("TRTLLM_M3_MOE_PREQUANT_OVERLAP", "0") == "1"
+# TRTLLM_M3_SHARED_EXPERT_FORK=post_router|pre_dispatch|pre_combine: under a MoE all-to-all (attention
+# DP + EP), start the shared expert on its stream only after the router GEMM (post_router, recorded by
+# this module) or when the routed path reaches that point of the MoE scheduler (it records the fork
+# event there), instead of next to the router GEMM. The router -> top-k -> dispatch chain is on the
+# critical path and the shared expert is needed only at the final add; at 26 requests per DEP8 rank
+# the shared expert's GEMMs slow the router from ~4.6 to ~10.4 us. pre_combine moves it too late (it
+# then ends ~8 us after the combine and the add waits for it). Decode CUDA graphs only (where the two
+# branches run on two streams); same kernels and inputs, so bitwise. Without an all-to-all (TP) the
+# default placement stays.
+_SHARED_EXPERT_FORK = os.environ.get("TRTLLM_M3_SHARED_EXPERT_FORK", "")
+_SHARED_EXPERT_FORK_POST_ROUTER = "post_router"
+_SHARED_EXPERT_FORK_STAGES = (_SHARED_EXPERT_FORK_POST_ROUTER, "pre_dispatch", "pre_combine")
 # TRTLLM_M3_ATTN_OUT_MXFP8=1: on decode graph steps the sparse-attention merge kernel also emits
 # the MXFP8 o_proj activation (bit-identical to the o_proj's own mxfp8_quantize), so the o_proj
 # quantize kernel drops out of every sparse layer.
@@ -985,6 +997,59 @@ class MiniMaxM3MoE(nn.Module):
         event_shared.wait()
         return routed_output, shared_output
 
+    def _use_late_shared_fork(self, lora_params) -> bool:
+        """Whether this forward starts the shared expert at a MoE scheduler stage (see _SHARED_EXPERT_FORK)."""
+        if _SHARED_EXPERT_FORK not in _SHARED_EXPERT_FORK_STAGES:
+            return False
+        if self.shared_experts is None or lora_params is not None:
+            return False
+        if is_torch_compiling() or torch.compiler.is_compiling():
+            return False
+        if self.aux_stream is None or not do_multi_stream():
+            return False
+        return getattr(self.experts, "comm", None) is not None
+
+    def _forward_late_shared_fork(
+        self,
+        hidden_states: torch.Tensor,
+        shared_input,
+        all_rank_num_tokens: Optional[List[int]],
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Routed branch on the main stream; the shared expert forks off where the routed path records the event.
+
+        The MoE scheduler records the fork event on the main stream just before the configured stage
+        (dispatch / combine), so the shared expert runs in the all-to-all latency window instead of next to
+        the router GEMM. If the routed path never reached the stage (another MoE implementation), the event
+        is recorded after it, which serializes the branches but keeps the dependency on the input.
+        """
+        fork = self.event_dict[EventType.Main]
+        event_shared = self.event_dict[EventType.MoeShared]
+        experts = self.experts
+        post_router = _SHARED_EXPERT_FORK == _SHARED_EXPERT_FORK_POST_ROUTER
+        experts.stage_events = {} if post_router else {_SHARED_EXPERT_FORK: fork}
+        experts.stage_events_fired = set()
+        try:
+            router_logits = self.gate(hidden_states)
+            if post_router:
+                fork.record()
+            routed_output = experts(
+                hidden_states,
+                router_logits,
+                all_rank_num_tokens=all_rank_num_tokens,
+                use_dp_padding=False,
+            )
+            fired = post_router or _SHARED_EXPERT_FORK in experts.stage_events_fired
+        finally:
+            experts.stage_events = {}
+        if not fired:
+            fork.record()
+        with torch.cuda.stream(self.aux_stream):
+            fork.wait()
+            shared_output = self.shared_experts(shared_input)
+            event_shared.record()
+        event_shared.wait()
+        return routed_output, shared_output
+
     def accepts_mxfp8_shared_input(self) -> bool:
         """Whether the shared expert's next eager forward runs its gate_up projection as an MXFP8 GEMM that can
         take a pre-quantized activation (see stage_mxfp8_shared_input)."""
@@ -1063,7 +1128,11 @@ class MiniMaxM3MoE(nn.Module):
             routed_output = _compute_routed_output()
             result = routed_output
         else:
-            if self._use_prequant_overlap(hidden_states, lora_params):
+            if self._use_late_shared_fork(lora_params):
+                routed_output, shared_output = self._forward_late_shared_fork(
+                    hidden_states, shared_input, all_rank_num_tokens
+                )
+            elif self._use_prequant_overlap(hidden_states, lora_params):
                 routed_output, shared_output = self._forward_prequant_overlap(
                     hidden_states, all_rank_num_tokens
                 )

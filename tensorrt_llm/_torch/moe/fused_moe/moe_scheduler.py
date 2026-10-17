@@ -63,10 +63,35 @@ __all__ = [
     "ExternalCommMoEScheduler",
     "FusedCommMoEScheduler",
     "create_moe_scheduler",
+    "fire_stage_event",
 ]
 
 if TYPE_CHECKING:
     from .configurable_moe import ConfigurableMoE
+
+# Points of the external-comm flow at which a caller can have an event recorded on the current
+# stream (``moe.stage_events = {stage: event}``), e.g. to start independent work on another stream
+# exactly when the routed path reaches the all-to-all.
+MOE_STAGE_PRE_DISPATCH = "pre_dispatch"  # routing and input quantize enqueued, dispatch next
+MOE_STAGE_PRE_COMBINE = "pre_combine"  # expert GEMMs (and finalize) enqueued, combine next
+
+
+def fire_stage_event(moe, stage: str) -> None:
+    """Record the event registered for ``stage`` in ``moe.stage_events`` (if any) on the current stream.
+
+    Fired stages are added to ``moe.stage_events_fired`` so the caller can tell whether the routed
+    path reached the point (a caller must not depend on an event that was never recorded).
+    """
+    events = getattr(moe, "stage_events", None)
+    if not events:
+        return
+    event = events.get(stage)
+    if event is None:
+        return
+    event.record()
+    fired = getattr(moe, "stage_events_fired", None)
+    if fired is not None:
+        fired.add(stage)
 
 
 class MoEScheduler(ABC):
@@ -547,6 +572,7 @@ class ExternalCommMoEScheduler(MoEScheduler):
                 if hasattr(moe, "quant_scales") and moe.quant_scales is not None:
                     if hasattr(moe.quant_scales, "pre_quant_scale_1"):
                         dispatch_kwargs["pre_quant_scale"] = moe.quant_scales.pre_quant_scale_1
+                fire_stage_event(moe, MOE_STAGE_PRE_DISPATCH)
                 x, x_sf, token_selected_slots, token_final_scales = moe.comm.dispatch(
                     hidden_states=x,
                     hidden_states_sf=x_sf,
@@ -561,6 +587,7 @@ class ExternalCommMoEScheduler(MoEScheduler):
                     moe._load_balancer_update_statistic_with_gathered_statistic(gathered_stats)
             else:
                 # Dispatch -> Quantize
+                fire_stage_event(moe, MOE_STAGE_PRE_DISPATCH)
                 x, x_sf, token_selected_slots, token_final_scales = moe.comm.dispatch(
                     hidden_states=x,
                     hidden_states_sf=None,  # not quantized yet
@@ -626,6 +653,7 @@ class ExternalCommMoEScheduler(MoEScheduler):
 
         # ========== Step 8: Communication combine ==========
         if moe.comm is not None:
+            fire_stage_event(moe, MOE_STAGE_PRE_COMBINE)
             if moe.enable_dummy_allreduce:
                 moe.dummy_allreduce()
             all_rank_max_num_tokens = max(all_rank_num_tokens)
