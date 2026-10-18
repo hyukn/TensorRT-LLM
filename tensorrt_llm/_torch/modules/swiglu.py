@@ -4,6 +4,8 @@ import torch
 import triton  # type: ignore[import]
 import triton.language as tl  # type: ignore[import]
 
+from .mxfp8_triton import mxfp8_quantize_rows, sf_offset_128x4
+
 
 @triton.jit
 def scale_and_clamp(x, scale, dtype):
@@ -59,6 +61,44 @@ def silu_and_mul_kernel(o_ptr, o_stride, o_scale_ptr, x_ptr, x_stride, d,
         result = scale_and_clamp(result, o_scale, o_ptr.dtype.element_ty)
 
     tl.store(o_row_ptr + offsets, result, mask=mask)
+
+
+@triton.jit
+def silu_and_mul_mxfp8_kernel(q_ptr, sf_ptr, x_ptr, x_stride, q_stride, d,
+                              num_k_tiles, swiglu_limit: tl.constexpr,
+                              swiglu_alpha: tl.constexpr,
+                              swiglu_beta: tl.constexpr,
+                              BLOCK_SIZE: tl.constexpr,
+                              HAS_SWIGLU_LIMIT: tl.constexpr) -> None:
+    """silu_and_mul_kernel's bf16 result, quantized to MXFP8 in the epilogue.
+
+    Writes the E4M3 bytes and 128x4-swizzled UE8M0 scales that
+    mxfp8_quantize(silu_and_mul(x), True) gives (see mxfp8_triton), without the
+    bf16 intermediate. d must be a multiple of 32.
+    """
+    i = tl.program_id(axis=0).to(tl.int64)
+    j = tl.program_id(axis=1)
+
+    blocks = j * (BLOCK_SIZE // 32) + tl.arange(0, BLOCK_SIZE // 32)
+    offsets = blocks[:, None] * 32 + tl.arange(0, 32)[None, :]
+    mask = offsets < d
+    x_row_ptr = x_ptr + x_stride * i
+
+    a = tl.load(x_row_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
+    b = tl.load(x_row_ptr + offsets + d, mask=mask, other=0.0).to(tl.float32)
+
+    if HAS_SWIGLU_LIMIT:
+        a = tl.minimum(a, swiglu_limit)
+        b = tl.clamp(b, -swiglu_limit, swiglu_limit)
+
+    result = a * tl.sigmoid(swiglu_alpha * a) * (b + swiglu_beta)
+    # The bf16 activation the separate quantize would read.
+    result = result.to(tl.bfloat16).to(tl.float32)
+    q, sf = mxfp8_quantize_rows(result)
+    tl.store(q_ptr + q_stride * i + offsets, q, mask=mask)
+    tl.store(sf_ptr + sf_offset_128x4(i, blocks, num_k_tiles),
+             sf,
+             mask=blocks * 32 < d)
 
 
 @triton.jit

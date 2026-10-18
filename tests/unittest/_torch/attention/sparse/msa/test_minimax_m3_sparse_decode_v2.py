@@ -470,3 +470,181 @@ def test_sk_env_switch(monkeypatch, mode):
         assert torch.equal(out, base)  # 12 groups: still the one-shot kernel
     else:
         torch.testing.assert_close(out.float(), base.float(), rtol=1e-2, atol=1e-2)
+
+
+# ---------------------------------------------------------------------------
+# MXFP8 epilogue (one-shot mma.sync kernel and stream-K kernel): with an Mxfp8OutputRequest open for the
+# output buffer, the kernel also writes the E4M3 bytes and 128x4-swizzled UE8M0 scales of its bf16 output,
+# bitwise what torch.ops.trtllm.mxfp8_quantize(output, True) gives, and leaves the bf16 output unchanged.
+
+
+def _run_sk_mxfp8(case, cfg, out_ptr=None):
+    from tensorrt_llm._torch.modules.mxfp8_triton import Mxfp8OutputRequest, mxfp8_output_request
+
+    total_q, num_heads, head_dim = case.q.shape
+    out = torch.empty(case.q.shape, device=case.q.device, dtype=torch.bfloat16)
+    request = Mxfp8OutputRequest.allocate(total_q, num_heads * head_dim, out.device)
+    request.out_ptr = out.data_ptr() if out_ptr is None else out_ptr
+    with mxfp8_output_request(request):
+        minimax_m3_sparse_attn_decode_v2(
+            case.q,
+            case.k_paged,
+            case.v_paged,
+            case.topk_idx,
+            case.block_table,
+            case.seq_lens,
+            sm_scale=SM_SCALE,
+            output=out,
+            decode_query_len=case.decode_query_len,
+            _force="v2",
+            _config=cfg,
+            **case.scales,
+        )
+    return out, request
+
+
+def _assert_mxfp8_of(out, request):
+    total_q = out.shape[0]
+    flat = out.reshape(total_q, -1)
+    ref_q, ref_sf = torch.ops.trtllm.mxfp8_quantize(flat, True)
+    assert torch.equal(request.fp8.view(torch.uint8), ref_q.view(total_q, -1).view(torch.uint8))
+    num_blocks = flat.shape[1] // 32
+    rows = torch.arange(total_q, device=out.device)[:, None]
+    blks = torch.arange(num_blocks, device=out.device)[None, :]
+    off = (
+        (rows // 128) * (((num_blocks + 3) // 4) * 512)
+        + (blks // 4) * 512
+        + (rows % 32) * 16
+        + ((rows % 128) // 32) * 4
+        + (blks % 4)
+    ).reshape(-1)
+    assert torch.equal(request.sf[off], ref_sf.view(torch.uint8).reshape(-1)[off])
+
+
+@pytest.mark.parametrize("wpt", [4, 2])
+@pytest.mark.parametrize("grid", [None, 3, 7])
+@pytest.mark.parametrize(
+    ("num_kv_heads", "group", "dql"), [(1, 16, 4), (4, 16, 4), (2, 8, 2), (1, 16, 1)]
+)
+@pytest.mark.parametrize(
+    "seqs", [[1, 128, 129], [1025, 4097], [1024, 0, 512, 0]], ids=["short", "two-req", "empty"]
+)
+def test_sk_mxfp8_output_request(num_kv_heads, group, dql, seqs, grid, wpt):
+    seq_lens = [max(s, dql) if s else 0 for s in seqs]
+    case = _make_nvfp4_inputs(
+        seq_lens, num_kv_heads=num_kv_heads, group=group, decode_query_len=dql, seed=53
+    )
+    case.q = case.q.to(torch.float8_e4m3fn)
+    cfg = _sk_cfg(dql, group, grid, wpt=wpt, groups=len(seq_lens) * num_kv_heads)
+    plain = _run_v2(case, _config=cfg)
+    out, request = _run_sk_mxfp8(case, cfg)
+    assert request.written
+    assert torch.equal(out, plain)
+    _assert_mxfp8_of(out, request)
+
+
+@pytest.mark.parametrize("shared", [16, 0])
+def test_sk_mxfp8_output_request_many_rows(shared):
+    """Attention-DP shape over two 128-row scale tiles: 36 requests x 4 query tokens, 4 KV heads."""
+    seq_lens = [3000 + 211 * i for i in range(36)]
+    case = _make_nvfp4_inputs(seq_lens, num_kv_heads=4, group=16, decode_query_len=4, seed=59)
+    _eagle_overlap_topk(case, shared=shared, seed=shared + 5)
+    case.q = case.q.to(torch.float8_e4m3fn)
+    cfg = _sk_cfg(4, 16)
+    plain = _run_v2(case, _config=cfg)
+    out, request = _run_sk_mxfp8(case, cfg)
+    assert request.written and torch.equal(out, plain)
+    _assert_mxfp8_of(out, request)
+
+
+@pytest.mark.parametrize(
+    ("wpt", "nsplit"), [(4, 1), (4, 3), (4, 4), (2, 1), (2, 2), (4, 8)], ids=lambda v: str(v)
+)
+@pytest.mark.parametrize(
+    ("num_kv_heads", "group", "dql"), [(1, 16, 4), (2, 8, 2), (1, 16, 1), (4, 16, 4)]
+)
+@pytest.mark.parametrize(
+    "seqs", [[1, 128, 129], [6000, 2049, 4500], [1024, 0, 512, 0]], ids=["short", "long", "empty"]
+)
+def test_v2_mxfp8_output_request(num_kv_heads, group, dql, seqs, wpt, nsplit):
+    """The one-shot kernel: direct output (one split) and the global-partials merge (several)."""
+    seq_lens = [max(s, dql) if s else 0 for s in seqs]
+    case = _make_nvfp4_inputs(
+        seq_lens, num_kv_heads=num_kv_heads, group=group, decode_query_len=dql, seed=61
+    )
+    _eagle_overlap_topk(case, shared=12, seed=2)
+    case.q = case.q.to(torch.float8_e4m3fn)
+    ntiles = (dql * group + 15) // 16
+    cfg = dict(
+        ntiles=ntiles, wpt=wpt, stages=max(1, min(6, -(-(dql * 16) // nsplit))), nsplit=nsplit
+    )
+    plain = _run_v2(case, _config=cfg)
+    out, request = _run_sk_mxfp8(case, cfg)
+    assert request.written
+    assert torch.equal(out, plain)
+    _assert_mxfp8_of(out, request)
+
+
+def test_mxfp8_request_left_open_where_unsupported():
+    """A request for another buffer is left open (stream-K and one-shot), and so is one under the
+    cluster merge; the bf16 output does not change."""
+    case = _make_nvfp4_inputs([4097, 1025, 3000], num_kv_heads=4, group=16, decode_query_len=4)
+    case.q = case.q.to(torch.float8_e4m3fn)
+    other = torch.empty(1, device="cuda")
+    for cfg in (_sk_cfg(4, 16, 5, groups=12), dict(ntiles=4, wpt=4, stages=4, nsplit=4)):
+        out, request = _run_sk_mxfp8(case, cfg, out_ptr=other.data_ptr())
+        assert not request.written
+        assert torch.equal(out, _run_v2(case, _config=cfg))
+    cfg = dict(ntiles=4, wpt=4, stages=4, nsplit=4, cluster=1)
+    out, request = _run_sk_mxfp8(case, cfg)
+    assert not request.written
+    assert torch.equal(out, _run_v2(case, _config=cfg))
+
+
+def test_sk_mxfp8_cuda_graph_replay():
+    from tensorrt_llm._torch.modules.mxfp8_triton import Mxfp8OutputRequest, mxfp8_output_request
+
+    case = _make_nvfp4_inputs(
+        [5000, 2049, 129, 7000, 300], num_kv_heads=4, group=16, decode_query_len=4
+    )
+    _eagle_overlap_topk(case, shared=10, seed=3)
+    case.q = case.q.to(torch.float8_e4m3fn)
+    cfg = _sk_cfg(4, 16, 9, groups=20)
+    total_q, num_heads, head_dim = case.q.shape
+    out = torch.empty(case.q.shape, device="cuda", dtype=torch.bfloat16)
+    request = Mxfp8OutputRequest.allocate(total_q, num_heads * head_dim, out.device)
+
+    def run():
+        request.out_ptr, request.written = out.data_ptr(), False
+        with mxfp8_output_request(request):
+            minimax_m3_sparse_attn_decode_v2(
+                case.q,
+                case.k_paged,
+                case.v_paged,
+                case.topk_idx,
+                case.block_table,
+                case.seq_lens,
+                sm_scale=SM_SCALE,
+                output=out,
+                decode_query_len=4,
+                _force="v2",
+                _config=cfg,
+                **case.scales,
+            )
+        assert request.written
+
+    run()
+    torch.cuda.synchronize()
+    first = out.clone()
+    _assert_mxfp8_of(out, request)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run()
+    for _ in range(3):
+        out.zero_()
+        request.fp8.view(torch.uint8).zero_()
+        request.sf.zero_()
+        graph.replay()
+        torch.cuda.synchronize()
+        assert torch.equal(out, first)
+        _assert_mxfp8_of(out, request)

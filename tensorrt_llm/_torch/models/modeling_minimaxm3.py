@@ -584,7 +584,7 @@ def _build_swiglu_oai_dense_mlp(
     # the fused silu_and_mul kernel runs it in one launch with an optional fp8
     # epilogue. Mirrors the routed-expert SwigluBias path; the math lives in
     # _minimax_m3_swiglu_oai.
-    return GatedMLP(
+    mlp = GatedMLP(
         hidden_size=config.hidden_size,
         intermediate_size=intermediate_size,
         bias=False,
@@ -599,8 +599,14 @@ def _build_swiglu_oai_dense_mlp(
         is_shared_expert=is_shared_expert,
         layer_idx=layer_idx,
     )
+    mlp.swiglu_mxfp8_out = _SWIGLU_MXFP8
+    return mlp
 
 
+# TRTLLM_M3_SWIGLU_MXFP8=1: the shared-expert / dense-MLP SwiGLU kernel also quantizes its output to MXFP8 for an MXFP8
+# down_proj (trtllm::silu_and_mul_mxfp8, bit-identical to down_proj's own mxfp8_quantize), so the quantize launch
+# between them goes away. Wherever down_proj would quantize its input itself (decode graphs, eager steps).
+_SWIGLU_MXFP8 = os.environ.get("TRTLLM_M3_SWIGLU_MXFP8", "0") == "1"
 # TRTLLM_M3_ROUTER_FAST_UPCAST=1: eager steps upcast the router input with a vectorized kernel.
 _ROUTER_FAST_UPCAST = os.environ.get("TRTLLM_M3_ROUTER_FAST_UPCAST", "0") == "1"
 # TRTLLM_M3_MOE_PREQUANT_OVERLAP=1: quantize the routed experts' NVFP4 input on the shared-expert
@@ -2522,10 +2528,11 @@ class MiniMaxM3Attention(Attention):
             return None
         if getattr(attn_metadata, "num_contexts", None) != 0 or q.dim() != 2:
             return None
+        # o_proj always carries the base Attention's (inactive) o_lora LoraLayer; LoRA only runs when
+        # lora_params reach the Linear, and _attention_then_o_proj never passes any, so the LoraLayer
+        # itself must not decline the request.
         quant_method = getattr(self.o_proj, "quant_method", None)
-        if getattr(self.o_proj, "lora", None) is not None or not isinstance(
-            quant_method, MXFP8LinearMethod
-        ):
+        if not isinstance(quant_method, MXFP8LinearMethod):
             return None
         # Decode-graph GEMM path only (accepts_prequantized_input also covers eager native GEMMs).
         if not quant_method.on_decode_graph_path():

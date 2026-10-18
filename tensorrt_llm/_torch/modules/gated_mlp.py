@@ -13,8 +13,8 @@ from ..cute_dsl_utils import IS_CUTLASS_DSL_RUBIN_AVAILABLE
 from ..distributed import AllReduceParams
 from ..model_config import ModelConfig
 from ..peft.lora.layer import LoraLayer, LoraModuleType
-from ..utils import Fp4QuantizedTensor
-from .linear import (Linear, TensorParallelMode, WeightMode,
+from ..utils import Fp4QuantizedTensor, MxFp8QuantizedTensor, is_torch_compiling
+from .linear import (Linear, MXFP8LinearMethod, TensorParallelMode, WeightMode,
                      WeightsLoadingConfig, is_static_nvfp4_input_eligible)
 from .swiglu import swiglu, swiglu_2in
 
@@ -65,6 +65,11 @@ class GatedMLP(nn.Module):
             swiglu_alpha) if swiglu_alpha is not None else None
         self.swiglu_beta = float(
             swiglu_beta) if swiglu_beta is not None else None
+        # Opt-in (a model sets it): when down_proj is an MXFP8 GEMM that would
+        # quantize its input with mxfp8_quantize(x, True), the SwiGLU kernel
+        # emits that MXFP8 activation itself (bitwise) and the separate
+        # quantize launch goes away. See _swiglu_mxfp8_out_ok.
+        self.swiglu_mxfp8_out = False
 
         config = config or ModelConfig()
         use_cute_dsl_bf16_gemm = getattr(config, "use_cute_dsl_bf16_gemm",
@@ -359,6 +364,28 @@ class GatedMLP(nn.Module):
             return False
         return is_static_nvfp4_input_eligible(self.down_proj)
 
+    def _swiglu_mxfp8_out_ok(self, h1: torch.Tensor) -> bool:
+        """Whether the SwiGLU may hand down_proj its MXFP8 activation directly.
+
+        Needs the opt-in ``swiglu_mxfp8_out``, a 2-D bf16 gate_up output with
+        a 32-aligned half width, and a down_proj whose MXFP8 method would run
+        mxfp8_quantize(h2, True) and then the same GEMM right now.
+        """
+        if not self.swiglu_mxfp8_out or self.activation != F.silu:
+            return False
+        if is_torch_compiling() or torch.compiler.is_compiling():
+            return False
+        if (h1.dim() != 2 or h1.dtype != torch.bfloat16 or h1.shape[1] % 64
+                or h1.stride(1) != 1):
+            return False
+        if self.down_proj.has_fp8_qdq or self.down_proj.has_w4a8_nvfp4_fp8:
+            return False
+        quant_method = getattr(self.down_proj, "quant_method", None)
+        return isinstance(
+            quant_method,
+            MXFP8LinearMethod) and quant_method.accepts_prequantized_input(
+                self.down_proj)
+
     def _can_fuse_swiglu_fp8_quant(self) -> bool:
         """Check whether down projection can consume fused SwiGLU FP8 output."""
         # silu_and_mul_fp8_quantize_1x128_packed_ue8m0 takes the limit but has
@@ -495,6 +522,12 @@ class GatedMLP(nn.Module):
                 use_r128c4_layout = get_sm_version() == 107
                 h2 = torch.ops.trtllm.silu_and_mul_fp8_quantize_1x128_packed_ue8m0(
                     h1, self.swiglu_limit, use_r128c4_layout)
+            elif self._swiglu_mxfp8_out_ok(h1):
+                fp8, sf = torch.ops.trtllm.silu_and_mul_mxfp8(
+                    h1, self.swiglu_limit, self.swiglu_alpha, self.swiglu_beta)
+                h2 = MxFp8QuantizedTensor(fp8_tensor=fp8,
+                                          scaling_factor=sf,
+                                          is_sf_swizzled=True)
             else:
                 h2 = self._apply_activation(h1)
 

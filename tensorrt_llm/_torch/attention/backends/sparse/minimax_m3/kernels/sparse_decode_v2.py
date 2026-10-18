@@ -27,6 +27,7 @@ _COUNTERS: dict[int, torch.Tensor] = {}
 _COUNTER_CAPACITY = 1 << 16
 _SM_COUNT: dict[int, int] = {}
 _EMPTY_DBG: dict = {}
+_EMPTY_U8: dict = {}
 
 SPARSE_BLOCK_SIZE = 128
 HEAD_DIM = 128
@@ -110,6 +111,32 @@ def _sm_count(device: torch.device) -> int:
     if idx not in _SM_COUNT:
         _SM_COUNT[idx] = torch.cuda.get_device_properties(idx).multi_processor_count
     return _SM_COUNT[idx]
+
+
+def _mxfp8_out_request(output: torch.Tensor):
+    """The open MXFP8 output request (modules/mxfp8_triton.py) for exactly ``output``, or None.
+
+    The kernel then also writes the E4M3 bytes and 128x4-swizzled UE8M0 scales of its bf16 output
+    (bitwise mxfp8_quantize(output, True)), and o_proj skips its quantize.
+    """
+    try:
+        from tensorrt_llm._torch.modules.mxfp8_triton import current_mxfp8_output_request
+    except ImportError:  # pragma: no cover - standalone use
+        return None
+    if torch.compiler.is_compiling():
+        return None
+    request = current_mxfp8_output_request()
+    if (
+        request is None
+        or output.dim() != 3
+        or output.shape[2] != HEAD_DIM
+        or not request.matches(output)
+        or request.fp8.shape[1] != output.shape[1] * HEAD_DIM
+        or not request.fp8.is_contiguous()
+        or not request.sf.is_contiguous()
+    ):
+        return None
+    return request
 
 
 def _scratch(shape, dtype, name):
@@ -378,6 +405,7 @@ def minimax_m3_sparse_attn_decode_v2(
     ext = _load_ext()
     num_kv_heads = int(k_paged.shape[1])
     if cfg.get("sk"):
+        request = _mxfp8_out_request(output)
         _launch_sk(
             ext,
             cfg,
@@ -395,7 +423,10 @@ def minimax_m3_sparse_attn_decode_v2(
             decode_query_len,
             sm_scale,
             _debug,
+            mxfp8=request,
         )
+        if request is not None:
+            request.written = True
         return
     nsplit = int(cfg["nsplit"])
     ntiles = 4 if cfg.get("umma") else int(cfg["ntiles"])  # UMMA: one M=64 tile
@@ -414,6 +445,13 @@ def minimax_m3_sparse_attn_decode_v2(
         part_o = output
         part_ml = output
     pdl = os.environ.get("TRTLLM_ENABLE_PDL", "1") == "1"
+    # MXFP8 epilogue: the mma.sync kernel's direct and global-partials outputs (not UMMA, not the cluster merge).
+    request = (
+        _mxfp8_out_request(output)
+        if not cfg.get("umma") and int(cfg["wpt"]) in (2, 4) and not cluster_merge
+        else None
+    )
+    empty = _EMPTY_U8.setdefault(q.device, torch.empty(0, dtype=torch.uint8, device=q.device))
     ext.sparse_decode_v2(
         q,
         k_paged.view(torch.uint8),
@@ -440,7 +478,11 @@ def minimax_m3_sparse_attn_decode_v2(
         float(sm_scale) * math.log2(math.e),
         pdl,
         cluster_merge,
+        request.fp8.view(torch.uint8) if request is not None else empty,
+        request.sf if request is not None else empty,
     )
+    if request is not None:
+        request.written = True
 
 
 def _launch_sk(
@@ -460,8 +502,12 @@ def _launch_sk(
     decode_query_len,
     sm_scale,
     debug=None,
+    mxfp8=None,
 ) -> None:
-    """Stream-K launch: `grid` (default: one per SM) persistent CTAs; scratch from the buffer arena."""
+    """Stream-K launch: `grid` (default: one per SM) persistent CTAs; scratch from the buffer arena.
+
+    ``mxfp8`` (an Mxfp8OutputRequest for ``output``) also gets the MXFP8 form of the output.
+    """
     num_reqs = int(seq_lens.shape[0])
     groups = num_reqs * int(k_paged.shape[1])
     ntiles = int(cfg["ntiles"])
@@ -478,6 +524,7 @@ def _launch_sk(
     u_cnt = unions[4 * per : 4 * per + groups]
     u_wsum = unions[4 * per + groups : 4 * per + 2 * groups]
     pdl = os.environ.get("TRTLLM_ENABLE_PDL", "1") == "1"
+    empty = _EMPTY_U8.setdefault(q.device, torch.empty(0, dtype=torch.uint8, device=q.device))
     ext.sparse_decode_v2_sk(
         q,
         k_paged.view(torch.uint8),
@@ -509,6 +556,8 @@ def _launch_sk(
         grid,
         float(sm_scale) * math.log2(math.e),
         pdl,
+        mxfp8.fp8.view(torch.uint8) if mxfp8 is not None else empty,
+        mxfp8.sf if mxfp8 is not None else empty,
     )
 
 

@@ -12,7 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""MiniMax-M3: the layer-boundary AllReduce hands the next layer's QKV GEMM its MXFP8 input (plumbing)."""
+"""MiniMax-M3 MXFP8 activation handoffs: AllReduce -> QKV / shared expert, attention -> o_proj."""
 
 from types import SimpleNamespace
 
@@ -26,6 +26,8 @@ from tensorrt_llm._torch.models.modeling_minimaxm3 import (
     MiniMaxM3DecoderLayer,
     MiniMaxM3MoE,
 )
+from tensorrt_llm._torch.modules.linear import MXFP8LinearMethod
+from tensorrt_llm._torch.peft.lora.layer import LoraLayer, LoraModuleType
 from tensorrt_llm._torch.utils import MxFp8QuantizedTensor
 from tensorrt_llm.functional import AllReduceStrategy
 
@@ -146,3 +148,68 @@ def test_shared_expert_mxfp8_gating(monkeypatch: pytest.MonkeyPatch) -> None:
     assert _moe_layer(None)._mxfp8_shared_expert_moe(hidden) is None  # dense layers (no MoE)
     assert _moe_layer(_Moe(False))._mxfp8_shared_expert_moe(hidden) is None
     assert _moe_layer(accepting)._mxfp8_shared_expert_moe(hidden.unsqueeze(0)) is None
+
+
+class _DecodeGraphMxfp8(MXFP8LinearMethod):
+    def __init__(self, on_graph: bool) -> None:
+        self.on_graph = on_graph
+
+    def on_decode_graph_path(self) -> bool:
+        return self.on_graph
+
+
+def _sparse_attention(o_proj_method, with_o_lora=True) -> MiniMaxM3Attention:
+    attn = _attention()
+    attn.is_sparse_attention_layer = True
+    attn.attn = m3.MiniMaxM3MsaSparseAttention.__new__(m3.MiniMaxM3MsaSparseAttention)
+    attn.register_to_config = False
+    attn.attn_activation_dtype = torch.bfloat16
+    attn.num_heads, attn.head_dim = 2, 64
+    # The base Attention always builds o_proj with its o_lora LoraLayer (inactive without lora_params).
+    attn.o_proj = SimpleNamespace(
+        quant_method=o_proj_method,
+        lora=LoraLayer([LoraModuleType.ATTENTION_DENSE], [128]) if with_o_lora else None,
+    )
+    return attn
+
+
+def test_attn_out_mxfp8_request_gating(monkeypatch: pytest.MonkeyPatch) -> None:
+    q = torch.zeros(3, 2 * 64, dtype=torch.bfloat16)
+    decode = SimpleNamespace(num_contexts=0)
+    monkeypatch.setattr(m3, "_ATTN_OUT_MXFP8", False)
+    assert _sparse_attention(_DecodeGraphMxfp8(True))._attn_out_mxfp8_request(q, decode) is None
+    monkeypatch.setattr(m3, "_ATTN_OUT_MXFP8", True)
+    for with_o_lora in (True, False):  # the inactive o_lora must not decline the request
+        attn = _sparse_attention(_DecodeGraphMxfp8(True), with_o_lora=with_o_lora)
+        request = attn._attn_out_mxfp8_request(q, decode)
+        assert request is not None
+        assert tuple(request.fp8.shape) == (3, 128) and request.fp8.dtype == torch.float8_e4m3fn
+        assert not request.written and request.out_ptr is None
+    attn = _sparse_attention(_DecodeGraphMxfp8(True))
+    assert attn._attn_out_mxfp8_request(q, SimpleNamespace(num_contexts=1)) is None  # mixed step
+    assert attn._attn_out_mxfp8_request(q.view(3, 2, 64), decode) is None
+    assert _sparse_attention(_DecodeGraphMxfp8(False))._attn_out_mxfp8_request(q, decode) is None
+    assert _sparse_attention(object())._attn_out_mxfp8_request(q, decode) is None  # not MXFP8
+    attn = _sparse_attention(_DecodeGraphMxfp8(True))
+    attn.attn_activation_dtype = torch.float16
+    assert attn._attn_out_mxfp8_request(q, decode) is None
+    attn = _sparse_attention(_DecodeGraphMxfp8(True))
+    attn.is_sparse_attention_layer = False
+    assert attn._attn_out_mxfp8_request(q, decode) is None
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_swiglu_mxfp8_flag_reaches_the_mlps(monkeypatch: pytest.MonkeyPatch, enabled: bool) -> None:
+    from transformers import PretrainedConfig
+
+    from tensorrt_llm._torch.model_config import ModelConfig
+
+    monkeypatch.setattr(m3, "_SWIGLU_MXFP8", enabled)
+    pretrained = PretrainedConfig(hidden_size=64)
+    pretrained.torch_dtype = torch.bfloat16
+    config = ModelConfig(pretrained_config=pretrained, skip_create_weights_in_init=True)
+    for shared in (True, False):
+        mlp = m3._build_swiglu_oai_dense_mlp(
+            model_config=config, intermediate_size=128, layer_idx=0, is_shared_expert=shared
+        )
+        assert mlp.swiglu_mxfp8_out is enabled

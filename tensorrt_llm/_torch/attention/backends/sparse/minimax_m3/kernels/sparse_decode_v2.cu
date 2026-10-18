@@ -79,6 +79,13 @@ struct Params
     int* u_wcum; // [groups][kMaxCand] inclusive prefix of the page weights within the group
     int* u_wsum; // [groups] total page weight of the group
     int ngroups;
+    // Optional MXFP8 epilogue (stream-K schedule only; null elsewhere): the E4M3 bytes ([rows][q8_sn], columns
+    // head * 128 + dim) and the 128x4-swizzled UE8M0 scales (sf_ktiles tiles of four 32-column blocks) of the
+    // bf16 output, i.e. what mxfp8_quantize(out, swizzled) gives for it.
+    uint8_t* q8;
+    uint8_t* sf8;
+    int64_t q8_sn;
+    int sf_ktiles;
 };
 
 // ------------------------------------------------------------------ PTX bits
@@ -225,6 +232,100 @@ __device__ __forceinline__ float ex2(float x)
     float y;
     asm("ex2.approx.ftz.f32 %0, %1;" : "=f"(y) : "f"(x));
     return y;
+}
+
+// ------------------------------------------------------------------ MXFP8 epilogue
+// The instruction sequence of cvt_warp_fp16_to_mxfp8 (cpp/tensorrt_llm/kernels/quantization.cuh) on the bf16
+// output, so the bytes equal torch.ops.trtllm.mxfp8_quantize(out, True):
+//   sf = cvt.rp.satfinite.ue8m0(amax *ftz rcp.approx.ftz(448)), scale = amax != 0 ? rcp.approx.ftz(float(sf)) : 0,
+//   e4m3 = cvt.rn.satfinite.e4m3(x *ftz scale).
+__device__ __forceinline__ float rcp_approx_ftz(float x)
+{
+    float y;
+    asm("rcp.approx.ftz.f32 %0, %1;" : "=f"(y) : "f"(x));
+    return y;
+}
+
+__device__ __forceinline__ float mul_ftz(float a, float b)
+{
+    float y;
+    asm("mul.ftz.f32 %0, %1, %2;" : "=f"(y) : "f"(a), "f"(b));
+    return y;
+}
+
+__device__ __forceinline__ uint32_t ue8m0_rp(float x)
+{
+    uint16_t h;
+    asm("cvt.rp.satfinite.ue8m0x2.f32 %0, 0f00000000, %1;" : "=h"(h) : "f"(x));
+    return h & 0xffu;
+}
+
+// static_cast<float>(__nv_fp8_e8m0): 2^(code - 127); code 0 is the subnormal 2^-127.
+__device__ __forceinline__ float ue8m0_to_f32(uint32_t code)
+{
+    return __uint_as_float(code == 0 ? 0x00400000u : code << 23);
+}
+
+__device__ __forceinline__ uint32_t e4m3x2(float lo, float hi)
+{
+    uint16_t h;
+    asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(h) : "f"(hi), "f"(lo));
+    return h;
+}
+
+// Byte offset of the scale of (row m, 32-column block k) in the 128x4 swizzled layout (get_sf_out_offset_128x4).
+__device__ __forceinline__ int64_t sf_offset_128x4(int64_t m, int k, int num_k_tiles)
+{
+    return (m / 128) * static_cast<int64_t>(num_k_tiles) * 512 + (k / 4) * 512 + (m % 32) * 16 + ((m % 128) / 32) * 4
+        + (k % 4);
+}
+
+// The MXFP8 form of one thread's NW bf16x2 output words (2 * NW consecutive columns from col0 of output row
+// `row`). The 32 / (2 * NW) threads of a 32-column block are consecutive lanes of one quad (t = lane & 3) and
+// share their amax over shuffles, so every lane of the warp must call this; only `valid` lanes store.
+template <int NW>
+__device__ __forceinline__ void mxfp8_epilogue(
+    Params const& p, uint32_t const (&w)[NW], int64_t row, int col0, bool valid)
+{
+    constexpr int kVals = 2 * NW;
+    constexpr int kTpb = 32 / kVals;
+    static_assert(kVals * kTpb == 32 && kTpb <= 4, "a 32-column block spans one to four lanes of a quad");
+    float v[kVals];
+    float amax = 0.f;
+#pragma unroll
+    for (int i = 0; i < NW; ++i)
+    {
+        v[2 * i] = __uint_as_float(w[i] << 16);
+        v[2 * i + 1] = __uint_as_float(w[i] & 0xffff0000u);
+        amax = fmaxf(amax, fmaxf(fabsf(v[2 * i]), fabsf(v[2 * i + 1])));
+    }
+#pragma unroll
+    for (int o = 1; o < kTpb; o <<= 1)
+        amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o));
+    uint32_t const code = ue8m0_rp(mul_ftz(amax, rcp_approx_ftz(448.f)));
+    float const scale = amax != 0.f ? rcp_approx_ftz(ue8m0_to_f32(code)) : 0.f;
+    if (!valid)
+        return;
+    uint32_t q[kVals / 4];
+#pragma unroll
+    for (int i = 0; i < kVals / 4; ++i)
+    {
+        q[i] = e4m3x2(mul_ftz(v[4 * i], scale), mul_ftz(v[4 * i + 1], scale))
+            | (e4m3x2(mul_ftz(v[4 * i + 2], scale), mul_ftz(v[4 * i + 3], scale)) << 16);
+    }
+    uint8_t* dst = p.q8 + row * p.q8_sn + col0;
+    if constexpr (kVals == 8)
+    {
+        *reinterpret_cast<uint2*>(dst) = make_uint2(q[0], q[1]);
+    }
+    else
+    {
+#pragma unroll
+        for (int i = 0; i < kVals / 16; ++i)
+            reinterpret_cast<uint4*>(dst)[i] = make_uint4(q[4 * i], q[4 * i + 1], q[4 * i + 2], q[4 * i + 3]);
+    }
+    if ((threadIdx.x & (kTpb - 1)) == 0)
+        p.sf8[sf_offset_128x4(row, col0 >> 5, p.sf_ktiles)] = static_cast<uint8_t>(code);
 }
 
 __device__ __forceinline__ void mma16816(float* c, uint32_t const* a, uint32_t b0, uint32_t b1)
@@ -942,7 +1043,8 @@ __global__ void __launch_bounds__(kMaxThreads, kMinBlocks) sparse_decode_v2_kern
         for (int rr = 0; rr < 2; ++rr)
         {
             bool const rv = rr ? rv1 : rv0;
-            if (!rv)
+            // The MXFP8 epilogue shuffles within quads (rv is uniform over a quad): all lanes go on.
+            if (!rv && p.q8 == nullptr)
                 continue;
             float const sc = rr ? sc1 : sc0;
             uint32_t w[C::kNP];
@@ -953,6 +1055,10 @@ __global__ void __launch_bounds__(kMaxThreads, kMinBlocks) sparse_decode_v2_kern
                 w[C::kNP / 2 + c] = pack_bf2(o[2 * c][2 * rr + 1] * sc, o[2 * c + 1][2 * rr + 1] * sc);
             }
             int const jj = rr ? j1 : j0, hh = rr ? hh1 : hh0;
+            if (p.q8 != nullptr)
+                mxfp8_epilogue(p, w, (int64_t) (r * p.dql + jj), (h * p.group + hh) * 128 + dim0, rv);
+            if (!rv)
+                continue;
             uint4* dst = reinterpret_cast<uint4*>(
                 p.out + (int64_t) (r * p.dql + jj) * p.o_sn + (int64_t) (h * p.group + hh) * p.o_sh + dim0);
 #pragma unroll
@@ -1090,7 +1196,8 @@ __global__ void __launch_bounds__(kMaxThreads, kMinBlocks) sparse_decode_v2_kern
 #pragma unroll
         for (int rr = 0; rr < 2; ++rr)
         {
-            if (!(rr ? rv1 : rv0))
+            bool const rv = rr ? rv1 : rv0;
+            if (!rv && p.q8 == nullptr) // the MXFP8 epilogue needs every lane (see above)
                 continue;
             float const sc = W[rr] > 0.f ? v_gs / W[rr] : 0.f;
             uint32_t w[C::kNP];
@@ -1098,6 +1205,10 @@ __global__ void __launch_bounds__(kMaxThreads, kMinBlocks) sparse_decode_v2_kern
             for (int c = 0; c < C::kNP; ++c)
                 w[c] = pack_bf2(A[rr][2 * c] * sc, A[rr][2 * c + 1] * sc);
             int const jj = rr ? j1 : j0, hh = rr ? hh1 : hh0;
+            if (p.q8 != nullptr)
+                mxfp8_epilogue(p, w, (int64_t) (r * p.dql + jj), (h * p.group + hh) * 128 + dim0, rv);
+            if (!rv)
+                continue;
             uint4* dst = reinterpret_cast<uint4*>(
                 p.out + (int64_t) (r * p.dql + jj) * p.o_sn + (int64_t) (h * p.group + hh) * p.o_sh + dim0);
 #pragma unroll
@@ -2923,6 +3034,16 @@ __global__ void __launch_bounds__(128) sparse_decode_v2_union_kernel(const __gri
             uint4* dst = reinterpret_cast<uint4*>(
                 p.out + (int64_t) (r * p.dql + jj) * p.o_sn + (int64_t) (h * p.group + hh) * p.o_sh);
             dst[ch] = make_uint4(0u, 0u, 0u, 0u);
+            if (p.q8 != nullptr)
+            {
+                // MXFP8 of zeros: zero bytes and the scale code of amax 0.
+                int64_t const orow = (int64_t) (r * p.dql + jj);
+                int const ocol = (h * p.group + hh) * 128 + ch * 8;
+                *reinterpret_cast<uint2*>(p.q8 + orow * p.q8_sn + ocol) = make_uint2(0u, 0u);
+                if ((ch & 3) == 0)
+                    p.sf8[sf_offset_128x4(orow, ocol >> 5, p.sf_ktiles)]
+                        = static_cast<uint8_t>(ue8m0_rp(mul_ftz(0.f, rcp_approx_ftz(448.f))));
+            }
         }
     }
     griddep_launch();
@@ -3475,7 +3596,8 @@ __global__ void __launch_bounds__(kMaxThreads, kMinBlocks) sparse_decode_v2_sk_k
             for (int rr = 0; rr < 2; ++rr)
             {
                 bool const rv = rr ? rv1 : rv0;
-                if (!rv)
+                // The MXFP8 epilogue shuffles within quads (rv is uniform over a quad): all lanes go on.
+                if (!rv && p.q8 == nullptr)
                     continue;
                 float const sc = rr ? sc1 : sc0;
                 uint32_t w[C::kNP];
@@ -3486,6 +3608,10 @@ __global__ void __launch_bounds__(kMaxThreads, kMinBlocks) sparse_decode_v2_sk_k
                     w[C::kNP / 2 + c] = pack_bf2(o[2 * c][2 * rr + 1] * sc, o[2 * c + 1][2 * rr + 1] * sc);
                 }
                 int const jj = rr ? j1 : j0, hh = rr ? hh1 : hh0;
+                if (p.q8 != nullptr)
+                    mxfp8_epilogue(p, w, (int64_t) (r * p.dql + jj), (h * p.group + hh) * 128 + dim0, rv);
+                if (!rv)
+                    continue;
                 uint4* dst = reinterpret_cast<uint4*>(
                     p.out + (int64_t) (r * p.dql + jj) * p.o_sn + (int64_t) (h * p.group + hh) * p.o_sh + dim0);
 #pragma unroll
@@ -3615,7 +3741,8 @@ __global__ void __launch_bounds__(kMaxThreads, kMinBlocks) sparse_decode_v2_sk_k
 #pragma unroll
                 for (int rr = 0; rr < 2; ++rr)
                 {
-                    if (!(rr ? rv1 : rv0))
+                    bool const rv = rr ? rv1 : rv0;
+                    if (!rv && p.q8 == nullptr) // the MXFP8 epilogue needs every lane (see above)
                         continue;
                     float const sc = W[rr] > 0.f ? v_gs / W[rr] : 0.f;
                     uint32_t w[C::kNP];
@@ -3623,6 +3750,10 @@ __global__ void __launch_bounds__(kMaxThreads, kMinBlocks) sparse_decode_v2_sk_k
                     for (int c = 0; c < C::kNP; ++c)
                         w[c] = pack_bf2(A[rr][2 * c] * sc, A[rr][2 * c + 1] * sc);
                     int const jj = rr ? j1 : j0, hh = rr ? hh1 : hh0;
+                    if (p.q8 != nullptr)
+                        mxfp8_epilogue(p, w, (int64_t) (r * p.dql + jj), (h * p.group + hh) * 128 + dim0, rv);
+                    if (!rv)
+                        continue;
                     uint4* dst = reinterpret_cast<uint4*>(
                         p.out + (int64_t) (r * p.dql + jj) * p.o_sn + (int64_t) (h * p.group + hh) * p.o_sh + dim0);
 #pragma unroll
@@ -3727,11 +3858,33 @@ void launch_impl(Params const& p, int grid, int threads, int smem, bool pdl, cud
 
 } // namespace sdv2
 
+// Non-empty q8 ([rows, heads * 128] uint8, contiguous) and sf8 (128x4-swizzled UE8M0 scales,
+// swizzled_sf_numel(rows, heads * 128) bytes) make the kernel also write the MXFP8 form of its output.
+void set_mxfp8_out(sdv2::Params& p, torch::Tensor const& out, torch::Tensor const& q8, torch::Tensor const& sf8)
+{
+    if (q8.numel() == 0)
+        return;
+    int64_t const rows = out.size(0), cols = out.size(1) * out.size(2);
+    TORCH_CHECK(out.is_contiguous() && out.size(2) == 128, "sparse_decode_v2: MXFP8 output needs a contiguous out");
+    TORCH_CHECK(q8.scalar_type() == at::ScalarType::Byte && q8.dim() == 2 && q8.size(0) == rows && q8.size(1) == cols
+            && q8.is_contiguous(),
+        "sparse_decode_v2: q8 must be a contiguous uint8 [rows, heads * 128]");
+    int64_t const ktiles = (cols / 32 + 3) / 4;
+    TORCH_CHECK(sf8.scalar_type() == at::ScalarType::Byte && sf8.is_contiguous()
+            && sf8.numel() >= (rows + 127) / 128 * 128 * ktiles * 4,
+        "sparse_decode_v2: sf8 must hold the 128x4-swizzled scales");
+    p.q8 = q8.data_ptr<uint8_t>();
+    p.sf8 = sf8.data_ptr<uint8_t>();
+    p.q8_sn = cols;
+    p.sf_ktiles = static_cast<int>(ktiles);
+}
+
+// q8 / sf8: see set_mxfp8_out (mma.sync configurations, wpt 2 / 4, without the cluster merge).
 void sparse_decode_v2(torch::Tensor q, torch::Tensor k, torch::Tensor v, torch::Tensor ks, torch::Tensor vs,
     torch::Tensor k_gs, torch::Tensor v_gs, torch::Tensor topk, torch::Tensor bt, torch::Tensor seq_lens,
     torch::Tensor out, torch::Tensor part_o, torch::Tensor part_ml, torch::Tensor counters, torch::Tensor dbg,
     int64_t dql, int64_t nsplit, int64_t ntiles, int64_t wpt, int64_t stages, double sm_scale_log2e, bool pdl,
-    bool cluster_merge)
+    bool cluster_merge, torch::Tensor q8, torch::Tensor sf8)
 {
     using namespace sdv2;
     const at::cuda::CUDAGuard guard(q.device());
@@ -3782,6 +3935,9 @@ void sparse_decode_v2(torch::Tensor q, torch::Tensor k, torch::Tensor v, torch::
     p.cluster_merge = cluster_merge ? 1 : 0;
     p.kv_fused = (p.v == p.k + kKvBytes && p.v_sb == p.k_sb && p.v_sh == p.k_sh) ? 1 : 0;
     p.sc_fused = (p.vs == p.ks + kScBytes && p.vs_sb == p.ks_sb && p.vs_sh == p.ks_sh) ? 1 : 0;
+    TORCH_CHECK(q8.numel() == 0 || ((wpt == 2 || wpt == 4) && !(cluster_merge && nsplit > 1)),
+        "sparse_decode_v2: the MXFP8 output needs the mma.sync kernel without the cluster merge");
+    set_mxfp8_out(p, out, q8, sf8);
 
     int const threads = wpt <= 0 ? 512 : p.ntiles * static_cast<int>(wpt) * 32;
     int const grid = num_reqs * p.num_kvh * p.nsplit;
@@ -3821,13 +3977,13 @@ void sparse_decode_v2(torch::Tensor q, torch::Tensor k, torch::Tensor v, torch::
 
 // Stream-K schedule (see sparse_decode_v2_sk_kernel): prep kernel for the per-group unions, then
 // `grid` persistent CTAs. part_o / part_ml need (grid + groups) * rows_pad rows, u_blk / u_page /
-// u_mask / u_wcum groups * 64 ints, u_cnt / u_wsum groups ints.
+// u_mask / u_wcum groups * 64 ints, u_cnt / u_wsum groups ints. q8 / sf8: see set_mxfp8_out.
 void sparse_decode_v2_sk(torch::Tensor q, torch::Tensor k, torch::Tensor v, torch::Tensor ks, torch::Tensor vs,
     torch::Tensor k_gs, torch::Tensor v_gs, torch::Tensor topk, torch::Tensor bt, torch::Tensor seq_lens,
     torch::Tensor out, torch::Tensor part_o, torch::Tensor part_ml, torch::Tensor counters, torch::Tensor u_blk,
     torch::Tensor u_page, torch::Tensor u_mask, torch::Tensor u_cnt, torch::Tensor u_wcum, torch::Tensor u_wsum,
     torch::Tensor dbg, int64_t dql, int64_t ntiles, int64_t wpt, int64_t stages, int64_t grid, double sm_scale_log2e,
-    bool pdl)
+    bool pdl, torch::Tensor q8, torch::Tensor sf8)
 {
     using namespace sdv2;
     const at::cuda::CUDAGuard guard(q.device());
@@ -3885,6 +4041,7 @@ void sparse_decode_v2_sk(torch::Tensor q, torch::Tensor k, torch::Tensor v, torc
     p.u_wcum = u_wcum.data_ptr<int>();
     p.u_wsum = u_wsum.data_ptr<int>();
     p.ngroups = num_reqs * p.num_kvh;
+    set_mxfp8_out(p, out, q8, sf8);
 
     int const threads = p.ntiles * static_cast<int>(wpt) * 32;
     int const smem = SmemLayout(p.stages, p.ntiles, static_cast<int>(wpt), 1, p.dql * p.group).total;

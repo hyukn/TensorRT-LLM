@@ -48,7 +48,9 @@ if IS_FLASHINFER_AVAILABLE:
     from flashinfer.fp4_quantization import nvfp4_quantize as _flashinfer_nvfp4_quantize
 
 from ..modules.multi_stream_utils import do_multi_stream
-from ..modules.swiglu import silu_and_mul_2in_kernel, silu_and_mul_kernel
+from ..modules.mxfp8_triton import swizzled_sf_numel
+from ..modules.swiglu import (silu_and_mul_2in_kernel, silu_and_mul_kernel,
+                              silu_and_mul_mxfp8_kernel)
 from ..utils import (ActivationType, deep_gemm_gen_tuning_buckets,
                      deep_gemm_jit_warmup_buckets, fp4_scale_infer_shape,
                      get_last_power_of_2_num_tokens_buckets,
@@ -2649,6 +2651,59 @@ def _(
 
     o_dtype = dtype or x.dtype
     return x.new_empty((b, d), dtype=o_dtype)
+
+
+@torch.library.custom_op("trtllm::silu_and_mul_mxfp8", mutates_args=())
+def silu_and_mul_mxfp8(
+        x: torch.Tensor,
+        swiglu_limit: Optional[float] = None,
+        swiglu_alpha: Optional[float] = None,
+        swiglu_beta: Optional[float] = None
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """``mxfp8_quantize(silu_and_mul(x, ...), True)`` in one kernel, bit for bit.
+
+    Returns (E4M3 [b, d], 128x4-swizzled UE8M0 scales as uint8) for an MXFP8
+    GEMM; d = x.shape[1] // 2 must be a multiple of 32.
+    """
+    b, n = x.shape
+    assert n % 64 == 0, "silu_and_mul_mxfp8: the output width must be a multiple of 32"
+    d = n // 2
+    q = torch.empty((b, d), dtype=torch.float8_e4m3fn, device=x.device)
+    sf = torch.empty((swizzled_sf_numel(b, d), ),
+                     dtype=torch.uint8,
+                     device=x.device)
+
+    def grid(meta: Mapping[str, int]) -> tuple[int, int]:
+        return (b, triton.cdiv(d, meta["BLOCK_SIZE"]))
+
+    silu_and_mul_mxfp8_kernel[grid](
+        q_ptr=q.view(torch.uint8),
+        sf_ptr=sf,
+        x_ptr=x,
+        x_stride=x.stride(0),
+        q_stride=q.stride(0),
+        d=d,
+        num_k_tiles=(d // 32 + 3) // 4,
+        swiglu_limit=swiglu_limit or 0.0,
+        swiglu_alpha=swiglu_alpha if swiglu_alpha is not None else 1.0,
+        swiglu_beta=swiglu_beta if swiglu_beta is not None else 0.0,
+        BLOCK_SIZE=1024,
+        HAS_SWIGLU_LIMIT=swiglu_limit is not None and swiglu_limit > 0.0,
+    )
+    return q, sf
+
+
+@silu_and_mul_mxfp8.register_fake
+def _(
+    x: torch.Tensor,
+    swiglu_limit: Optional[float] = None,
+    swiglu_alpha: Optional[float] = None,
+    swiglu_beta: Optional[float] = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    b, n = x.shape
+    d = n // 2
+    return (x.new_empty((b, d), dtype=torch.float8_e4m3fn),
+            x.new_empty((swizzled_sf_numel(b, d), ), dtype=torch.uint8))
 
 
 # Launch parameters for silu_and_mul_2in_kernel, keyed on SM version, as
