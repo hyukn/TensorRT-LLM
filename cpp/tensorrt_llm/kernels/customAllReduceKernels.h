@@ -85,6 +85,9 @@ enum class AllReduceFusionOp : int8_t
     RESIDUAL_RMS_NORM_OUT_QUANT_MXFP8 = 10,
     // MNNVL only: AllReduce + residual + RMSNorm, emitting the norm output and an fp32 copy of it.
     RESIDUAL_RMS_NORM_OUT_F32 = 11,
+    // MNNVL only: RESIDUAL_RMS_NORM_OUT_F32 plus the NVFP4 (linear scales, global scale) and MXFP8 (swizzled scales)
+    // quantizations of the norm output.
+    RESIDUAL_RMS_NORM_OUT_F32_NVFP4_MXFP8 = 12,
 };
 
 inline std::ostream& operator<<(std::ostream& os, AllReduceFusionOp op)
@@ -105,6 +108,7 @@ inline std::ostream& operator<<(std::ostream& os, AllReduceFusionOp op)
     case AllReduceFusionOp::RMS_NORM: os << "RMS_NORM"; break;
     case AllReduceFusionOp::RESIDUAL_RMS_NORM_OUT_QUANT_MXFP8: os << "RESIDUAL_RMS_NORM_OUT_QUANT_MXFP8"; break;
     case AllReduceFusionOp::RESIDUAL_RMS_NORM_OUT_F32: os << "RESIDUAL_RMS_NORM_OUT_F32"; break;
+    case AllReduceFusionOp::RESIDUAL_RMS_NORM_OUT_F32_NVFP4_MXFP8: os << "RESIDUAL_RMS_NORM_OUT_F32_NVFP4_MXFP8"; break;
     default: os << "UNKNOWN"; break;
     }
     return os;

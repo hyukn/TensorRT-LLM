@@ -230,7 +230,8 @@ inline bool requiresTwoAccessScaleGroup(ar_fusion::AllReduceFusionPattern patter
 // 4 for MXFP8 (32 elements), 1 otherwise.
 inline int scaleGroupAccesses(ar_fusion::AllReduceFusionPattern pattern)
 {
-    if (pattern == ar_fusion::AllReduceFusionPattern::kARResidualRMSNormOutMXFP8Quant)
+    if (pattern == ar_fusion::AllReduceFusionPattern::kARResidualRMSNormOutMXFP8Quant
+        || pattern == ar_fusion::AllReduceFusionPattern::kARResidualRMSNormOutF32Fp4Mxfp8)
     {
         return 4;
     }
@@ -361,7 +362,25 @@ struct MnnvlAllReduceKernelParams
     bool waitForResults;
     QuantizationSFLayout layout;
     T const* shardAddPtr; // optional second local partial, added before the reduction
+    // kARResidualRMSNormOutF32Fp4Mxfp8 only (see AllReduceFusionParams), set by setMoeQuantOutputs.
+    void* fp4OutPtr = nullptr;
+    void* fp4ScaleOutPtr = nullptr;
+    float const* fp4ScaleFactorPtr = nullptr;
+    QuantizationSFLayout fp4Layout = QuantizationSFLayout::LINEAR;
+    void* mxfp8OutPtr = nullptr;
+    void* mxfp8ScaleOutPtr = nullptr;
 };
+
+template <typename T>
+inline void setMoeQuantOutputs(MnnvlAllReduceKernelParams<T>& kernelParams, AllReduceFusionParams const& params)
+{
+    kernelParams.fp4OutPtr = params.fp4Out;
+    kernelParams.fp4ScaleOutPtr = params.fp4ScaleOut;
+    kernelParams.fp4ScaleFactorPtr = params.fp4ScaleFactor;
+    kernelParams.fp4Layout = params.fp4Layout;
+    kernelParams.mxfp8OutPtr = params.mxfp8Out;
+    kernelParams.mxfp8ScaleOutPtr = params.mxfp8ScaleOut;
+}
 
 template <typename PackedType, typename T>
 inline __device__ void sanitizeLamportPayload(PackedVec<PackedType, T>& value)
@@ -534,6 +553,20 @@ inline __device__ PackedVec<PackedType, T> reduceOneshotDeterministicFastPath(
     return reduceOneshotDeterministic<WorldSize, LocalRank, T, PackedType, kELTS_PER_THREAD>(remoteValues, localValue);
 }
 
+// The NVFP4 and MXFP8 conversions of kARResidualRMSNormOutF32Fp4Mxfp8 as out-of-line calls: inlining both into the
+// unrolled rmsNormLamport kernels trips a ptxas internal compiler error (C7907). Same instructions, so same bytes.
+template <typename T>
+__device__ __noinline__ uint32_t moeQuantFp4(tensorrt_llm::kernels::PackedVec<T> packVal, float sfScale, uint8_t* sfOut)
+{
+    return cvt_warp_fp16_to_fp4<T, 16, false>(packVal, sfScale, sfOut);
+}
+
+template <typename T>
+__device__ __noinline__ uint64_t moeQuantMxfp8(tensorrt_llm::kernels::PackedVec<T> packVal, uint8_t* sfOut)
+{
+    return cvt_warp_fp16_to_mxfp8<T, 32>(packVal, sfOut);
+}
+
 template <ar_fusion::AllReduceFusionPattern Pattern, typename T, typename PackedType, int kELTS_PER_THREAD>
 inline __device__ void quantizeEpilogue(PackedVec<PackedType, T> const& value,
     MnnvlAllReduceKernelParams<T> const& params, int packedAccessIdx, int accessIdInToken, int token)
@@ -575,6 +608,38 @@ inline __device__ void quantizeEpilogue(PackedVec<PackedType, T> const& value,
             out[i] = make_float4(cuda_cast<float, T>(value.elements[4 * i]),
                 cuda_cast<float, T>(value.elements[4 * i + 1]), cuda_cast<float, T>(value.elements[4 * i + 2]),
                 cuda_cast<float, T>(value.elements[4 * i + 3]));
+        }
+    }
+    else if constexpr (ar_fusion::GetQuantType<Pattern> == ar_fusion::QuantType::kF32Fp4Mxfp8)
+    {
+        // The kF32, kFP4 and kMXFP8 epilogues above on the same bf16 norm output, each writing its own buffers.
+        // The 4-access group (32 elements) of MXFP8 also holds the two 2-access NVFP4 groups.
+        static_assert(kELTS_PER_THREAD == 8, "NVFP4 / MXFP8 quantization expects eight elements per 16-byte access.");
+        using QuantPackedVec = tensorrt_llm::kernels::PackedVec<T>;
+        QuantPackedVec packVal = *reinterpret_cast<QuantPackedVec const*>(&value.packed);
+        auto* f32Out = reinterpret_cast<float4*>(params.quantOutPtr) + packedAccessIdx * (kELTS_PER_THREAD / 4);
+#pragma unroll
+        for (int i = 0; i < kELTS_PER_THREAD / 4; ++i)
+        {
+            f32Out[i] = make_float4(cuda_cast<float, T>(value.elements[4 * i]),
+                cuda_cast<float, T>(value.elements[4 * i + 1]), cuda_cast<float, T>(value.elements[4 * i + 2]),
+                cuda_cast<float, T>(value.elements[4 * i + 3]));
+        }
+        {
+            constexpr int kSFVecSize = 16;
+            auto* sfOut = cvt_quant_get_sf_out_offset<uint32_t, 2>(std::nullopt /* batchIdx */, token, accessIdInToken,
+                std::nullopt /* numRows */, params.tokenDim / kSFVecSize,
+                reinterpret_cast<uint32_t*>(params.fp4ScaleOutPtr), params.fp4Layout);
+            reinterpret_cast<uint32_t*>(params.fp4OutPtr)[packedAccessIdx]
+                = moeQuantFp4<T>(packVal, *params.fp4ScaleFactorPtr, sfOut);
+        }
+        {
+            constexpr int kSFVecSize = 32;
+            auto* sfOut
+                = cvt_quant_get_sf_out_offset<uint32_t, kSFVecSize / kELTS_PER_THREAD>(std::nullopt /* batchIdx */,
+                    token, accessIdInToken, std::nullopt /* numRows */, params.tokenDim / kSFVecSize,
+                    reinterpret_cast<uint32_t*>(params.mxfp8ScaleOutPtr), QuantizationSFLayout::SWIZZLED);
+            reinterpret_cast<uint64_t*>(params.mxfp8OutPtr)[packedAccessIdx] = moeQuantMxfp8<T>(packVal, sfOut);
         }
     }
     else if constexpr (ar_fusion::GetQuantType<Pattern> == ar_fusion::QuantType::kFP8)
@@ -622,6 +687,7 @@ using detail::blockReduceSum;
 using detail::divUp;
 using detail::copyF4;
 using detail::MnnvlAllReduceKernelParams;
+using detail::setMoeQuantOutputs;
 using detail::sanitizeLamportPayload;
 using detail::accumulateLamportRanksChunked;
 using detail::reduceOneshotDeterministicFastPath;
@@ -901,6 +967,18 @@ void oneshotAllreduceFusionOp(AllReduceFusionParams const& params)
             TLLM_CHECK_WITH_INFO(false, "[MNNVL AllReduceOneShot] The fp32 norm copy needs FP16 or BF16 input.");      \
         }                                                                                                              \
     }                                                                                                                  \
+    else if (params.pattern == ar_fusion::AllReduceFusionPattern::kARResidualRMSNormOutF32Fp4Mxfp8)                    \
+    {                                                                                                                  \
+        if constexpr (!std::is_same_v<T, float>)                                                                       \
+        {                                                                                                              \
+            LAUNCH_ALLREDUCE_KERNEL(                                                                                   \
+                WORLD_SIZE, T, ar_fusion::AllReduceFusionPattern::kARResidualRMSNormOutF32Fp4Mxfp8);                   \
+        }                                                                                                              \
+        else                                                                                                           \
+        {                                                                                                              \
+            TLLM_CHECK_WITH_INFO(false, "[MNNVL AllReduceOneShot] The MoE quant outputs need FP16 or BF16 input.");    \
+        }                                                                                                              \
+    }                                                                                                                  \
     else if (params.pattern == ar_fusion::AllReduceFusionPattern::kARRMSNorm)                                          \
     {                                                                                                                  \
         LAUNCH_ALLREDUCE_KERNEL(WORLD_SIZE, T, ar_fusion::AllReduceFusionPattern::kARRMSNorm);                         \
@@ -924,6 +1002,7 @@ void oneshotAllreduceFusionOp(AllReduceFusionParams const& params)
             reinterpret_cast<T*>(params.bufferPtrLocal), mcPtr, params.quantOut, params.scaleOut, params.scaleFactor,
             numTokens, tokenDim, params.nRanks, params.rank, static_cast<float>(params.epsilon), params.bufferFlags,
             false, params.layout, reinterpret_cast<T const*>(params.inputAdd)};
+        setMoeQuantOutputs(kernelParams, params);
 
         switch (params.nRanks)
         {
@@ -1321,6 +1400,7 @@ void twoshotAllreduceFusionOp(AllReduceFusionParams const& params)
             reinterpret_cast<T*>(params.bufferPtrLocal), mcastPtr, params.quantOut, params.scaleOut, params.scaleFactor,
             numTokens, tokenDim, params.nRanks, params.rank, static_cast<float>(params.epsilon), params.bufferFlags,
             !params.rmsNormFusion, params.layout, reinterpret_cast<T const*>(params.inputAdd)};
+        setMoeQuantOutputs(kernelParams, params);
         switch (params.nRanks)
         {
         case 2: LAUNCH_ALLREDUCE_KERNEL(2, T); return true;
@@ -1459,6 +1539,18 @@ void twoshotAllreduceFusionOp(AllReduceFusionParams const& params)
             TLLM_CHECK_WITH_INFO(false, "[MNNVL AllReduceTwoShot] The fp32 norm copy needs FP16 or BF16 input.");      \
         }                                                                                                              \
     }                                                                                                                  \
+    else if (params.pattern == ar_fusion::AllReduceFusionPattern::kARResidualRMSNormOutF32Fp4Mxfp8)                    \
+    {                                                                                                                  \
+        if constexpr (!std::is_same_v<T, float>)                                                                       \
+        {                                                                                                              \
+            RUN_RMSNORM_KERNEL(                                                                                        \
+                T, ar_fusion::AllReduceFusionPattern::kARResidualRMSNormOutF32Fp4Mxfp8, USE_CGA, LOADS_PER_THREAD);    \
+        }                                                                                                              \
+        else                                                                                                           \
+        {                                                                                                              \
+            TLLM_CHECK_WITH_INFO(false, "[MNNVL AllReduceTwoShot] The MoE quant outputs need FP16 or BF16 input.");    \
+        }                                                                                                              \
+    }                                                                                                                  \
     else if (params.pattern == ar_fusion::AllReduceFusionPattern::kARRMSNorm)                                          \
     {                                                                                                                  \
         RUN_RMSNORM_KERNEL(T, ar_fusion::AllReduceFusionPattern::kARRMSNorm, USE_CGA, LOADS_PER_THREAD);               \
@@ -1479,6 +1571,7 @@ void twoshotAllreduceFusionOp(AllReduceFusionParams const& params)
                 reinterpret_cast<T*>(params.multicastPtr), params.quantOut, params.scaleOut, params.scaleFactor,
                 numTokens, tokenDim, params.nRanks, params.rank, static_cast<float>(params.epsilon), params.bufferFlags,
                 false, params.layout};
+            setMoeQuantOutputs(kernelParams, params);
             if (rnUseCGA)
             {
                 DISPATCH_RMSNORM_PATTERN(T, true, 1);

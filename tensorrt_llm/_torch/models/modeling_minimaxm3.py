@@ -681,6 +681,12 @@ _AR_FUSED_MOE_ADD_MAX_BYTES = int(
 # gate_up GEMM takes it (the router and the routed experts keep reading the bf16 norm). Eager steps, same strategies
 # and C++ op as TRTLLM_M3_AR_MXFP8_QKV; where TRTLLM_M3_AR_F32_ROUTER also applies (MNNVL), that one wins.
 _AR_MXFP8_SHARED = os.environ.get("TRTLLM_M3_AR_MXFP8_SHARED", "0") == "1"
+# TRTLLM_M3_AR_MOE_QUANT=1: with TRTLLM_M3_AR_F32_ROUTER on MNNVL and the routed-input pre-quantize path
+# (TRTLLM_M3_MOE_PREQUANT_OVERLAP), the post-attention AllReduce + residual + RMSNorm emits, besides the norm output and
+# its fp32 copy, the routed experts' NVFP4 input (the backend's static fc31_input_scale, linear scales) and the shared
+# expert's MXFP8 input (RESIDUAL_RMS_NORM_OUT_F32_NVFP4_MXFP8). Both are bit-identical to the separate quantize
+# launches they replace. Needs the C++ op (libtensorrt_llm.so + libth_common.so with that fusion op).
+_AR_MOE_QUANT = os.environ.get("TRTLLM_M3_AR_MOE_QUANT", "0") == "1"
 
 
 def _allreduce_emits_mxfp8(allreduce: nn.Module) -> bool:
@@ -1028,6 +1034,7 @@ class MiniMaxM3MoE(nn.Module):
         self,
         hidden_states: torch.Tensor,
         all_rank_num_tokens: Optional[List[int]],
+        shared_input: Optional[Union[torch.Tensor, MxFp8QuantizedTensor]] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Routed + shared branches with the routed input quantize next to the router GEMM.
 
@@ -1037,14 +1044,21 @@ class MiniMaxM3MoE(nn.Module):
         FP4 tensor and scales it would have produced itself, one router GEMM earlier.
         """
         backend = _moe_prequant_backend(self.experts)
+        # The AllReduce before this MoE may already have produced both quantized inputs (TRTLLM_M3_AR_MOE_QUANT).
+        staged = self._take_staged_routed_fp4_input(hidden_states)
+        if shared_input is None:
+            shared_input = hidden_states
         event_main = self.event_dict[EventType.Main]
         event_shared = self.event_dict[EventType.MoeShared]
         event_main.record()
         with torch.cuda.stream(self.aux_stream):
             event_main.wait()
-            x_fp4, x_sf = backend.quantize_input(hidden_states, post_quant_comm=False)
+            if staged is None:
+                x_fp4, x_sf = backend.quantize_input(hidden_states, post_quant_comm=False)
+            else:
+                x_fp4, x_sf = staged
             self._prequant_event.record()
-            shared_output = self.shared_experts(hidden_states)
+            shared_output = self.shared_experts(shared_input)
             event_shared.record()
         router_logits = self.gate(hidden_states)
         self._prequant_event.wait()
@@ -1207,11 +1221,53 @@ class MiniMaxM3MoE(nn.Module):
         if staged is not None and staged[0] is hidden_states:
             logger.info_once(
                 "MiniMax-M3 shared expert takes the MXFP8 activation from the "
-                "post-attention AllReduce (TRTLLM_M3_AR_MXFP8_SHARED=1)",
+                "post-attention AllReduce (TRTLLM_M3_AR_MXFP8_SHARED / TRTLLM_M3_AR_MOE_QUANT)",
                 key="m3_ar_mxfp8_shared_input",
             )
             return staged[1]
         return hidden_states
+
+    def moe_quant_input_scale(self, hidden_states: torch.Tensor) -> Optional[torch.Tensor]:
+        """The routed experts' static NVFP4 input scale if the AllReduce before this MoE should also emit the routed
+        NVFP4 and the shared MXFP8 inputs (TRTLLM_M3_AR_MOE_QUANT), else None.
+
+        Only where this forward takes the pre-quantize path, the backend's quantize_input is exactly
+        fp4_quantize(x, fc31_input_scale, 16, linear scales) (no AWQ pre-scale, no padding), and the shared expert
+        takes an MXFP8 activation.
+        """
+        if not _AR_MOE_QUANT or not self._use_prequant_overlap(hidden_states, None):
+            return None
+        backend = _moe_prequant_backend(self.experts)
+        if getattr(backend, "fc31_act_scale", None) is not None:
+            return None
+        if getattr(backend, "scaling_vector_size", 16) != 16:
+            return None
+        w31 = getattr(backend, "w3_w1_weight", None)
+        scale = getattr(backend, "fc31_input_scale", None)
+        if w31 is None or w31.shape[-1] * 2 != hidden_states.shape[-1] or scale is None:
+            return None
+        if scale.dtype != torch.float32 or not self.accepts_mxfp8_shared_input():
+            return None
+        return scale
+
+    def stage_routed_fp4_input(
+        self, hidden_states: torch.Tensor, fp4: torch.Tensor, scale_factors: torch.Tensor
+    ) -> None:
+        """Hand the routed experts' NVFP4 input for ``hidden_states`` (the exact tensor this MoE's forward will
+        receive; linear scales) to the pre-quantize path; any other input leaves it unused."""
+        self._staged_routed_fp4_input = (hidden_states, fp4, scale_factors)
+
+    def _take_staged_routed_fp4_input(self, hidden_states: torch.Tensor):
+        staged = getattr(self, "_staged_routed_fp4_input", None)
+        self._staged_routed_fp4_input = None
+        if staged is not None and staged[0] is hidden_states:
+            logger.info_once(
+                "MiniMax-M3 routed experts take the NVFP4 activation from the "
+                "post-attention AllReduce (TRTLLM_M3_AR_MOE_QUANT=1)",
+                key="m3_ar_moe_quant_input",
+            )
+            return staged[1], staged[2].view(hidden_states.shape[0], -1)
+        return None
 
     def forward(
         self,
@@ -1265,7 +1321,7 @@ class MiniMaxM3MoE(nn.Module):
                 )
             elif self._use_prequant_overlap(hidden_states, lora_params):
                 routed_output, shared_output = self._forward_prequant_overlap(
-                    hidden_states, all_rank_num_tokens
+                    hidden_states, all_rank_num_tokens, shared_input
                 )
             else:
                 routed_output, shared_output = maybe_execute_in_parallel(
@@ -3187,6 +3243,32 @@ class MiniMaxM3DecoderLayer(DecoderLayer):
         """
         if self.pre_feed_forward_fusion:
             gate = self._fp32_router_gate(hidden_states)
+            moe_scale = (
+                self.block_sparse_moe.moe_quant_input_scale(hidden_states)
+                if gate is not None
+                else None
+            )
+            if moe_scale is not None:
+                norm, norm_fp32, residual, fp4, fp4_sf, mx8, mx8_sf = self.allreduce(
+                    hidden_states,
+                    all_reduce_params=AllReduceParams(
+                        fusion_op=AllReduceFusionOp.RESIDUAL_RMS_NORM_OUT_F32_NVFP4_MXFP8,
+                        residual=residual,
+                        norm_weight=self.post_attention_layernorm.weight,
+                        eps=self.post_attention_layernorm.variance_epsilon,
+                        scale=moe_scale,
+                        trigger_completion_at_end=False,
+                    ),
+                )
+                gate.stage_fp32_input(norm, norm_fp32)
+                self.block_sparse_moe.stage_routed_fp4_input(norm, fp4, fp4_sf)
+                self.block_sparse_moe.stage_mxfp8_shared_input(
+                    norm,
+                    MxFp8QuantizedTensor(
+                        fp8_tensor=mx8, scaling_factor=mx8_sf, is_sf_swizzled=True
+                    ),
+                )
+                return norm, residual
             if gate is not None:
                 norm, norm_fp32, residual = self.allreduce(
                     hidden_states,

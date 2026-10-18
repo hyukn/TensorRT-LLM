@@ -133,6 +133,9 @@ class AllReduceFusionOp(IntEnum):
     RESIDUAL_RMS_NORM_OUT_QUANT_MXFP8 = 10
     # MNNVL only: norm output plus an exact fp32 copy of it (e.g. for an fp32 MoE router).
     RESIDUAL_RMS_NORM_OUT_F32 = 11
+    # MNNVL only: RESIDUAL_RMS_NORM_OUT_F32 plus the NVFP4 (linear scales) and MXFP8 (swizzled scales) quantizations
+    # of the norm output, for a MoE's routed and shared experts.
+    RESIDUAL_RMS_NORM_OUT_F32_NVFP4_MXFP8 = 12
 
 
 class AllReduceParams:

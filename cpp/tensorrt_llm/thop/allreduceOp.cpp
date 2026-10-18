@@ -2088,6 +2088,8 @@ MnnvlFusionPattern getMnnvlFusionPattern(AllReduceFusionOp fusionOp)
     case AllReduceFusionOp::RESIDUAL_RMS_NORM_OUT_QUANT_MXFP8:
         return MnnvlFusionPattern::kARResidualRMSNormOutMXFP8Quant;
     case AllReduceFusionOp::RESIDUAL_RMS_NORM_OUT_F32: return MnnvlFusionPattern::kARResidualRMSNormOutF32;
+    case AllReduceFusionOp::RESIDUAL_RMS_NORM_OUT_F32_NVFP4_MXFP8:
+        return MnnvlFusionPattern::kARResidualRMSNormOutF32Fp4Mxfp8;
     default:
         TORCH_CHECK(
             false, "[mnnvlFusionAllReduce] Unsupported fusion operation: " + tensorrt_llm::kernels::toString(fusionOp));
@@ -2102,7 +2104,13 @@ bool isMnnvlQuantFusionOp(AllReduceFusionOp fusionOp)
         || fusionOp == AllReduceFusionOp::RESIDUAL_RMS_NORM_QUANT_NVFP4
         || fusionOp == AllReduceFusionOp::RESIDUAL_RMS_NORM_OUT_QUANT_NVFP4
         || fusionOp == AllReduceFusionOp::RESIDUAL_RMS_NORM_OUT_QUANT_MXFP8
-        || fusionOp == AllReduceFusionOp::RESIDUAL_RMS_NORM_OUT_F32;
+        || fusionOp == AllReduceFusionOp::RESIDUAL_RMS_NORM_OUT_F32
+        || fusionOp == AllReduceFusionOp::RESIDUAL_RMS_NORM_OUT_F32_NVFP4_MXFP8;
+}
+
+bool isMnnvlMoeQuantFusionOp(AllReduceFusionOp fusionOp)
+{
+    return fusionOp == AllReduceFusionOp::RESIDUAL_RMS_NORM_OUT_F32_NVFP4_MXFP8;
 }
 
 bool isMnnvlMxfp8FusionOp(AllReduceFusionOp fusionOp)
@@ -2127,7 +2135,8 @@ bool hasMnnvlNormOutput(AllReduceFusionOp fusionOp)
         || fusionOp == AllReduceFusionOp::RESIDUAL_RMS_NORM_OUT_QUANT_FP8
         || fusionOp == AllReduceFusionOp::RESIDUAL_RMS_NORM_OUT_QUANT_NVFP4
         || fusionOp == AllReduceFusionOp::RESIDUAL_RMS_NORM_OUT_QUANT_MXFP8
-        || fusionOp == AllReduceFusionOp::RESIDUAL_RMS_NORM_OUT_F32;
+        || fusionOp == AllReduceFusionOp::RESIDUAL_RMS_NORM_OUT_F32
+        || fusionOp == AllReduceFusionOp::RESIDUAL_RMS_NORM_OUT_F32_NVFP4_MXFP8;
 }
 
 } // namespace
@@ -2179,6 +2188,10 @@ std::vector<torch::Tensor> mnnvlFusionAllReduce(torch::Tensor& input, torch::opt
     torch::Tensor residualOut;
     torch::Tensor quantOut;
     torch::Tensor scaleOut;
+    torch::Tensor fp4Out;
+    torch::Tensor fp4ScaleOut;
+    torch::Tensor mxfp8Out;
+    torch::Tensor mxfp8ScaleOut;
 
     if (hasRmsNormFusion)
     {
@@ -2198,7 +2211,29 @@ std::vector<torch::Tensor> mnnvlFusionAllReduce(torch::Tensor& input, torch::opt
         reduceOut = torch::empty_like(input);
     }
 
-    if (isMnnvlF32CopyFusionOp(fusionOp))
+    if (isMnnvlMoeQuantFusionOp(fusionOp))
+    {
+        // The fp32 copy (router GEMM), the NVFP4 quantization with the global scale ``scale`` and linear scales
+        // (routed experts; sized like fp4_quantize(x, scale, 16, false, false)) and the MXFP8 quantization with
+        // 128x4 swizzled scales (shared expert; like mxfp8_quantize(x, true)) of the norm output.
+        TORCH_CHECK(input.scalar_type() == torch::kFloat16 || input.scalar_type() == torch::kBFloat16,
+            "[mnnvlFusionAllReduce] the MoE quant outputs require FP16 or BF16 input");
+        TORCH_CHECK(hiddenDim % 32 == 0,
+            "[mnnvlFusionAllReduce] hidden dimension must be divisible by 32 for the MoE quant outputs");
+        TORCH_CHECK(
+            scale.has_value() && scale.value().scalar_type() == torch::kFloat32 && scale.value().is_contiguous(),
+            "[mnnvlFusionAllReduce] a contiguous float32 NVFP4 global scale is required for the MoE quant outputs");
+        quantOut = at::detail::empty_cuda(input.sizes(), torch::kFloat32, input.device(), std::nullopt);
+        std::vector<int64_t> fp4Shape(input.sizes().begin(), input.sizes().end());
+        fp4Shape.back() /= 2;
+        fp4Out = at::detail::empty_cuda(fp4Shape, FLOAT4_E2M1X2, input.device(), std::nullopt);
+        fp4ScaleOut = at::detail::empty_cuda({tensorrt_llm::computeLinearLayoutSFSize(numTokens, hiddenDim / 16)},
+            SF_DTYPE, input.device(), std::nullopt);
+        mxfp8Out = at::detail::empty_cuda(input.sizes(), torch::kFloat8_e4m3fn, input.device(), std::nullopt);
+        mxfp8ScaleOut = at::detail::empty_cuda({tensorrt_llm::computeSwizzledLayoutSFSize(numTokens, hiddenDim / 32)},
+            SF_DTYPE, input.device(), std::nullopt);
+    }
+    else if (isMnnvlF32CopyFusionOp(fusionOp))
     {
         TORCH_CHECK(input.scalar_type() == torch::kFloat16 || input.scalar_type() == torch::kBFloat16,
             "[mnnvlFusionAllReduce] the fp32 norm copy requires FP16 or BF16 input");
@@ -2288,9 +2323,19 @@ std::vector<torch::Tensor> mnnvlFusionAllReduce(torch::Tensor& input, torch::opt
     {
         allreduce_params.quantOut = quantOut.mutable_data_ptr();
         allreduce_params.scaleOut = scaleOut.defined() ? scaleOut.mutable_data_ptr() : nullptr;
-        allreduce_params.scaleFactor = (isMnnvlMxfp8FusionOp(fusionOp) || isMnnvlF32CopyFusionOp(fusionOp))
+        allreduce_params.scaleFactor
+            = (isMnnvlMxfp8FusionOp(fusionOp) || isMnnvlF32CopyFusionOp(fusionOp) || isMnnvlMoeQuantFusionOp(fusionOp))
             ? nullptr
             : scale.value().data_ptr<float>();
+    }
+    if (isMnnvlMoeQuantFusionOp(fusionOp))
+    {
+        allreduce_params.fp4Out = fp4Out.mutable_data_ptr();
+        allreduce_params.fp4ScaleOut = fp4ScaleOut.mutable_data_ptr();
+        allreduce_params.fp4ScaleFactor = scale.value().data_ptr<float>();
+        allreduce_params.fp4Layout = tensorrt_llm::QuantizationSFLayout::LINEAR;
+        allreduce_params.mxfp8Out = mxfp8Out.mutable_data_ptr();
+        allreduce_params.mxfp8ScaleOut = mxfp8ScaleOut.mutable_data_ptr();
     }
 
     allreduce_params.rmsNormFusion = hasRmsNormFusion;
@@ -2319,6 +2364,8 @@ std::vector<torch::Tensor> mnnvlFusionAllReduce(torch::Tensor& input, torch::opt
     case AllReduceFusionOp::RESIDUAL_RMS_NORM_OUT_QUANT_NVFP4: return {normOut, quantOut, scaleOut, residualOut};
     case AllReduceFusionOp::RESIDUAL_RMS_NORM_OUT_QUANT_MXFP8: return {normOut, quantOut, scaleOut, residualOut};
     case AllReduceFusionOp::RESIDUAL_RMS_NORM_OUT_F32: return {normOut, quantOut, residualOut};
+    case AllReduceFusionOp::RESIDUAL_RMS_NORM_OUT_F32_NVFP4_MXFP8:
+        return {normOut, quantOut, residualOut, fp4Out, fp4ScaleOut, mxfp8Out, mxfp8ScaleOut};
     default:
         TORCH_CHECK(
             false, "[mnnvlFusionAllReduce] Unsupported fusion operation: " + tensorrt_llm::kernels::toString(fusionOp));

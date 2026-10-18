@@ -71,7 +71,15 @@ struct AllReduceFusionParams
     void* scaleOut = nullptr;           //!< NVFP4 scale-factor output (used by NVFP4 fusion patterns)
     float const* scaleFactor = nullptr; //!< Quantization scale factor
     QuantizationSFLayout layout = QuantizationSFLayout::SWIZZLED; //!< NVFP4 scale-factor layout
-    cudaStream_t stream;                                          //!< CUDA stream for asynchronous kernel execution
+    //! kARResidualRMSNormOutF32Fp4Mxfp8 only (quantOut is the fp32 copy there): the NVFP4 quantization of the norm
+    //! output (data, scales, global scale, scale layout) and its MXFP8 quantization (data, 128x4 swizzled scales).
+    void* fp4Out = nullptr;
+    void* fp4ScaleOut = nullptr;
+    float const* fp4ScaleFactor = nullptr;
+    QuantizationSFLayout fp4Layout = QuantizationSFLayout::LINEAR;
+    void* mxfp8Out = nullptr;
+    void* mxfp8ScaleOut = nullptr;
+    cudaStream_t stream; //!< CUDA stream for asynchronous kernel execution
 
     //! @}
 };

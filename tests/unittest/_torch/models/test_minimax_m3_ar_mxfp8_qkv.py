@@ -213,3 +213,56 @@ def test_swiglu_mxfp8_flag_reaches_the_mlps(monkeypatch: pytest.MonkeyPatch, ena
             model_config=config, intermediate_size=128, layer_idx=0, is_shared_expert=shared
         )
         assert mlp.swiglu_mxfp8_out is enabled
+
+
+def _moe() -> MiniMaxM3MoE:
+    moe = MiniMaxM3MoE.__new__(MiniMaxM3MoE)
+    nn.Module.__init__(moe)
+    return moe
+
+
+def test_moe_staged_routed_fp4_is_taken_only_for_the_same_tensor() -> None:
+    moe = _moe()
+    hidden = torch.zeros(4, 64)
+    fp4, sf = torch.zeros(4, 32, dtype=torch.uint8), torch.zeros(4 * 4, dtype=torch.uint8)
+    moe.stage_routed_fp4_input(hidden, fp4, sf)
+    got = moe._take_staged_routed_fp4_input(hidden)
+    # The scales come back viewed per row, as quantize_input returns them.
+    assert got[0] is fp4 and tuple(got[1].shape) == (4, 4)
+    assert moe._take_staged_routed_fp4_input(hidden) is None  # consumed
+    moe.stage_routed_fp4_input(hidden, fp4, sf)
+    assert moe._take_staged_routed_fp4_input(hidden.clone()) is None  # another tensor never gets it
+    assert moe._take_staged_routed_fp4_input(hidden) is None  # and the stale entry was dropped
+
+
+def test_moe_quant_input_scale_gating(monkeypatch: pytest.MonkeyPatch) -> None:
+    hidden = torch.zeros(4, 64)
+    scale = torch.ones(1)
+    backend = SimpleNamespace(
+        fc31_act_scale=None,
+        scaling_vector_size=16,
+        w3_w1_weight=torch.zeros(2, 32, dtype=torch.uint8),
+        fc31_input_scale=scale,
+    )
+    monkeypatch.setattr(m3, "_moe_prequant_backend", lambda experts, allow_comm=False: backend)
+    moe = _moe()
+    moe.experts = None
+    state = {"prequant": True, "shared": True}
+    monkeypatch.setattr(moe, "_use_prequant_overlap", lambda h, lora: state["prequant"])
+    monkeypatch.setattr(moe, "accepts_mxfp8_shared_input", lambda: state["shared"])
+    monkeypatch.setattr(m3, "_AR_MOE_QUANT", False)
+    assert moe.moe_quant_input_scale(hidden) is None
+    monkeypatch.setattr(m3, "_AR_MOE_QUANT", True)
+    assert moe.moe_quant_input_scale(hidden) is scale
+    for key in state:
+        state[key] = False
+        assert moe.moe_quant_input_scale(hidden) is None
+        state[key] = True
+    backend.fc31_act_scale = torch.ones(1, 64)  # AWQ pre-scale: quantize_input multiplies first
+    assert moe.moe_quant_input_scale(hidden) is None
+    backend.fc31_act_scale = None
+    backend.w3_w1_weight = torch.zeros(2, 48, dtype=torch.uint8)  # padded input
+    assert moe.moe_quant_input_scale(hidden) is None
+    backend.w3_w1_weight = torch.zeros(2, 32, dtype=torch.uint8)
+    backend.fc31_input_scale = scale.half()
+    assert moe.moe_quant_input_scale(hidden) is None

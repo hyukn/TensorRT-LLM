@@ -776,6 +776,7 @@ class MNNVLAllReduce(nn.Module):
         AllReduceFusionOp.RESIDUAL_RMS_NORM_OUT_QUANT_NVFP4,
         AllReduceFusionOp.RESIDUAL_RMS_NORM_OUT_QUANT_MXFP8,
         AllReduceFusionOp.RESIDUAL_RMS_NORM_OUT_F32,
+        AllReduceFusionOp.RESIDUAL_RMS_NORM_OUT_F32_NVFP4_MXFP8,
     })
 
     @classmethod
