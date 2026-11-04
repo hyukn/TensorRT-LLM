@@ -1264,6 +1264,8 @@ class AutoTuner:
 
         tuning_start_time = time.perf_counter()
         profiles = self._optimization_profiles(tuning_config, inputs)
+        if tuning_config.exclude_from_cache:
+            profiles = self._stagger_for_local_peers(profiles)
 
         # Initialize the statistics for the custom_op
         if custom_op not in self.stats.tuned_op_profiled_configs:
@@ -1591,6 +1593,33 @@ class AutoTuner:
             )
 
         return best_runner_id, best_tactic, min_time, has_tuning_failure_occurred
+
+    @staticmethod
+    def _stagger_for_local_peers(
+            profiles: List[OptimizationProfile]) -> List[OptimizationProfile]:
+        """Start each GPU of a node at a different offset of the same sweep.
+
+        Excluded ops are tuned for the JIT they drive, and the ranks of a node
+        usually share those kernels' on-disk caches. Each rank first walks its
+        own round-robin share of small contiguous blocks, then the others'
+        blocks, whose kernels its peers have by then written to disk. Small
+        blocks keep the shares even although distinct kernels cluster unevenly
+        along the swept dimension. Every rank still runs every profile. Only
+        helps when the ranks share a JIT cache directory;
+        TLLM_AUTOTUNER_STAGGER_LOCAL_PEERS=0 disables it.
+        """
+        num_devices = torch.cuda.device_count()
+        if (os.environ.get("TLLM_AUTOTUNER_STAGGER_LOCAL_PEERS", "1") == "0"
+                or num_devices <= 1 or len(profiles) < 2 * num_devices):
+            return profiles
+        local = torch.cuda.current_device()
+        num_blocks = min(len(profiles), num_devices * 16)
+        bounds = [len(profiles) * b // num_blocks for b in range(num_blocks + 1)]
+        order = ([b for b in range(num_blocks) if b % num_devices == local] +
+                 [b for b in range(num_blocks) if b % num_devices != local])
+        return [
+            profiles[i] for b in order for i in range(bounds[b], bounds[b + 1])
+        ]
 
     def _parallel_jit_warmup(self, custom_op: str, runners: List[TunableRunner],
                              profiles: List[OptimizationProfile],
