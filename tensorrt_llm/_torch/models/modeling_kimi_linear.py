@@ -81,13 +81,19 @@ is validated only without block reuse.
 
 from __future__ import annotations
 
+import bisect
+import contextlib
 import copy
 import gc
 import json
 import math
 import os
+import re
+import struct
 import threading
+import time
 import weakref
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack
 from typing import (
     TYPE_CHECKING,
@@ -2605,6 +2611,209 @@ def _dequantize_fp8_block_scaled(ckpt_key: str, src: torch.Tensor, weights) -> t
     return (out * expanded[: out.shape[0], : out.shape[1]]).to(torch.bfloat16)
 
 
+_SAFETENSORS_TORCH_DTYPES = {
+    name: getattr(torch, attr)
+    for name, attr in (
+        ("BOOL", "bool"),
+        ("U8", "uint8"),
+        ("I8", "int8"),
+        ("U16", "uint16"),
+        ("I16", "int16"),
+        ("U32", "uint32"),
+        ("I32", "int32"),
+        ("U64", "uint64"),
+        ("I64", "int64"),
+        ("F16", "float16"),
+        ("BF16", "bfloat16"),
+        ("F32", "float32"),
+        ("F64", "float64"),
+        ("F8_E4M3", "float8_e4m3fn"),
+        ("F8_E5M2", "float8_e5m2"),
+        ("F8_E8M0", "float8_e8m0fnu"),
+    )
+    if hasattr(torch, attr)
+}
+
+
+class _ShardSubsetReader:
+    """Read a known subset of one safetensors file with large concurrent preads.
+
+    Faulting a rank's expert slices in through the safetensors mmap is
+    latency-bound on a network filesystem: each loader thread waits on one page
+    range at a time, and readahead pulls in neighbours owned by other EP ranks
+    (the checkpoint stores experts in string order, so EP rank 0's experts
+    0..111 are spread over the whole file). Coalescing the requested tensors into
+    a few ranges and reading them with concurrent ``pread`` calls is 5-10x faster
+    on Lustre (GB300, 4 ranks per node, 0.5-1.4 -> 4.4-6.7 GB/s per rank).
+
+    Same accessors as a ``safe_open`` handle; a key outside the requested subset
+    is read through ``safe_open``.
+    """
+
+    _ALIGN = 64  # buffer offset == file offset (mod 64): views keep file alignment
+    _GAP = 1 << 20  # read through holes up to this size rather than split a range
+    _CHUNK = 32 << 20  # bytes per pread
+    _CLONE_BELOW = 1 << 20  # copy small tensors out so they do not pin the buffer
+
+    def __init__(self, path: str, keys, pool) -> None:
+        self._path = path
+        self._fallback = None
+        with open(path, "rb") as f:
+            (header_len,) = struct.unpack("<Q", f.read(8))
+            header = json.loads(f.read(header_len))
+        header.pop("__metadata__", None)
+        self._file_keys = set(header)
+        data_start = 8 + header_len
+        self._entries = {}
+        for key in keys:
+            info = header.get(key)
+            if info is None:
+                continue
+            dtype = _SAFETENSORS_TORCH_DTYPES[info["dtype"]]
+            begin, end = (data_start + offset for offset in info["data_offsets"])
+            self._entries[key] = (begin, end, dtype, info["shape"])
+        ranges = []
+        for begin, end, _, _ in sorted(self._entries.values(), key=lambda e: e[0]):
+            if ranges and begin - ranges[-1][1] <= self._GAP:
+                ranges[-1][1] = max(ranges[-1][1], end)
+            else:
+                ranges.append([begin, end])
+        self._ranges = []
+        size = 0
+        for begin, end in ranges:
+            size += (begin - size) % self._ALIGN
+            self._ranges.append((begin, end, size))
+            size += end - begin
+        self._range_starts = [begin for begin, _, _ in self._ranges]
+        self._buf = torch.empty(size, dtype=torch.uint8)
+        view = memoryview(self._buf.numpy())
+        fd = os.open(path, os.O_RDONLY)
+        try:
+
+            def read(offset: int, dst: int, nbytes: int) -> None:
+                done = 0
+                while done < nbytes:
+                    n = os.preadv(fd, [view[dst + done : dst + nbytes]], offset + done)
+                    if n <= 0:
+                        raise OSError(f"short read from {path} at byte {offset + done}")
+                    done += n
+
+            futures = [
+                pool.submit(read, offset, dst + offset - begin, min(self._CHUNK, end - offset))
+                for begin, end, dst in self._ranges
+                for offset in range(begin, end, self._CHUNK)
+            ]
+            for future in futures:
+                future.result()
+        finally:
+            os.close(fd)
+
+    def keys(self):
+        return self._file_keys
+
+    def get_tensor(self, key: str) -> torch.Tensor:
+        entry = self._entries.get(key)
+        if entry is None:
+            if self._fallback is None:
+                self._fallback = safe_open(self._path, framework="pt", device="cpu")
+            return self._fallback.get_tensor(key)
+        begin, end, dtype, shape = entry
+        i = bisect.bisect_right(self._range_starts, begin) - 1
+        range_begin, _, dst = self._ranges[i]
+        pos = dst + begin - range_begin
+        raw = self._buf[pos : pos + end - begin]
+        if end - begin < self._CLONE_BELOW:
+            raw = raw.clone()
+        try:
+            return raw.view(dtype).reshape(shape)
+        except RuntimeError:  # a non-conforming file left this tensor misaligned
+            return raw.clone().view(dtype).reshape(shape)
+
+    def close(self) -> None:
+        self._buf = None
+        self._fallback = None
+
+
+_ROUTED_EXPERT_KEY = re.compile(r"\.experts\.\d+\.")
+
+
+def _warm_non_expert_pages(weights) -> None:
+    """Read every non-routed-expert tensor of a lazy checkpoint into the page cache.
+
+    The trunk, the attention FP8 projections and the vision tower are read
+    through the lazy mmap -- the attention ones one projection at a time on the
+    loading thread -- so on a network filesystem they cost one page-fault round
+    trip per page range (about 0.5 GB/s per rank). These ~80 GB are replicated on
+    every rank under attention DP. Reading them up front with coalesced
+    concurrent ``pread`` (see ``_ShardSubsetReader``) turns those faults into
+    page-cache hits; ranks on a node reading the same pages share the I/O.
+    Advisory: any failure leaves the mmap path to read the pages itself.
+    ``TLLM_K3_PREFETCH_NON_EXPERT=0`` disables it.
+    """
+    ckpt_dir = getattr(weights, "checkpoint_dir", None)
+    if not ckpt_dir or os.environ.get("TLLM_K3_PREFETCH_NON_EXPERT", "1") == "0":
+        return
+    index_path = os.path.join(ckpt_dir, "model.safetensors.index.json")
+    if not os.path.isfile(index_path):
+        return
+    start = time.perf_counter()
+    try:
+        with open(index_path) as f:
+            files = sorted(set(json.load(f)["weight_map"].values()))
+        chunk = _ShardSubsetReader._CHUNK
+        scratch = threading.local()
+
+        def read_discard(path: str, offset: int, nbytes: int) -> int:
+            buf = getattr(scratch, "buf", None)
+            if buf is None:
+                buf = scratch.buf = memoryview(bytearray(chunk))
+            fd = os.open(path, os.O_RDONLY)
+            try:
+                done = 0
+                while done < nbytes:
+                    n = os.preadv(fd, [buf[: nbytes - done]], offset + done)
+                    if n <= 0:
+                        break
+                    done += n
+                return done
+            finally:
+                os.close(fd)
+
+        futures = []
+        with ThreadPoolExecutor(max_workers=16, thread_name_prefix="k3_page_warm") as pool:
+            for name in files:
+                path = os.path.join(ckpt_dir, name)
+                with open(path, "rb") as f:
+                    (header_len,) = struct.unpack("<Q", f.read(8))
+                    header = json.loads(f.read(header_len))
+                header.pop("__metadata__", None)
+                data_start = 8 + header_len
+                spans = sorted(
+                    (data_start + info["data_offsets"][0], data_start + info["data_offsets"][1])
+                    for key, info in header.items()
+                    if not _ROUTED_EXPERT_KEY.search(key)
+                )
+                ranges = []
+                for begin, end in spans:
+                    if ranges and begin - ranges[-1][1] <= _ShardSubsetReader._GAP:
+                        ranges[-1][1] = max(ranges[-1][1], end)
+                    else:
+                        ranges.append([begin, end])
+                for begin, end in ranges:
+                    for offset in range(begin, end, chunk):
+                        futures.append(
+                            pool.submit(read_discard, path, offset, min(chunk, end - offset))
+                        )
+            nbytes = sum(future.result() for future in futures)
+    except Exception as e:  # noqa: BLE001 - advisory
+        logger.warning(f"Kimi K3: non-expert page warm-up skipped ({type(e).__name__}: {e})")
+        return
+    logger.info(
+        f"Kimi K3: read {nbytes / 1e9:.1f} GB of non-expert checkpoint pages ahead in "
+        f"{time.perf_counter() - start:.1f} s"
+    )
+
+
 def _materialize(value) -> torch.Tensor:
     """Materialize a (possibly lazy safetensors slice) weight value."""
     if isinstance(value, torch.Tensor):
@@ -3163,6 +3372,7 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
         name_map, expected_keys, expert_jobs = self.checkpoint_name_plan(prefix)
 
         self._validate_checkpoint_keys(weights, expected_keys, prefix)
+        _warm_non_expert_pages(weights)
         num_params = self._load_trunk_params(weights, params, name_map)
         num_params += self._load_attention_fp8(weights, prefix)
         self._load_expert_slices(weights, expert_jobs)
@@ -3578,11 +3788,45 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
                 except OSError:
                     pass
 
+            def job_keys(jobs: list) -> list:
+                return [
+                    checkpoint_key(f"{base}.{expert_idx}.{suffix}")
+                    for moe, base, _, expert_idx in jobs
+                    for suffix in (
+                        *(
+                            f"{w}.{kind}"
+                            for w in ("w1", "w2", "w3")
+                            for kind in moe.expert_ckpt_spec.kinds
+                        ),
+                        *moe.expert_ckpt_spec.optional_suffixes,
+                    )
+                ]
+
+            @contextlib.contextmanager
+            def open_expert_file(path: str, jobs: list):
+                reader = None
+                if read_pool is not None:
+                    try:
+                        reader = _ShardSubsetReader(path, job_keys(jobs), read_pool)
+                    except Exception as e:  # noqa: BLE001 - fall back to the mmap path
+                        logger.warning(
+                            f"Kimi K3: pread of {os.path.basename(path)} failed "
+                            f"({type(e).__name__}: {e}); reading it through safe_open."
+                        )
+                if reader is None:
+                    with safe_open(path, framework="pt", device="cpu") as fh:
+                        yield fh
+                    return
+                try:
+                    yield reader
+                finally:
+                    reader.close()
+
             def load_expert_file(file_name: str, jobs: list):
                 if device.type == "cuda":
                     torch.cuda.set_device(device)
                 path = os.path.join(ckpt_dir, file_name)
-                with safe_open(path, framework="pt", device="cpu") as fh:
+                with open_expert_file(path, jobs) as fh:
                     # A job lands here only when every key it needs -- optional
                     # ones included, see the grouping above -- is in this file,
                     # so presence in this file is the whole question.
@@ -3633,7 +3877,17 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
                 for file_name in files:
                     drop_file_pages(file_name)
 
-            run_concurrently(load_expert_file, sorted(per_file.items()), num_workers=4)
+            # TLLM_K3_EXPERT_PREAD=0 restores per-key reads through the mmap.
+            read_pool = (
+                ThreadPoolExecutor(max_workers=16, thread_name_prefix="k3_expert_read")
+                if os.environ.get("TLLM_K3_EXPERT_PREAD", "1") != "0"
+                else None
+            )
+            try:
+                run_concurrently(load_expert_file, sorted(per_file.items()), num_workers=4)
+            finally:
+                if read_pool is not None:
+                    read_pool.shutdown()
             run_concurrently(load_split_file_expert, split_file_jobs, num_workers=4)
         else:
             # Falling back is a silent loss of the whole point of the block
