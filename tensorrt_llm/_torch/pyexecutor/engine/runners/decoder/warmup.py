@@ -62,7 +62,6 @@ if TYPE_CHECKING:
     from .metadata import DecoderMetadata
 
 
-
 def _run_jit_prebuild(name: str, fn: Callable[[], Any]) -> None:
     """Run one best-effort JIT prebuild; a failure is left to the module's first use."""
     start = time.perf_counter()

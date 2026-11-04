@@ -1237,16 +1237,18 @@ class AutoTuner:
         if tuning_config.exclude_from_cache:
             self.profiling_cache.add_excluded_op(custom_op)
         is_cache_hit, best_runner_id, best_tactic, min_time = (
-            self.profiling_cache.search_cache(
-                custom_op,
-                runners,
-                input_shapes,
-                tuning_config,
-                apply_map_to_tuning_buckets=True))
+            self.profiling_cache.search_cache(custom_op,
+                                              runners,
+                                              input_shapes,
+                                              tuning_config,
+                                              apply_map_to_tuning_buckets=True))
         if (tuning_config.exclude_from_cache and self.is_tuning_mode
                 and is_cache_hit and self.profiling_cache.get_cache_key(
-                    custom_op, runners[best_runner_id], input_shapes,
-                    tuning_config, apply_map_to_tuning_buckets=True)
+                    custom_op,
+                    runners[best_runner_id],
+                    input_shapes,
+                    tuning_config,
+                    apply_map_to_tuning_buckets=True)
                 not in self._keys_profiled_in_process):
             # Only an entry this process profiled proves its JIT side
             # effects already ran here; re-profile anything else.
@@ -1646,7 +1648,9 @@ class AutoTuner:
             return profiles
         local = torch.cuda.current_device()
         num_blocks = min(len(profiles), num_devices * 16)
-        bounds = [len(profiles) * b // num_blocks for b in range(num_blocks + 1)]
+        bounds = [
+            len(profiles) * b // num_blocks for b in range(num_blocks + 1)
+        ]
         order = ([b for b in range(num_blocks) if b % num_devices == local] +
                  [b for b in range(num_blocks) if b % num_devices != local])
         return [
@@ -1664,19 +1668,17 @@ class AutoTuner:
         if not (tuning_config.defer_jit_warmup and self._defer_jit_sweeps
                 and not self._in_deferred_flush and len(runners) == 1
                 and tuning_config.distributed_tuning_strategy
-                == DistributedTuningStrategy.INDEPENDENT
-                and os.environ.get("TLLM_AUTOTUNER_DEFER_JIT_WARMUP", "1")
-                != "0"):
+                == DistributedTuningStrategy.INDEPENDENT and os.environ.get(
+                    "TLLM_AUTOTUNER_DEFER_JIT_WARMUP", "1") != "0"):
             return False
         swept = {(s.input_idx, s.dim_idx)
                  for s in tuning_config.dynamic_tensor_specs}
         swept |= {(s.input_idx, s.dim_idx)
                   for s in tuning_config.constraint_specs}
-        signature = tuple(
-            (tuple(-1 if (i, d) in swept else n
-                   for d, n in enumerate(t.shape)), t.dtype) if isinstance(
-                       t, torch.Tensor) else repr(t)
-            for i, t in enumerate(inputs))
+        signature = tuple((tuple(-1 if (i, d) in swept else n
+                                 for d, n in enumerate(t.shape)),
+                           t.dtype) if isinstance(t, torch.Tensor) else repr(t)
+                          for i, t in enumerate(inputs))
         key = (custom_op, repr(runners[0].unique_id()), signature,
                repr(sorted(kwargs.items())))
         self._deferred_jit_sweeps.setdefault(
@@ -1701,8 +1703,8 @@ class AutoTuner:
             profiles = self._optimization_profiles(tuning_config, inputs)
             if tuning_config.exclude_from_cache:
                 profiles = self._stagger_for_local_peers(profiles)
-            jobs.append((custom_op, runners, inputs, tuning_config, kwargs,
-                         profiles))
+            jobs.append(
+                (custom_op, runners, inputs, tuning_config, kwargs, profiles))
         self._parallel_jit_warmup_jobs(jobs)
         self._in_deferred_flush = True
         try:
@@ -1736,10 +1738,10 @@ class AutoTuner:
         is left to the profiling loop, which runs every profile again and
         handles errors as usual.
         """
-        auto_threads = min(
-            32, (os.cpu_count() or 1) // max(1, torch.cuda.device_count()))
-        num_threads = max(auto_threads if job[3].parallel_jit_warmup < 0 else
-                          job[3].parallel_jit_warmup for job in jobs)
+        auto_threads = min(32, (os.cpu_count() or 1) //
+                           max(1, torch.cuda.device_count()))
+        num_threads = max(auto_threads if job[3].parallel_jit_warmup <
+                          0 else job[3].parallel_jit_warmup for job in jobs)
         num_threads = int(
             os.environ.get("TLLM_AUTOTUNER_PARALLEL_JIT_WARMUP", num_threads))
         if num_threads < 0:
@@ -1765,9 +1767,8 @@ class AutoTuner:
             nblk = min(num_threads, len(pending))
             size = -(-len(pending) // nblk)
             blocks = [pending[i * size:(i + 1) * size] for i in range(nblk)]
-            orders.append([(runners, inputs, kwargs, b[j])
-                           for j in range(size) for b in blocks
-                           if j < len(b)])
+            orders.append([(runners, inputs, kwargs, b[j]) for j in range(size)
+                           for b in blocks if j < len(b)])
         # Then round-robin across sweeps: different shapes, different kernels.
         tasks = [
             o[j] for j in range(max((len(o) for o in orders), default=0))
@@ -1941,9 +1942,8 @@ class AutoTuner:
         # caches instead of flushing them per capture. Only this thread's
         # launches are captured; warmup may build JIT modules on others.
         capture_kwargs = (dict(release_cached_memory=False,
-                               capture_error_mode="thread_local")
-                          if self._profile_graph_pool_keeper is not None else
-                          {})
+                               capture_error_mode="thread_local") if
+                          self._profile_graph_pool_keeper is not None else {})
         completed = False
         try:
             with torch.cuda.stream(stream):
