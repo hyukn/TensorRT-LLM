@@ -5,10 +5,14 @@
 
 from __future__ import annotations
 
+import concurrent.futures
 import contextlib
 import gc
+import importlib
 import os
-from collections.abc import Callable
+import threading
+import time
+from collections.abc import Callable, Iterator
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -56,6 +60,60 @@ if TYPE_CHECKING:
     from .graphs import DecoderCudaGraphs, ForwardWarmup
     from .inputs import DecoderInputPreparer
     from .metadata import DecoderMetadata
+
+
+
+def _run_jit_prebuild(name: str, fn: Callable[[], Any]) -> None:
+    """Run one best-effort JIT prebuild; a failure is left to the module's first use."""
+    start = time.perf_counter()
+    try:
+        fn()
+    except Exception as e:  # noqa: BLE001 - best effort, like the sequential prewarms
+        logger.warning(f"[warmup] JIT prebuild {name} failed: {type(e).__name__}: {e}")
+        return
+    logger.info(f"[warmup] JIT prebuild {name}: done in {time.perf_counter() - start:.1f}s")
+
+
+def _start_jit_prebuild_thread(name: str, fn: Callable[[], Any]) -> concurrent.futures.Future:
+    """Run one prebuild on a daemon thread; the returned future completes with it."""
+    future: concurrent.futures.Future = concurrent.futures.Future()
+
+    def body() -> None:
+        try:
+            _run_jit_prebuild(name, fn)
+        finally:
+            future.set_result(None)
+
+    threading.Thread(target=body, name=f"jit_prebuild_{name}", daemon=True).start()
+    return future
+
+
+def _flashinfer_cubin_dir() -> str | None:
+    try:
+        from flashinfer.jit import env as flashinfer_jit_env
+    except ImportError:
+        return None
+    return str(getattr(flashinfer_jit_env, "FLASHINFER_CUBIN_DIR", "")) or None
+
+
+def _one_process_at_a_time(lock_dir: str | None, name: str, fn: Callable[[], Any]) -> Any:
+    """Run ``fn`` under a file lock shared by every process using ``lock_dir``.
+
+    FlashInfer's artifact fetch checks the local copy outside its download lock
+    and does not re-check under it, so every rank that starts cold downloads and
+    atomically replaces the same headers. A replacement that lands after one rank
+    has started compiling makes the header newer than that rank's objects, and the
+    next rank's ninja run rebuilds the whole module (49 s for TRTLLM-Gen FMHA on
+    GB300). One process at a time, the first fetches and builds and the rest find
+    valid artifacts and an up-to-date build.
+    """
+    if not lock_dir:
+        return fn()
+    from filelock import FileLock
+
+    os.makedirs(lock_dir, exist_ok=True)
+    with FileLock(os.path.join(lock_dir, f".trtllm_prebuild_{name}.lock")):
+        return fn()
 
 
 class WarmupAgreement:
@@ -279,6 +337,8 @@ class DecoderWarmup:
         self._eager_workspace_reclaimable = eager_workspace_reclaimable
         # Token shape of the last autotuner warmup that ran a forward pass.
         self._completed_autotuner_warmup_num_tokens: int | None = None
+        # Background JIT builds whose modules are first used after the forwards.
+        self._deferred_jit_prebuilds: list[concurrent.futures.Future] = []
 
     @property
     def guided_decoder(self) -> CapturableGuidedDecoder | None:
@@ -293,7 +353,10 @@ class DecoderWarmup:
         warmup_named_allreduce_topologies(self.model)
         # Retain a partial summary when a phase raises.
         with self._warmup_timer:
-            return self._warmup_scheduled(resource_manager, kv_cache_manager)
+            try:
+                return self._warmup_scheduled(resource_manager, kv_cache_manager)
+            finally:
+                self._join_deferred_jit_prebuilds()
 
     def _get_max_shape_warmup_requests(
         self, resource_manager: ResourceManager
@@ -363,12 +426,14 @@ class DecoderWarmup:
         # CUDA graph capture pass exercises the non-greedy sampler, so with
         # cuda_graph_config=None flashinfer's sampling kernels would be
         # JIT-built mid-serving.
-        with self._warmup_timer.phase(
-            "sampling_module_prewarm", metrics=self._metrics, metric_name="sampling_warmup_seconds"
+        with (
+            self._warmup_timer.phase(
+                "sampling_module_prewarm",
+                metrics=self._metrics,
+                metric_name="sampling_warmup_seconds",
+            ),
+            self._background_jit_prebuilds(kv_cache_manager),
         ):
-            warmup_sampling_module()
-            if self._config.max_beam_width > 1:
-                warmup_topk_module()
             self._prewarm_engram_kernels(kv_cache_manager)
             self._prewarm_csa2_sparse_indexer(kv_cache_manager)
             self._prewarm_minimax_m3_msa_indexer(kv_cache_manager)
@@ -481,6 +546,8 @@ class DecoderWarmup:
             # NVSHMEM).
             gc.collect()
             torch.cuda.empty_cache()
+        with self._warmup_timer.phase("jit_prebuild_join"):
+            self._join_deferred_jit_prebuilds()
         with self._warmup_timer.phase("cuda_graph_capture"):
             self._graphs.warmup_and_capture(resource_manager)
         log_mem_snapshot("warmup/after_cuda_graph_capture")
@@ -1511,6 +1578,146 @@ class DecoderWarmup:
             self.dist.tp_allgather(1)
         if compiled:
             logger.info("CSA2 sparse indexer prewarm complete")
+
+    @contextlib.contextmanager
+    def _background_jit_prebuilds(
+        self, kv_cache_manager: KVCacheManager | KVCacheManagerV2 | None
+    ) -> Iterator[None]:
+        """Build independent JIT modules on worker threads around the enclosed warmup.
+
+        Each task compiles and loads one module behind a process-wide cached
+        getter, so its first real use later finds it ready. The builds run
+        ninja/nvcc subprocesses, which release the GIL, so they overlap with
+        each other and with the enclosed prewarms instead of running back to
+        back on the first forward that needs each one. Waits for every task
+        before returning. TLLM_WARMUP_PARALLEL_JIT=0 restores the sequential
+        sampling-module build and leaves the other modules to first use.
+        """
+        if os.environ.get("TLLM_WARMUP_PARALLEL_JIT", "1") != "1":
+            warmup_sampling_module()
+            if self._config.max_beam_width > 1:
+                warmup_topk_module()
+            yield
+            return
+        # The sampler is first used in graph capture, so its modules may keep
+        # building through the warmup forwards; the rest are joined on exit.
+        deferred = [("flashinfer_sampling", warmup_sampling_module)]
+        if self._config.max_beam_width > 1:
+            deferred.append(("flashinfer_topk", warmup_topk_module))
+        for name, fn in deferred:
+            self._deferred_jit_prebuilds.append(_start_jit_prebuild_thread(name, fn))
+        tasks = self._minimax_m3_msa_jit_prebuild_tasks(kv_cache_manager)
+        if not tasks:
+            yield
+            return
+        with concurrent.futures.ThreadPoolExecutor(
+            max_workers=len(tasks), thread_name_prefix="jit_prebuild"
+        ) as pool:
+            futures = [pool.submit(_run_jit_prebuild, name, fn) for name, fn in tasks]
+            try:
+                yield
+            finally:
+                for future in futures:
+                    future.result()
+
+    def _join_deferred_jit_prebuilds(self) -> None:
+        """Wait for background JIT builds started for later first use."""
+        while self._deferred_jit_prebuilds:
+            self._deferred_jit_prebuilds.pop().result()
+
+    def _minimax_m3_msa_jit_prebuild_tasks(
+        self, kv_cache_manager: KVCacheManager | KVCacheManagerV2 | None
+    ) -> list[tuple[str, Callable[[], Any]]]:
+        """JIT modules the MiniMax-M3 MSA path builds lazily on its first forwards."""
+        from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.cache_manager import (
+            MiniMaxM3KVCacheManagerV2,
+        )
+
+        if not isinstance(kv_cache_manager, MiniMaxM3KVCacheManagerV2):
+            return []
+        sparse_config = self.sparse_attention_config
+        if (
+            not isinstance(sparse_config, MiniMaxM3SparseAttentionConfig)
+            or sparse_config.implementation != "msa"
+        ):
+            return []
+        from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.kernels.msa_utils import (
+            require_msa_module,
+        )
+
+        def fmha_plan() -> None:
+            require_msa_module()
+            importlib.import_module("fmha_sm100.jit").get_plan_fn()
+
+        def k2q_csr() -> None:
+            # Imported under the same name fmha_sm100 loads it by.
+            require_msa_module()
+            importlib.import_module("src.sm100.build_k2q_csr")
+
+        def fmha_variant_families() -> None:
+            # Start the fmha_sm100 attention variants the dense main attention
+            # and the indexer proxy dispatch to; each is otherwise a blocking
+            # nvcc build inside the first forward that needs it.
+            require_msa_module()
+            prebuild = getattr(
+                importlib.import_module("fmha_sm100.jit"), "prebuild_variant_family", None
+            )
+            if prebuild is None:
+                return
+            from tensorrt_llm.bindings import DataType
+
+            params = sparse_config.to_sparse_metadata_params(
+                pretrained_config=self.model.model_config.pretrained_config
+            )
+            page_size = kv_cache_manager.tokens_per_block
+            fp8 = kv_cache_manager.dtype in (DataType.FP8, DataType.NVFP4)
+            num_q_heads, num_kv_heads = params.sharded_head_counts(self.mapping)
+            dense_mode = 3  # neither block-sparse nor score-producing
+            prebuild(
+                torch.float8_e4m3fn if fp8 else torch.bfloat16,
+                dense_mode,
+                page_size,
+                num_q_heads,
+                num_kv_heads,
+            )
+            score_only_mode = 2
+            prebuild(
+                torch.float8_e4m3fn
+                if kv_cache_manager.indexer_kv_dtype == "fp8"
+                else torch.bfloat16,
+                score_only_mode,
+                page_size,
+                params.sharded_index_head_count(self.mapping),
+                1,
+            )
+
+        tasks = [
+            ("fmha_sm100_variant_families", fmha_variant_families),
+            ("fmha_sm100_plan", fmha_plan),
+            ("fmha_sm100_k2q_csr", k2q_csr),
+        ]
+        try:
+            import flashinfer
+        except ImportError:
+            return tasks
+        # The MSA dense decode runs on flashinfer's TRTLLM-Gen FMHA, and the
+        # target's MXFP8 linears on its CUTLASS MXFP8 GEMM.
+        tasks += [
+            (
+                "flashinfer_trtllm_gen_fmha",
+                lambda: _one_process_at_a_time(
+                    _flashinfer_cubin_dir(),
+                    "trtllm_gen_fmha",
+                    flashinfer.decode.get_trtllm_gen_fmha_module,
+                ),
+            ),
+            (
+                "flashinfer_cutlass_mxfp8_gemm",
+                lambda: flashinfer.gemm.gemm_base.get_gemm_sm100_module_cutlass_mxfp8(),
+            ),
+            ("flashinfer_trtllm_utils", lambda: flashinfer.tllm_utils.get_trtllm_utils_module()),
+        ]
+        return tasks
 
     def _prewarm_minimax_m3_msa_indexer(
         self, kv_cache_manager: KVCacheManager | KVCacheManagerV2 | None
