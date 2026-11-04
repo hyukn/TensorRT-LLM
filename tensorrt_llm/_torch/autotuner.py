@@ -919,6 +919,39 @@ def _spec_in_bounds(spec, shapes_list) -> bool:
     return True
 
 
+class _ProfileTimer:
+    """Device-side start/end stamps on one stream, as CUDA events or %globaltimer."""
+
+    def __init__(self, stream: torch.cuda.Stream, use_global_timer: bool):
+        self._stream = stream
+        self._use_global_timer = use_global_timer
+        if use_global_timer:
+            self._start = torch.empty(1, dtype=torch.int64, device='cuda')
+            self._end = torch.empty(1, dtype=torch.int64, device='cuda')
+        else:
+            self._start = torch.cuda.Event(enable_timing=True)
+            self._end = torch.cuda.Event(enable_timing=True)
+
+    def record_start(self) -> None:
+        if self._use_global_timer:
+            record_global_timer(self._start.data_ptr(), self._stream)
+        else:
+            self._start.record(self._stream)
+
+    def record_end(self) -> None:
+        if self._use_global_timer:
+            record_global_timer(self._end.data_ptr(), self._stream)
+        else:
+            self._end.record(self._stream)
+
+    def elapsed_ms(self) -> float:
+        """Milliseconds between the stamps; the stream must be synchronized."""
+        if self._use_global_timer:
+            # %globaltimer counts in ns.
+            return (self._end.item() - self._start.item()) / 1e6
+        return self._start.elapsed_time(self._end)
+
+
 class AutoTuner:
     """AutoTuner for optimizing TensorRT LLM operations.
 
@@ -977,6 +1010,10 @@ class AutoTuner:
         # choose_one() tuning pass (see _shared_profile_graph_pool).
         self._profile_graph_pool: Optional[torch.cuda.MemPool] = None
         self._profile_graph_pool_depth = 0
+        # Tiny graph captured into the shared pool for the pool's lifetime;
+        # see _profile_graph_pool_handle.
+        self._profile_graph_pool_keeper: Optional[Tuple[torch.cuda.CUDAGraph,
+                                                        torch.Tensor]] = None
 
         # Dsitributed tuning state
         self._dist: Optional[Distributed] = None
@@ -1583,7 +1620,13 @@ class AutoTuner:
         finally:
             self._profile_graph_pool_depth -= 1
             if self._profile_graph_pool_depth == 0:
-                self._profile_graph_pool = None
+                self._drop_profile_graph_pool()
+
+    def _drop_profile_graph_pool(self) -> None:
+        if self._profile_graph_pool_keeper is not None:
+            self._profile_graph_pool_keeper[0].reset()
+            self._profile_graph_pool_keeper = None
+        self._profile_graph_pool = None
 
     def _profile_graph_pool_handle(self) -> Tuple[int, int]:
         """Pool handle for one profiling capture: the shared pool inside
@@ -1591,7 +1634,21 @@ class AutoTuner:
         if self._profile_graph_pool_depth == 0:
             return torch.cuda.graph_pool_handle()
         if self._profile_graph_pool is None:
-            self._profile_graph_pool = torch.cuda.MemPool()
+            pool = torch.cuda.MemPool()
+            # Captures into the shared pool skip torch.cuda.graph's per-capture
+            # cache flush (see _profile_single_kernel). The host caching
+            # allocator counts references to a graph pool only through live
+            # graphs, and every profiling graph is reset right after use, so
+            # without that flush the next capture would find the pool's id
+            # released. A tiny graph kept for the pool's lifetime holds it.
+            keeper_input = torch.zeros(1, device="cuda")
+            keeper = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(keeper,
+                                  pool=pool.id,
+                                  capture_error_mode="thread_local"):
+                keeper_input.zero_()
+            self._profile_graph_pool = pool
+            self._profile_graph_pool_keeper = (keeper, keeper_input)
         return self._profile_graph_pool.id
 
     def _profile_single_kernel(
@@ -1622,68 +1679,49 @@ class AutoTuner:
             inputs, tuning_config)
 
         stream = torch.cuda.current_stream()
-        # If the warm up time is longer than 0.5ms, we will profile the kernel with fewer repeats.
+        # A kernel slower than this per launch is timed over fewer launches.
         profile_fewer_repeat = 2
         short_profile_threshold_ms = 1
+        timer = _ProfileTimer(stream, self._use_global_timer)
 
-        avg_time = float('inf')
+        # Warm up. The last launch is timed, behind a delay that hides its
+        # host-side launch cost, to size the measurement below, so each
+        # tactic is captured once instead of a short probe and then a full one.
+        for i in range(self.warmup):
+            if i == self.warmup - 1:
+                delay_kernel(self._CUDA_GRAPH_DELAY_MICRO_SECS, stream)
+                timer.record_start()
+            self._run_profile_runner(runner, input_tensor_batches[-1], tactic,
+                                     **kwargs)
+        repeat = self.repeat
+        disable_short_profile = os.environ.get(
+            "TLLM_AUTOTUNER_DISABLE_SHORT_PROFILE", "0") == "1"
+        # MERGE peers must launch symmetrically, so they never shorten.
+        if (self.warmup > 0 and not disable_short_profile
+                and tuning_config.distributed_tuning_strategy
+                != DistributedTuningStrategy.MERGE):
+            timer.record_end()
+            stream.synchronize()
+            if timer.elapsed_ms() > short_profile_threshold_ms:
+                repeat = profile_fewer_repeat
 
-        def pure_profile(stream: torch.cuda.Stream, repeat: int):
-            graph = torch.cuda.CUDAGraph()
-
-            @contextlib.contextmanager
-            def graph_pool_lifetime():
-                if not use_cuda_graph:
-                    yield None
-                    return
-                graph_pool = self._profile_graph_pool_handle()
-                completed = False
-                try:
-                    yield graph_pool
-                    completed = True
-                finally:
-                    graph.reset()
-                    # The NCCL-window owner stays per capture even when the
-                    # memory pool is shared: a later capture of the same pool
-                    # gets a new owner.
-                    if completed:
-                        release_nccl_window_graph_owner(graph_pool)
-                    else:
-                        # Local profiling failures need not occur on every rank.
-                        abandon_nccl_window_graph_owner(graph_pool)
-                        # Do not capture into a pool a failed capture used.
-                        self._profile_graph_pool = None
-
-            if self._use_global_timer:
-                start_ts = torch.empty(1, dtype=torch.int64, device='cuda')
-                end_ts = torch.empty(1, dtype=torch.int64, device='cuda')
-
-                def record_start():
-                    record_global_timer(start_ts.data_ptr(), stream)
-
-                def record_end():
-                    record_global_timer(end_ts.data_ptr(), stream)
-
-                def elapsed_time():
-                    # GPU %globaltimer counts in ns; convert to ms to match the
-                    # units of Torch.cuda.Event.elapsed_time()
-                    return (end_ts.item() - start_ts.item()) / 1e6
-            else:
-                start_evt = torch.cuda.Event(enable_timing=True)
-                end_evt = torch.cuda.Event(enable_timing=True)
-
-                def record_start():
-                    start_evt.record()
-
-                def record_end():
-                    end_evt.record()
-
-                def elapsed_time():
-                    return start_evt.elapsed_time(end_evt)
-
-            with graph_pool_lifetime() as graph_pool, torch.cuda.stream(stream):
+        graph = torch.cuda.CUDAGraph()
+        graph_pool = self._profile_graph_pool_handle(
+        ) if use_cuda_graph else None
+        # Inside a tuning pass the pool is shared and kept referenced (see
+        # _profile_graph_pool_handle), so the capture can keep the allocator
+        # caches instead of flushing them per capture. Only this thread's
+        # launches are captured; warmup may build JIT modules on others.
+        capture_kwargs = (dict(release_cached_memory=False,
+                               capture_error_mode="thread_local")
+                          if self._profile_graph_pool_keeper is not None else
+                          {})
+        completed = False
+        try:
+            with torch.cuda.stream(stream):
                 if use_cuda_graph:
-                    with nccl_window_graph_capture(graph, graph_pool):
+                    with nccl_window_graph_capture(graph, graph_pool,
+                                                   **capture_kwargs):
                         for r in range(repeat):
                             self._run_profile_runner(
                                 runner,
@@ -1704,8 +1742,7 @@ class AutoTuner:
                 else:
                     delay_kernel(self.stream_delay_micro_secs, stream)
 
-                record_start()
-
+                timer.record_start()
                 if use_cuda_graph:
                     graph.replay()
                 else:
@@ -1716,30 +1753,24 @@ class AutoTuner:
                             tactic,
                             **kwargs,
                         )
-
-                record_end()
+                timer.record_end()
                 stream.synchronize()
-
-                return elapsed_time() / repeat
-
-        # warm up, no timing
-        for _ in range(self.warmup):
-            self._run_profile_runner(runner, input_tensor_batches[-1], tactic,
-                                     **kwargs)
-
-        fewer_repeat_avg_time = pure_profile(stream, profile_fewer_repeat)
-
-        disable_short_profile = os.environ.get(
-            "TLLM_AUTOTUNER_DISABLE_SHORT_PROFILE", "0") == "1"
-
-        # Disable this feature for merged tuning strategy to avoid potential hang due to asymmetric tuning.
-        if fewer_repeat_avg_time > short_profile_threshold_ms and not disable_short_profile \
-            and tuning_config.distributed_tuning_strategy != DistributedTuningStrategy.MERGE:
-            # directly use the few repeat estimated time to avoid redundant profiling
-            avg_time = fewer_repeat_avg_time
-        else:
-            # profile the kernel with the full repeat to get precise time
-            avg_time = pure_profile(stream, self.repeat)
+                avg_time = timer.elapsed_ms() / repeat
+            completed = True
+        finally:
+            if use_cuda_graph:
+                graph.reset()
+                # The NCCL-window owner stays per capture even when the
+                # memory pool is shared: a later capture of the same pool
+                # gets a new owner.
+                if completed:
+                    release_nccl_window_graph_owner(graph_pool)
+                else:
+                    # Local profiling failures need not occur on every rank.
+                    abandon_nccl_window_graph_owner(graph_pool)
+                    # Do not capture into a pool a failed capture used.
+                    if self._profile_graph_pool_depth > 0:
+                        self._drop_profile_graph_pool()
 
         shapes = self._get_input_sizes(inputs)
         self._debug_logger(

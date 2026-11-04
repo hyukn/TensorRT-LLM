@@ -94,18 +94,57 @@ def nccl_window_graph_owner(pool: Any) -> Iterator[None]:
             abandon_nccl_window_graph_owner(pool)
 
 
+_capture_streams: dict[int, torch.cuda.Stream] = {}
+
+
+@contextlib.contextmanager
+def _graph_keeping_cached_memory(
+    graph: torch.cuda.CUDAGraph,
+    pool: Any,
+    capture_error_mode: str = "global",
+) -> Iterator[None]:
+    """``torch.cuda.graph`` without first returning cached memory to the driver.
+
+    ``torch.cuda.graph`` empties the device and pinned-host allocator caches
+    before every capture. That is worth it for one large capture, but for many
+    small back-to-back captures into a reused pool it only forces the next
+    allocations back through cudaMalloc. The synchronize is kept: callers rely
+    on prior work being complete when capture begins.
+    """
+    torch.cuda.synchronize()
+    device = torch.cuda.current_device()
+    stream = _capture_streams.get(device)
+    if stream is None:
+        stream = _capture_streams.setdefault(device, torch.cuda.Stream(device))
+    with torch.cuda.stream(stream):
+        graph.capture_begin(pool=pool, capture_error_mode=capture_error_mode)
+        try:
+            yield
+        finally:
+            graph.capture_end()
+
+
 @contextlib.contextmanager
 def nccl_window_graph_capture(
     graph: torch.cuda.CUDAGraph,
     pool: Any,
+    *,
+    release_cached_memory: bool = True,
     **capture_kwargs: Any,
 ) -> Iterator[None]:
+    """Capture ``graph`` into ``pool`` with NCCL-window ownership bound to the pool.
+
+    ``release_cached_memory=False`` skips the allocator cache flush that
+    ``torch.cuda.graph`` performs before capturing (see
+    ``_graph_keeping_cached_memory``).
+    """
+    capture = torch.cuda.graph if release_cached_memory else _graph_keeping_cached_memory
     with nccl_window_graph_owner(pool):
         device = torch.cuda.current_device()
         release_epoch = torch.ops.trtllm.get_nccl_window_buffer_release_epoch()
         # CUDA tensor finalizers can invalidate capture. Restore automatic GC only
-        # after torch.cuda.graph has completed its exit or exception cleanup.
-        with _defer_capture_gc(), torch.cuda.graph(graph, pool=pool, **capture_kwargs):
+        # after the capture context has completed its exit or exception cleanup.
+        with _defer_capture_gc(), capture(graph, pool=pool, **capture_kwargs):
             # capture_begin has synchronized PyTorch warmup work. Promote explicitly
             # released windows before the captured body can request them.
             torch.ops.trtllm.promote_nccl_window_buffer_releases(device, release_epoch)
