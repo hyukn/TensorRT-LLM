@@ -155,6 +155,13 @@ class TuningConfig:
             this rank's share of the host's cores (up to 32): neighbouring sweep points
             often select the same kernel and compile it twice, so more threads keep
             paying off. TLLM_AUTOTUNER_PARALLEL_JIT_WARMUP overrides the thread count.
+        defer_jit_warmup (bool): The op is tuned only for the JIT its runs drive: one runner
+            whose tactic is ignored. Inside an outermost ``autotune()`` scope its sweeps are
+            queued rather than run, and the queued sweeps of every shape run together when
+            the scope exits, so ``parallel_jit_warmup`` works on all of their distinct
+            kernels at once instead of the few of one shape. The deferred call itself runs
+            with tactic -1 and compiles its own shape on demand.
+            TLLM_AUTOTUNER_DEFER_JIT_WARMUP=0 disables.
     """
     dynamic_tensor_specs: Tuple[DynamicTensorSpec, ...] = ()
     constraint_specs: Tuple[ConstraintSpec, ...] = ()
@@ -165,6 +172,7 @@ class TuningConfig:
     distributed_tuning_strategy: DistributedTuningStrategy = DistributedTuningStrategy.INDEPENDENT
     exclude_from_cache: bool = False
     parallel_jit_warmup: int = 0
+    defer_jit_warmup: bool = False
 
 
 @dataclass(unsafe_hash=True)
@@ -347,9 +355,22 @@ def autotune(tune_mode: bool = True,
     if autotune_enabled:
         torch.ops.trtllm.set_fine_grained_sync_disabled_override(True)
 
+    if autotune_enabled:
+        autotuner._defer_jit_sweeps = True
     try:
         yield
+    except BaseException:
+        if autotune_enabled:
+            autotuner._defer_jit_sweeps = False
+            autotuner._deferred_jit_sweeps.clear()
+        raise
+    else:
+        if autotune_enabled:
+            # Still in tuning mode: the queued sweeps tune as usual.
+            autotuner._run_deferred_jit_sweeps()
     finally:
+        if autotune_enabled:
+            autotuner._defer_jit_sweeps = False
         autotuner.is_tuning_mode = old_mode
         autotuner.skip_dynamic_tuning_buckets = old_skip
         set_allreduce_autotuner_tuning_mode(old_mode)
@@ -990,6 +1011,11 @@ class AutoTuner:
         # Cache keys whose runner ran in this process (so any JIT it drives
         # has happened here), as opposed to keys loaded from disk or peers.
         self._keys_profiled_in_process: set[Tuple] = set()
+        # Sweeps of defer_jit_warmup ops queued in the current outermost
+        # autotune() scope, keyed by everything but the swept dimensions.
+        self._deferred_jit_sweeps: Dict[Tuple, Tuple] = {}
+        self._defer_jit_sweeps = False
+        self._in_deferred_flush = False
         self.is_tuning_mode = False
         self.skip_dynamic_tuning_buckets = False
 
@@ -1251,6 +1277,10 @@ class AutoTuner:
             self._prime_cached_tactics(custom_op, runners, tuning_config,
                                        inputs, **kwargs)
             return (runners[best_runner_id], best_tactic)
+
+        if self._maybe_defer_jit_sweep(custom_op, runners, tuning_config,
+                                       inputs, **kwargs):
+            return (runners[0], -1)
 
         # PP rank does not have cache hit, so we try to receive the cache from the previous rank
         # Notice that only under tuning mode, pp_recv will be called
@@ -1623,49 +1653,137 @@ class AutoTuner:
             profiles[i] for b in order for i in range(bounds[b], bounds[b + 1])
         ]
 
+    def _maybe_defer_jit_sweep(self, custom_op: str,
+                               runners: List[TunableRunner],
+                               tuning_config: TuningConfig,
+                               inputs: List[torch.Tensor], **kwargs) -> bool:
+        """Queue this sweep for the end of the autotune() scope if allowed.
+
+        See ``TuningConfig.defer_jit_warmup``.
+        """
+        if not (tuning_config.defer_jit_warmup and self._defer_jit_sweeps
+                and not self._in_deferred_flush and len(runners) == 1
+                and tuning_config.distributed_tuning_strategy
+                == DistributedTuningStrategy.INDEPENDENT
+                and os.environ.get("TLLM_AUTOTUNER_DEFER_JIT_WARMUP", "1")
+                != "0"):
+            return False
+        swept = {(s.input_idx, s.dim_idx)
+                 for s in tuning_config.dynamic_tensor_specs}
+        swept |= {(s.input_idx, s.dim_idx)
+                  for s in tuning_config.constraint_specs}
+        signature = tuple(
+            (tuple(-1 if (i, d) in swept else n
+                   for d, n in enumerate(t.shape)), t.dtype) if isinstance(
+                       t, torch.Tensor) else repr(t)
+            for i, t in enumerate(inputs))
+        key = (custom_op, repr(runners[0].unique_id()), signature,
+               repr(sorted(kwargs.items())))
+        self._deferred_jit_sweeps.setdefault(
+            key, (custom_op, runners, list(inputs), tuning_config, kwargs))
+        return True
+
+    def _run_deferred_jit_sweeps(self) -> None:
+        """Tune every queued sweep: drive all of their JIT together, then profile.
+
+        Called at the exit of the outermost autotune() scope, still in tuning
+        mode. The profiling pass goes through choose_one as usual and finds
+        the kernels built, so cache entries and statistics are as before.
+        """
+        self._defer_jit_sweeps = False
+        entries = list(self._deferred_jit_sweeps.values())
+        self._deferred_jit_sweeps.clear()
+        if not entries:
+            return
+        start = time.perf_counter()
+        jobs = []
+        for custom_op, runners, inputs, tuning_config, kwargs in entries:
+            profiles = self._optimization_profiles(tuning_config, inputs)
+            if tuning_config.exclude_from_cache:
+                profiles = self._stagger_for_local_peers(profiles)
+            jobs.append((custom_op, runners, inputs, tuning_config, kwargs,
+                         profiles))
+        self._parallel_jit_warmup_jobs(jobs)
+        self._in_deferred_flush = True
+        try:
+            for custom_op, runners, inputs, tuning_config, kwargs, _ in jobs:
+                self.choose_one(custom_op, runners, tuning_config, inputs,
+                                **kwargs)
+        finally:
+            self._in_deferred_flush = False
+        logger.info(f"[Autotuner] ran {len(jobs)} deferred JIT sweeps in "
+                    f"{time.perf_counter() - start:.1f}s")
+
     def _parallel_jit_warmup(self, custom_op: str, runners: List[TunableRunner],
                              profiles: List[OptimizationProfile],
                              inputs: List[torch.Tensor],
                              tuning_config: TuningConfig, **kwargs) -> None:
         """Run each not-yet-tuned profile once on a thread pool to drive its JIT.
 
-        See ``TuningConfig.parallel_jit_warmup``. Purely a warmup: results are
-        discarded, and a failure here is left to the profiling loop, which
-        runs every profile again and handles errors as usual.
+        See ``TuningConfig.parallel_jit_warmup``. A deferred sweep has had its
+        JIT driven together with the others already (_run_deferred_jit_sweeps).
         """
+        if self._in_deferred_flush:
+            return
+        self._parallel_jit_warmup_jobs([(custom_op, runners, inputs,
+                                         tuning_config, kwargs, profiles)])
+
+    def _parallel_jit_warmup_jobs(self, jobs: List[Tuple]) -> None:
+        """Drive the JIT of several sweeps' not-yet-tuned profiles on one pool.
+
+        Each job is (custom_op, runners, inputs, tuning_config, kwargs,
+        profiles). Purely a warmup: results are discarded, and a failure here
+        is left to the profiling loop, which runs every profile again and
+        handles errors as usual.
+        """
+        auto_threads = min(
+            32, (os.cpu_count() or 1) // max(1, torch.cuda.device_count()))
+        num_threads = max(auto_threads if job[3].parallel_jit_warmup < 0 else
+                          job[3].parallel_jit_warmup for job in jobs)
         num_threads = int(
-            os.environ.get("TLLM_AUTOTUNER_PARALLEL_JIT_WARMUP",
-                           tuning_config.parallel_jit_warmup))
+            os.environ.get("TLLM_AUTOTUNER_PARALLEL_JIT_WARMUP", num_threads))
         if num_threads < 0:
-            num_threads = min(
-                32, (os.cpu_count() or 1) // max(1, torch.cuda.device_count()))
+            num_threads = auto_threads
         if num_threads < 2:
             return
-        pending = [
-            p for p in profiles if not self.profiling_cache.search_cache(
-                custom_op,
-                runners,
-                p.get_opt_shapes(),
-                tuning_config,
-                apply_map_to_tuning_buckets=False,
-            )[0]
+        orders = []
+        for custom_op, runners, inputs, tuning_config, kwargs, profiles in jobs:
+            pending = [
+                p for p in profiles if not self.profiling_cache.search_cache(
+                    custom_op,
+                    runners,
+                    p.get_opt_shapes(),
+                    tuning_config,
+                    apply_map_to_tuning_buckets=False,
+                )[0]
+            ]
+            if not pending:
+                continue
+            # Interleave contiguous blocks of the sweep, so the calls in
+            # flight come from far-apart points and mostly select different
+            # kernels rather than several threads compiling the same one.
+            nblk = min(num_threads, len(pending))
+            size = -(-len(pending) // nblk)
+            blocks = [pending[i * size:(i + 1) * size] for i in range(nblk)]
+            orders.append([(runners, inputs, kwargs, b[j])
+                           for j in range(size) for b in blocks
+                           if j < len(b)])
+        # Then round-robin across sweeps: different shapes, different kernels.
+        tasks = [
+            o[j] for j in range(max((len(o) for o in orders), default=0))
+            for o in orders if j < len(o)
         ]
-        num_threads = min(num_threads, len(pending))
+        num_threads = min(num_threads, len(tasks))
         if num_threads < 2:
             return
-        # Interleave contiguous blocks of the sweep, so the calls in flight
-        # come from far-apart shapes and mostly select different kernels
-        # rather than several threads compiling the same one.
-        size = -(-len(pending) // num_threads)
-        blocks = [pending[i * size:(i + 1) * size] for i in range(num_threads)]
-        order = [b[j] for j in range(size) for b in blocks if j < len(b)]
         device = torch.cuda.current_device()
         # One stream for all workers: the allocator caches their blocks where
-        # the profiling loop below allocates, and GPU time is not the cost here.
+        # the profiling loop allocates, and GPU time is not the cost here.
         stream = torch.cuda.current_stream()
         failures = []
 
-        def warm(profile: OptimizationProfile) -> None:
+        def warm(task) -> None:
+            runners, inputs, kwargs, profile = task
             torch.cuda.set_device(device)
             try:
                 with torch.cuda.stream(stream):
@@ -1682,11 +1800,12 @@ class AutoTuner:
         with concurrent.futures.ThreadPoolExecutor(
                 max_workers=num_threads,
                 thread_name_prefix="autotuner_jit_warmup") as pool:
-            list(pool.map(warm, order))
+            list(pool.map(warm, tasks))
+        ops = sorted({job[0] for job in jobs})
         logger.info(
-            f"[Autotuner] {custom_op}: ran {len(order)} profiles on "
-            f"{num_threads} threads to drive their JIT in "
-            f"{time.perf_counter() - start:.1f}s" +
+            f"[Autotuner] {', '.join(ops)}: ran {len(tasks)} profiles of "
+            f"{len(orders)} sweep(s) on {num_threads} threads to drive their "
+            f"JIT in {time.perf_counter() - start:.1f}s" +
             (f"; {len(failures)} failed and are left to profiling "
              f"({type(failures[0]).__name__}: {failures[0]})"
              if failures else ""))

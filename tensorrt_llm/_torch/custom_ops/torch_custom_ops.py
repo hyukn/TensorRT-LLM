@@ -2226,7 +2226,9 @@ class Fp8QuantKernelRunner(TunableRunner):
 
 # DeepGemm compiles each layout with nvcc and releases the GIL meanwhile, so
 # the autotuner drives the JIT of a sweep's distinct layouts on a thread pool
-# (TuningConfig.parallel_jit_warmup; -1 sizes it from the host's cores).
+# (TuningConfig.parallel_jit_warmup; -1 sizes it from the host's cores), with
+# the sweeps of all shapes of a warmup forward batched together at its end
+# (TuningConfig.defer_jit_warmup). These runners ignore the tactic.
 _DEEP_GEMM_JIT_WARMUP_THREADS = -1
 
 
@@ -2246,6 +2248,7 @@ class fp8SwapABGemmRunner(TunableRunner):
             0, 0, deep_gemm_jit_warmup_buckets), ),
         exclude_from_cache=True,
         parallel_jit_warmup=_DEEP_GEMM_JIT_WARMUP_THREADS,
+        defer_jit_warmup=True,
     )
 
     def __init__(self, output_dtype: torch.dtype, disable_ue8m0_cast: bool,
@@ -2301,6 +2304,7 @@ class Fp8PrequantizedSwapABGemmRunner(TunableRunner):
             1, 0, lambda input_shapes: input_shapes[0][0]), ),
         exclude_from_cache=True,
         parallel_jit_warmup=_DEEP_GEMM_JIT_WARMUP_THREADS,
+        defer_jit_warmup=True,
     )
 
     def __init__(self, output_dtype: torch.dtype,
@@ -2452,6 +2456,7 @@ class Fp8BlockScalingGemmRunner(TunableRunner):
         tune_max_num_tokens=4096,
         exclude_from_cache=True,
         parallel_jit_warmup=_DEEP_GEMM_JIT_WARMUP_THREADS,
+        defer_jit_warmup=True,
     )
 
     def get_valid_tactics(
