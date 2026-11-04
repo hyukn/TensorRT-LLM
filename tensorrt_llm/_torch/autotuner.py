@@ -151,8 +151,10 @@ class TuningConfig:
             on this many threads. For runners whose first call per shape JIT-compiles a
             kernel and releases the GIL while compiling (DeepGEMM), those compiles then
             overlap, and the profiling loop that follows finds them built. Opted-in
-            runners must be thread-safe and must not use NCCL windows. 0 disables;
-            TLLM_AUTOTUNER_PARALLEL_JIT_WARMUP overrides the thread count.
+            runners must be thread-safe and must not use NCCL windows. 0 disables; -1 uses
+            this rank's share of the host's cores (up to 32): neighbouring sweep points
+            often select the same kernel and compile it twice, so more threads keep
+            paying off. TLLM_AUTOTUNER_PARALLEL_JIT_WARMUP overrides the thread count.
     """
     dynamic_tensor_specs: Tuple[DynamicTensorSpec, ...] = ()
     constraint_specs: Tuple[ConstraintSpec, ...] = ()
@@ -1634,6 +1636,9 @@ class AutoTuner:
         num_threads = int(
             os.environ.get("TLLM_AUTOTUNER_PARALLEL_JIT_WARMUP",
                            tuning_config.parallel_jit_warmup))
+        if num_threads < 0:
+            num_threads = min(
+                32, (os.cpu_count() or 1) // max(1, torch.cuda.device_count()))
         if num_threads < 2:
             return
         pending = [
